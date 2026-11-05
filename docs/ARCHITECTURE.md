@@ -53,7 +53,7 @@ Research agents produce claims faster than anyone checks them. Rules:
 
 ## Order of building
 
-1. memory ✓ → 2. protocol + engineering standard → 3. video (sense + perception) → 4. research v0 → 5. learning v0 → 6. intelligence wiring (budget, policy, audit) → 7. sound, vision, text → 8. expression.
+1. memory ✓ → 2. protocol + engineering standard ✓ → 3. video (sense + perception) → 4. research v0 → 5. learning v0 → 6. intelligence wiring (budget, policy, audit) → 7. sound, vision, text → 8. expression.
 
 ## Open questions
 

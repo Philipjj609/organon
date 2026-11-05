@@ -24,7 +24,7 @@ Around comprehension sit **memory** (what is known, with provenance and history)
 |---|---|---|---|
 | [mneme](https://github.com/Philipjj609/mneme) | Memory | Claim log with provenance, git-like history, frames of understanding, recall | working (v0) |
 | organon *(this)* | Intelligence + spec | Architecture, protocol, repo standard; later the coordinator with budget and self-audit | outlining |
-| organon-protocol | Shared language | `Source`, `Observation`, `Proposal`, `Episode` types + JSON schemas | next (extract from mneme) |
+| [organon-protocol](https://github.com/Philipjj609/organon-protocol) | Shared language | `Source`, `Observation`, `Claim`, `Proposal`, `Episode` types, JSON Schema, conformance fixtures | working (v0.1) |
 | organon-video | Sense + perception: video | URL/file → captions/transcript, scenes, key frames, on-screen text, layered index; frames on demand | designing |
 | organon-research | Research | Question → plan → wide search → source triage → read → verify claim against passage → counter-evidence → saturation | designing |
 | organon-learning | Learning | Consolidation, recall that learns from feedback, frames that grow | designing |
@@ -40,6 +40,7 @@ Each repo is published separately. Anyone can use one piece, fork it, or replace
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how the organs connect, the data flow, budgets and self-audit
 - [docs/PROTOCOL.md](docs/PROTOCOL.md): the objects every organ reads and writes
 - [docs/REPO-STANDARD.md](docs/REPO-STANDARD.md): how every organ repo is built
+- [docs/ENGINEERING.md](docs/ENGINEERING.md): how we write code (design and Rust)
 - [docs/organs/](docs/organs/): one design page per organ
 - [docs/research/](docs/research/): what already exists, what it gets wrong, with sources
 
