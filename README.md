@@ -2,7 +2,7 @@
 
 **One living intelligence, built from organs you can use, replace and improve one at a time.**
 
-*organon* (Greek: instrument, organ; Aristotle's name for the tools of knowing) is the umbrella of a family of repositories. Each organ is its own repo, useful on its own, and speaks one shared protocol. This repo holds the architecture, the protocol, the standard every organ follows, and later the binary that connects them.
+*organon* (Greek: instrument, organ; Aristotle's name for the tools of knowing) is the umbrella of a family of repositories. Each organ is its own repo, useful on its own, and speaks one shared protocol. This repo holds the architecture, the protocol, the standard every organ follows, and the `organon` binary that coordinates them.
 
 > Living document. Every page has a **status** and **open questions**. Decisions are also recorded as claims in the memory (`project:organon`), so the "why" survives.
 
@@ -23,7 +23,7 @@ Around comprehension sit **memory** (what is known, with provenance and history)
 | Repo | Organ | Role | Status |
 |---|---|---|---|
 | [mneme](https://github.com/Philipjj609/mneme) | Memory | Claim log with provenance, git-like history, frames of understanding, recall | working (v0) |
-| organon *(this)* | Intelligence + spec | Architecture, protocol, repo standard; later the coordinator with budget and self-audit | outlining |
+| organon *(this)* | Intelligence + spec | Architecture, protocol, repo standard; the `organon` binary: session brief, tasks with budgets, measured spend, a policy hook for coding agents, two-tier routes, audit before memory | working (v0.1) |
 | [organon-protocol](https://github.com/Philipjj609/organon-protocol) | Shared language | `Source`, `Observation`, `Claim`, `Proposal`, `Episode` types, JSON Schema, conformance fixtures | working (v0.1) |
 | [organon-video](https://github.com/Philipjj609/organon-video) | Sense + perception: video | URL/file → transcript, keyframes measured (ink, repeats), moments with ★ where to look, index to read first; frames on demand; protocol messages for memory | working (v0.1) |
 | [organon-research](https://github.com/Philipjj609/organon-research) | Research | Ledger of a run; keyless search + agent web search; triage with reasons; every quoted passage verified in the source; independent voices counted; challenge, saturation, export to memory | working (v0.1) |
@@ -32,6 +32,19 @@ Around comprehension sit **memory** (what is known, with provenance and history)
 | organon-vision | Sense + perception: images | Layout, palette, typography, objects, text in images | later |
 | organon-text | Sense + perception: text | Web, X, PDFs, books, repos (moves out of mneme's capture) | later |
 | organon-express | Expression | Diagrams with drill-down levels + short text; briefings | after the core |
+
+## The intelligence (`organon`)
+
+```bash
+cargo install --git https://github.com/Philipjj609/organon organon
+organon init --memory ~/my-memory   # policy file, memory folder, and the Claude Code hook snippet
+organon brief                       # start of a session: organs, memory, spend, open task, routes
+organon task new "which OCR reads code in video frames" --effort compare
+organon audit proposal.json --messages messages.jsonl   # before mneme digest
+organon task done --outcome partial --left "no benchmark on our own frames"
+```
+
+Design and evidence: [docs/organs/intelligence.md](docs/organs/intelligence.md).
 
 Each repo is published separately. Anyone can use one piece, fork it, or replace it with their own, as long as it speaks the protocol.
 

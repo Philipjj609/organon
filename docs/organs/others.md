@@ -21,8 +21,7 @@ Each starts by researching what exists, then designs the gap. Status of all: **s
 - Web pages, X posts + articles, PDFs and books (tree index per document, as in PageIndex), repos and READMEs. Today this lives in mneme's `capture`; it moves here so the memory stays only memory.
 
 ## organon (intelligence): coordinating
-- Budget and effort rules; cheapest-adequate model routing; policy (what needs approval); producer ≠ verifier; self-audit of outputs; traces.
-- Evaluate Paperclip (agent-org control plane) as a coordination layer here.
+- **v0.1 built:** see [intelligence.md](intelligence.md). Budgets up front, measured spend, policy hook, two-tier routes, audit before digest, task episodes. Paperclip evaluated and not adopted for now.
 
 ## organon-express: showing
 - Answers as diagrams with levels you can open (overview → detail), a few lines of text beside them; built on the diagram-design skill (one HTML+SVG file per diagram); briefings.

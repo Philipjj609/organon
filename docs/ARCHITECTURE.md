@@ -53,11 +53,11 @@ Research agents produce claims faster than anyone checks them. Rules:
 
 ## Order of building
 
-1. memory ✓ → 2. protocol + engineering standard ✓ → 3. video (sense + perception) ✓ → 4. research v0 ✓ → 5. learning v0 ✓ → 6. intelligence wiring (budget, policy, audit) → 7. sound, vision, text → 8. expression.
+1. memory ✓ → 2. protocol + engineering standard ✓ → 3. video (sense + perception) ✓ → 4. research v0 ✓ → 5. learning v0 ✓ → 6. intelligence wiring (budget, policy, audit) ✓ → 7. sound, vision, text → 8. expression.
 
 ## Open questions
 
 - Should comprehension be its own repo, or live in intelligence (it's where models are called)?
 - Cross-modal comprehension: when a talk shows a slide while saying something, who unifies the two, perception (aligned "moments") or comprehension?
-- How should organs discover each other: config file, PATH, or a registry in the protocol repo?
-- Paperclip (in memory: agent-org control plane) could become the coordination layer for many agents. Evaluate it at step 6, not before.
+- ~~How should organs discover each other?~~ Like git subcommands: `organon-<organ>` on PATH; the memory is `mneme` with its folder set once (`organon init --memory`). See [organs/intelligence.md](organs/intelligence.md).
+- ~~Paperclip as the coordination layer?~~ Evaluated at step 6: not adopted for one person with one agent (a Node/Postgres control plane for agent companies; budget enforcement still contested). Its budget thresholds, approvals and trail were taken. Revisit if organon runs many agents around the clock.

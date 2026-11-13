@@ -1,0 +1,16 @@
+[package]
+name = "organon-core"
+description = "The intelligence of organon: budgets declared up front, measured spend, policy decisions, two-tier routing, and audits of what organs produce. Pure logic."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+organon-protocol.workspace = true
+
+[lints]
+workspace = true
