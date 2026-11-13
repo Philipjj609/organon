@@ -25,7 +25,7 @@ Around comprehension sit **memory** (what is known, with provenance and history)
 | [mneme](https://github.com/Philipjj609/mneme) | Memory | Claim log with provenance, git-like history, frames of understanding, recall | working (v0) |
 | organon *(this)* | Intelligence + spec | Architecture, protocol, repo standard; later the coordinator with budget and self-audit | outlining |
 | [organon-protocol](https://github.com/Philipjj609/organon-protocol) | Shared language | `Source`, `Observation`, `Claim`, `Proposal`, `Episode` types, JSON Schema, conformance fixtures | working (v0.1) |
-| organon-video | Sense + perception: video | URL/file → captions/transcript, scenes, key frames, on-screen text, layered index; frames on demand | designing |
+| [organon-video](https://github.com/Philipjj609/organon-video) | Sense + perception: video | URL/file → transcript, keyframes measured (ink, repeats), moments with ★ where to look, index to read first; frames on demand; protocol messages for memory | working (v0.1) |
 | organon-research | Research | Question → plan → wide search → source triage → read → verify claim against passage → counter-evidence → saturation | designing |
 | organon-learning | Learning | Consolidation, recall that learns from feedback, frames that grow | designing |
 | organon-sound | Sense + perception: sound | Speech, music (tempo, key, structure), sound events | later |
