@@ -27,7 +27,7 @@ Around comprehension sit **memory** (what is known, with provenance and history)
 | [organon-protocol](https://github.com/Philipjj609/organon-protocol) | Shared language | `Source`, `Observation`, `Claim`, `Proposal`, `Episode` types, JSON Schema, conformance fixtures | working (v0.1) |
 | [organon-video](https://github.com/Philipjj609/organon-video) | Sense + perception: video | URL/file → transcript, keyframes measured (ink, repeats), moments with ★ where to look, index to read first; frames on demand; protocol messages for memory | working (v0.1) |
 | [organon-research](https://github.com/Philipjj609/organon-research) | Research | Ledger of a run; keyless search + agent web search; triage with reasons; every quoted passage verified in the source; independent voices counted; challenge, saturation, export to memory | working (v0.1) |
-| organon-learning | Learning | Consolidation, recall that learns from feedback, frames that grow | designing |
+| [organon-learning](https://github.com/Philipjj609/organon-learning) | Learning | Recall evaluated against rated and used questions; priors adopted only through a leave-one-out gate; frame slots proposed from use; hygiene (duplicates, stale, thin hubs) | working (v0.1) |
 | organon-sound | Sense + perception: sound | Speech, music (tempo, key, structure), sound events | later |
 | organon-vision | Sense + perception: images | Layout, palette, typography, objects, text in images | later |
 | organon-text | Sense + perception: text | Web, X, PDFs, books, repos (moves out of mneme's capture) | later |
