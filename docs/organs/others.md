@@ -10,8 +10,8 @@ Each starts by researching what exists, then designs the gap. Status of all: **s
 - **Procedures:** a method that worked repeatedly becomes a skill, linked to the claims it rests on (stale when they change).
 
 ## organon-sound: hearing
-- Speech: transcription with word timing, speakers. Music: tempo/beat grid, key, sections, energy curve, instrumentation. Sound events.
-- Exists: Whisper/WhisperX, librosa, CosyVoice (all in memory). Gap: features as located observations, comparable across tracks, tied to memory.
+- **v0.1 built:** [organon-sound](https://github.com/Philipjj609/organon-sound). ffmpeg decodes and transcribes (its `whisper` filter: whisper.cpp inside, no second binary); tempo (onset autocorrelation), key (chroma × Krumhansl/Temperley) and silence are measured in pure Rust; YAMNet tags sound events through tract. Takes an organon-video folder and keeps its source id, so a video's speech and pictures are one source. Measured: 96% of a talk's caption words in order (`ggml-base`); no music found in speech; 93% of 26 min of music found.
+- Next: EfficientAT tagger (mAP 0.483 vs YAMNet's 0.306), word timestamps and speakers (whisper-rs, diarization), sections inside music spans, a beat tracker for beat times.
 
 ## organon-vision: seeing still images and design
 - **v0.1 built:** [organon-vision](https://github.com/Philipjj609/organon-vision). ocrs (pure Rust, on RTen) reads text lines and words; layout from geometry (lines grouped into text blocks with their line heights, busy tiles without text as figure blocks); palette by k-means in CIE Lab; objects by any YOLOv8/YOLO11 ONNX model on RTen. Whole-image measures (ink, look, dhash) moved here from organon-video unchanged; video is to call this crate for its keyframes and for `screen_text`. Real run: six images, 0.2–1.3 s each.
