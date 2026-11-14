@@ -18,7 +18,8 @@ Each starts by researching what exists, then designs the gap. Status of all: **s
 - Gap: perception that a design agent can reason with (the website-making workflow in memory needs it).
 
 ## organon-text: reading
-- Web pages, X posts + articles, PDFs and books (tree index per document, as in PageIndex), repos and READMEs. Today this lives in mneme's `capture`; it moves here so the memory stays only memory.
+- **v0.1 built:** [organon-text](https://github.com/Philipjj609/organon-text). Readability (dom_smoothie) → Markdown with located `section`s, GitHub API + README, X via fxtwitter, HF datasets, PDFs through `pdftotext` with located `page`s. mneme's `capture links` is deprecated in its favour.
+- Next: a heading tree for PDFs (outline first, PageIndex-style when absent), pdfium vs pdftotext on our own PDFs, books.
 
 ## organon (intelligence): coordinating
 - **v0.1 built:** see [intelligence.md](intelligence.md). Budgets up front, measured spend, policy hook, two-tier routes, audit before digest, task episodes. Paperclip evaluated and not adopted for now.

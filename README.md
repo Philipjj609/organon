@@ -30,7 +30,7 @@ Around comprehension sit **memory** (what is known, with provenance and history)
 | [organon-learning](https://github.com/Philipjj609/organon-learning) | Learning | Recall evaluated against rated and used questions; priors adopted only through a leave-one-out gate; frame slots proposed from use; hygiene (duplicates, stale, thin hubs) | working (v0.1) |
 | organon-sound | Sense + perception: sound | Speech, music (tempo, key, structure), sound events | later |
 | organon-vision | Sense + perception: images | Layout, palette, typography, objects, text in images | later |
-| organon-text | Sense + perception: text | Web, X, PDFs, books, repos (moves out of mneme's capture) | later |
+| [organon-text](https://github.com/Philipjj609/organon-text) | Sense + perception: text | Web pages (Readability → Markdown, sections located), X posts and accounts, GitHub repos + README sections, HF datasets, PDFs (pages located); took over mneme's link capture with the same anchor ids | working (v0.1) |
 | organon-express | Expression | Diagrams with drill-down levels + short text; briefings | after the core |
 
 ## The intelligence (`organon`)
