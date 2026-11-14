@@ -29,7 +29,7 @@ Around comprehension sit **memory** (what is known, with provenance and history)
 | [organon-research](https://github.com/Philipjj609/organon-research) | Research | Ledger of a run; keyless search + agent web search; triage with reasons; every quoted passage verified in the source; independent voices counted; challenge, saturation, export to memory | working (v0.1) |
 | [organon-learning](https://github.com/Philipjj609/organon-learning) | Learning | Recall evaluated against rated and used questions; priors adopted only through a leave-one-out gate; frame slots proposed from use; hygiene (duplicates, stale, thin hubs) | working (v0.1) |
 | organon-sound | Sense + perception: sound | Speech, music (tempo, key, structure), sound events | later |
-| organon-vision | Sense + perception: images | Layout, palette, typography, objects, text in images | later |
+| [organon-vision](https://github.com/Philipjj609/organon-vision) | Sense + perception: images | File or URL → text lines and words (ocrs, pure Rust), layout blocks (text by alignment with line heights, figures from busy tiles), dominant palette (k-means in Lab), objects (YOLO on RTen when a model is present); regions in pixels; image measures shared with organon-video | working (v0.1) |
 | [organon-text](https://github.com/Philipjj609/organon-text) | Sense + perception: text | Web pages (Readability → Markdown, sections located), X posts and accounts, GitHub repos + README sections, HF datasets, PDFs (pages located); took over mneme's link capture with the same anchor ids | working (v0.1) |
 | organon-express | Expression | Diagrams with drill-down levels + short text; briefings | after the core |
 
