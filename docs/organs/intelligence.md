@@ -43,6 +43,7 @@ Like git subcommands: an organ is an executable named `organon-<organ>` on `PATH
 ## Limits
 
 - Money is measured for Claude Code only; another agent needs its own transcript reader. Without one, only time is budgeted.
+- A task belongs to the session it was declared in: the hook enforces its budget there and nowhere else, so parallel sessions never stop each other. A task declared outside an agent session has no meter and is not enforced.
 - A stop can lag up to 30 s behind the spend that caused it (the hook re-measures at most that often).
 - Time is wall-clock: a task left open over a break uses its time budget. Close tasks, or pass `--minutes 0` for no time limit.
 - The policy reads commands as written; `bash -c`, scripts and aliases get past it.

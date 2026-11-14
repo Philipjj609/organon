@@ -301,6 +301,14 @@ mod tests {
             .decision,
             Decision::Allow
         );
+        // Regression: every project's `projections/` folder was protected, not just mneme's.
+        assert_eq!(
+            p.decide(Action::Write {
+                path: "/app/src/projections/orders.ts"
+            })
+            .decision,
+            Decision::Allow
+        );
     }
 
     #[test]

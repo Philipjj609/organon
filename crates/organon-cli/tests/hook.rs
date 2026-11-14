@@ -56,9 +56,14 @@ impl Env {
     }
 
     fn hook(&self, tool: &str, input: &str) -> String {
+        self.hook_in(&self.transcript, tool, input)
+    }
+
+    /// A hook call from the session whose transcript is `transcript`.
+    fn hook_in(&self, transcript: &Path, tool: &str, input: &str) -> String {
         let ev = format!(
             r#"{{"session_id":"s","transcript_path":{},"cwd":".","hook_event_name":"PreToolUse","tool_name":"{tool}","tool_input":{input}}}"#,
-            serde_json::to_string(&self.transcript.to_string_lossy()).unwrap()
+            serde_json::to_string(&transcript.to_string_lossy()).unwrap()
         );
         let (out, ok) = self.organon(&["hook"], &ev);
         assert!(ok, "a hook never fails");
@@ -121,6 +126,18 @@ fn a_spent_budget_stops_work_but_not_wrap_up() {
     assert!(
         out.contains(r#""permissionDecision":"deny""#) && out.contains("do not retry"),
         "{out}"
+    );
+    // Regression: another session running at the same time was stopped by this task's budget.
+    let other = e.transcript.with_file_name("other-session.jsonl");
+    fs::write(&other, "").unwrap();
+    assert_eq!(
+        e.hook_in(
+            &other,
+            "Bash",
+            r#"{"command":"organon-research fetch run"}"#
+        ),
+        "",
+        "a task's budget acts only in its own session"
     );
     // Regression: a denied organ call was recorded as used.
     assert!(

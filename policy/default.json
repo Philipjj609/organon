@@ -28,7 +28,9 @@
     { "command": "* >> *log.jsonl", "decision": "deny", "reason": "memory/log.jsonl is written only by the memory: interpretation enters through digest (mneme invariants 1 and 3)." },
     { "command": "sed -i* *log.jsonl", "decision": "deny", "reason": "memory/log.jsonl is append-only (mneme invariant 1)." },
     { "path": "*memory/log.jsonl", "decision": "deny", "reason": "memory/log.jsonl is append-only and written only by the memory (mneme invariant 1). Fix mistakes with retract or a superseding claim." },
-    { "path": "*/projections/*", "decision": "deny", "reason": "Projections are generated: change the memory and run `mneme build` (mneme invariant 2)." }
+    { "path": "*/projections/graph.json", "decision": "deny", "reason": "Projections are generated: change the memory and run `mneme build` (mneme invariant 2)." },
+    { "path": "*/projections/view.html", "decision": "deny", "reason": "Projections are generated: change the memory and run `mneme build` (mneme invariant 2)." },
+    { "path": "*/projections/wiki/*", "decision": "deny", "reason": "Projections are generated: change the memory and run `mneme build` (mneme invariant 2)." }
   ],
   "after_budget": [
     "organon",

@@ -576,7 +576,7 @@ fn hook(home: &Home) -> Result<()> {
     let (policy, _) = home.policy()?;
     let mut verdict = policy.decide(action);
     let mut context: Option<String> = None;
-    let active = home.active_task();
+    let active = home.active_task_in(s("transcript_path"));
 
     if let Some(t) = &active {
         let s = cached_standing(home, t)?;

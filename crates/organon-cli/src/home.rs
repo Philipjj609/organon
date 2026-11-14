@@ -123,6 +123,14 @@ impl Home {
         self.tasks().into_iter().rev().find(Task::is_open)
     }
 
+    /// The most recently started open task of the session with this transcript.
+    pub fn active_task_in(&self, transcript: &str) -> Option<Task> {
+        self.tasks()
+            .into_iter()
+            .rev()
+            .find(|t| t.is_open() && t.metered_in(transcript))
+    }
+
     pub fn append_event(&self, slug: &str, e: &Event) -> Result<()> {
         append_line(
             &self.task_dir(slug).join("trail.jsonl"),
@@ -143,13 +151,9 @@ impl Home {
         serde_json::from_str(&text).ok()
     }
 
+    /// Written on every hook call, so the session whose hook ran last is the one that just
+    /// called organon (`organon task new` meters the session that ran it).
     pub fn save_session(&self, s: &SessionPointer) -> Result<()> {
-        if self
-            .session()
-            .is_some_and(|old| old.transcript == s.transcript)
-        {
-            return Ok(());
-        }
         fs::create_dir_all(&self.root)?;
         write_json(&self.root.join("session.json"), s)
     }

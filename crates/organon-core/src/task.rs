@@ -108,6 +108,16 @@ impl Task {
         self.ended.is_none()
     }
 
+    /// Whether this task is metered on the session with this transcript. Budgets act only in
+    /// the session a task was declared in, so one session's spent budget never stops another.
+    #[must_use]
+    pub fn metered_in(&self, transcript: &str) -> bool {
+        let norm = |p: &str| p.replace('\\', "/").to_lowercase();
+        self.meter
+            .as_ref()
+            .is_some_and(|m| !transcript.is_empty() && norm(&m.transcript) == norm(transcript))
+    }
+
     #[must_use]
     pub fn started_at(&self) -> i64 {
         epoch_seconds(&self.started).unwrap_or(0)
@@ -190,6 +200,24 @@ mod tests {
             usd: Usd(5.0),
             minutes: Minutes(60.0),
         }
+    }
+
+    #[test]
+    fn a_task_belongs_to_the_session_it_was_declared_in() {
+        // Regression: the hook applied the newest open task to every session.
+        let mut t = Task::new("x", None, budget(), 0);
+        assert!(
+            !t.metered_in(r"C:\a\s1.jsonl"),
+            "unmetered: no session claims it"
+        );
+        t.meter = Some(MeterStart {
+            transcript: r"C:\Users\a\s1.jsonl".into(),
+            offset: 0,
+            rates: std::collections::BTreeMap::new(),
+        });
+        assert!(t.metered_in("c:/users/a/s1.jsonl"));
+        assert!(!t.metered_in(r"C:\Users\a\s2.jsonl"));
+        assert!(!t.metered_in(""));
     }
 
     #[test]
