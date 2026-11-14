@@ -38,6 +38,11 @@
     "git",
     "cargo fmt",
     "cargo test",
-    "cargo clippy"
+    "cargo clippy",
+    "gh run",
+    "gh pr view",
+    "gh pr checks",
+    "cd", "pwd", "ls", "cat", "head", "tail", "grep", "rg", "wc", "diff", "echo",
+    "set-location", "get-content", "get-childitem", "select-string"
   ]
 }

@@ -316,6 +316,12 @@ mod tests {
         let p = policy();
         assert!(p.allowed_after_budget("organon task done t --outcome partial"));
         assert!(p.allowed_after_budget("git add -A && git commit -m x"));
+        // Regression: reading and moving around were denied, so wrap-up could not be done.
+        assert!(p.allowed_after_budget(
+            r#"cd /x/organon-video && grep -n "dhash" README.md && git push"#
+        ));
+        assert!(p.allowed_after_budget("gh run watch 123 --exit-status"));
+        assert!(!p.allowed_after_budget("cd /x && cargo build --release"));
         assert!(!p.allowed_after_budget("organon-research fetch run"));
         assert!(!p.allowed_after_budget(""));
     }

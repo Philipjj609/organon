@@ -587,7 +587,7 @@ fn hook(home: &Home) -> Result<()> {
         if s.level == Level::Exhausted && !wrap_up && verdict.decision != Decision::Deny {
             verdict.decision = Decision::Deny;
             verdict.reason = Some(format!(
-                "The budget of task '{}' is spent ({:.0}% of its {} budget). Stopping is final: do not retry. Record what is left unknown and close it: organon task done {} --outcome partial --left \"…\"",
+                "The budget of task '{}' is spent ({:.0}% of its {} budget). Start no new work and do not retry this. Wrapping up is still allowed and expected: edit files, read with cd/ls/cat/grep, run cargo fmt/clippy/test, commit and push with git, watch CI with gh run, digest with mneme. Then close the task with what is left: organon task done {} --outcome partial --left \"…\"",
                 t.slug,
                 s.used * 100.0,
                 s.limit,
