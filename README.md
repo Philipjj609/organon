@@ -31,7 +31,7 @@ Around comprehension sit **memory** (what is known, with provenance and history)
 | [organon-sound](https://github.com/Philipjj609/organon-sound) | Sense + perception: sound | File, URL or organon-video folder (same source id) → transcript segments (ffmpeg's whisper filter), music spans with tempo and key, sound events (silence, whisper's annotations, YAMNet in tract); measures behind every music decision | working (v0.1) |
 | [organon-vision](https://github.com/Philipjj609/organon-vision) | Sense + perception: images | File or URL → text lines and words (ocrs, pure Rust), layout blocks (text by alignment with line heights, figures from busy tiles), dominant palette (k-means in Lab), objects (YOLO on RTen when a model is present); regions in pixels; image measures shared with organon-video | working (v0.1) |
 | [organon-text](https://github.com/Philipjj609/organon-text) | Sense + perception: text | Web pages (Readability → Markdown, sections located), X posts and accounts, GitHub repos + README sections, HF datasets, PDFs (pages located); took over mneme's link capture with the same anchor ids | working (v0.1) |
-| organon-express | Expression | Diagrams with drill-down levels + short text; briefings | after the core |
+| [organon-express](https://github.com/Philipjj609/organon-express) | Expression | Briefings from memory: a diagram first (anchor → frame slots → linked anchors, unknown slots dashed), short text, levels to drill into, every statement citing its claim; Markdown + Mermaid and one self-contained HTML page | working (v0.1) |
 
 ## The intelligence (`organon`)
 

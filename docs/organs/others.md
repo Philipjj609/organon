@@ -25,4 +25,7 @@ Each starts by researching what exists, then designs the gap. Status of all: **s
 - **v0.1 built:** see [intelligence.md](intelligence.md). Budgets up front, measured spend, policy hook, two-tier routes, audit before digest, task episodes. Paperclip evaluated and not adopted for now.
 
 ## organon-express: showing
-- Answers as diagrams with levels you can open (overview → detail), a few lines of text beside them; built on the diagram-design skill (one HTML+SVG file per diagram); briefings.
+Status: **working (v0.1, 2026-11-15)**. Repo: [organon-express](https://github.com/Philipjj609/organon-express).
+- `organon-express brief <anchor>` reads mneme's `projections/graph.json` (it runs `mneme build` when the projection is behind the head), arranges the anchor by its frame, and writes Markdown + Mermaid (one page per anchor) plus one self-contained HTML page (inline SVG, no script).
+- Levels: overview diagram (anchor → slots → linked anchors) → slot sections (five statements, the rest folded) → each drawn anchor's own briefing (`--depth`). Every statement cites `c_…` ← `s_…`/`o_…`; empty slots are shown as unknown; confidence only on inferred claims.
+- Not built on the diagram-design skill as first planned: that is a prompt for an agent to hand-draw one diagram, while a briefing must be generated deterministically from claims. Express draws its own SVG behind a `Renderer` trait, and Mermaid for Markdown, the only graph syntax GitHub renders (research run in memory: `concept:diagramming`).
