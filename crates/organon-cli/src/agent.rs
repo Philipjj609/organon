@@ -52,7 +52,7 @@ fn transcripts() -> Vec<PathBuf> {
 
 /// The transcript of the Claude Code session this process runs in. Claude Code names it
 /// after the session id it puts in every command's environment.
-fn own_transcript() -> Option<PathBuf> {
+pub fn own_transcript() -> Option<PathBuf> {
     let id = std::env::var("CLAUDE_CODE_SESSION_ID").ok()?;
     let name = format!("{}.jsonl", id.trim());
     transcripts()

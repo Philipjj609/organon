@@ -211,6 +211,13 @@ fn task_standing(t: &Task) -> (Standing, Option<SessionSpend>) {
     (s, ss)
 }
 
+/// The open task of the agent session this command runs in, never another session's
+/// (see [`Home::current_task`]).
+fn current_task(home: &Home) -> Option<Task> {
+    let own = agent::own_transcript().map(|p| p.to_string_lossy().into_owned());
+    home.current_task(own.as_deref())
+}
+
 // ---------------------------------------------------------------- brief
 
 fn brief(home: &Home) -> Result<ExitCode> {
@@ -270,7 +277,7 @@ fn brief(home: &Home) -> Result<ExitCode> {
         }
     }
 
-    match home.active_task() {
+    match current_task(home) {
         Some(t) => {
             let (s, ss) = task_standing(&t);
             println!("task: {}", task_line(&t, &s, ss.as_ref()));
@@ -377,7 +384,17 @@ fn task(home: &Home, cmd: TaskCmd) -> Result<ExitCode> {
         } => {
             let mut t = match slug {
                 Some(s) => home.load_task(&s)?,
-                None => home.active_task().context("no open task")?,
+                None => current_task(home).with_context(|| {
+                    let open: Vec<String> = home.open_tasks().into_iter().map(|t| t.slug).collect();
+                    if open.is_empty() {
+                        "no open task".to_owned()
+                    } else {
+                        format!(
+                            "no open task of this session; open: {}. Name one: organon task done <slug>",
+                            open.join(", ")
+                        )
+                    }
+                })?,
             };
             if !t.is_open() {
                 bail!("task {} is already closed", t.slug);
@@ -745,7 +762,7 @@ fn audit_cmd(home: &Home, proposal: Option<&Path>, messages: &[PathBuf]) -> Resu
     if a.findings.is_empty() {
         println!("  ✓ nothing to fix");
     }
-    if let Some(t) = home.active_task() {
+    if let Some(t) = current_task(home) {
         let (s, ss) = task_standing(&t);
         println!("task: {}", task_line(&t, &s, ss.as_ref()));
     }

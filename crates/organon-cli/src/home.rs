@@ -118,9 +118,29 @@ impl Home {
         v
     }
 
-    /// The most recently started open task.
-    pub fn active_task(&self) -> Option<Task> {
-        self.tasks().into_iter().rev().find(Task::is_open)
+    /// Open tasks, newest first.
+    pub fn open_tasks(&self) -> Vec<Task> {
+        self.tasks()
+            .into_iter()
+            .rev()
+            .filter(Task::is_open)
+            .collect()
+    }
+
+    /// The open task a command belongs to. Run in an agent session (`own` is its transcript):
+    /// that session's task, else an open task no session claims; never another session's.
+    /// Run outside one: the open task, if exactly one is open.
+    pub fn current_task(&self, own: Option<&str>) -> Option<Task> {
+        let open = self.open_tasks();
+        match own {
+            Some(transcript) => open
+                .iter()
+                .find(|t| t.metered_in(transcript))
+                .or_else(|| open.iter().find(|t| t.meter.is_none()))
+                .cloned(),
+            None if open.len() == 1 => open.into_iter().next(),
+            None => None,
+        }
     }
 
     /// The most recently started open task of the session with this transcript.

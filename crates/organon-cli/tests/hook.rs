@@ -233,6 +233,39 @@ fn a_task_is_metered_in_the_session_that_declared_it_even_before_its_first_total
 }
 
 #[test]
+fn commands_act_on_their_own_sessions_task() {
+    let e = env("scope");
+    let dir = e.claude_dir().join("projects").join("p");
+    fs::create_dir_all(&dir).unwrap();
+    for id in ["sid-a", "sid-b"] {
+        fs::write(dir.join(format!("{id}.jsonl")), "").unwrap();
+    }
+    let new = |id: &str, goal: &str| {
+        let (out, ok) = e.organon_in(Some(id), &["task", "new", goal, "--effort", "lookup"], "");
+        assert!(ok, "{out}");
+    };
+    new("sid-a", "task a");
+    std::thread::sleep(std::time::Duration::from_millis(1100)); // b starts later: the newest
+    new("sid-b", "task b");
+
+    // Regression: brief, audit and `task done` took the newest open task of any session.
+    let (out, _) = e.organon_in(Some("sid-a"), &["brief"], "");
+    assert!(out.contains("task: task-a"), "{out}");
+    let (out, ok) = e.organon_in(Some("sid-a"), &["task", "done", "--outcome", "good"], "");
+    assert!(ok && out.contains("closed task-a"), "{out}");
+
+    // Outside any session, with two open, nothing is guessed.
+    new("sid-a", "task c");
+    let (out, ok) = e.organon_in(None, &["task", "done", "--outcome", "good"], "");
+    assert!(!ok, "{out}");
+    let tasks = fs::read_to_string(e.home.join("tasks").join("task-b").join("task.json")).unwrap();
+    assert!(
+        !tasks.contains("\"ended\""),
+        "the other session's task stays open: {tasks}"
+    );
+}
+
+#[test]
 fn eighty_percent_warns_once() {
     let e = env("warn");
     e.hook("Bash", r#"{"command":"true"}"#);
