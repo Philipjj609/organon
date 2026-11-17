@@ -2,6 +2,7 @@
 //! with budgets, measured spend, a policy hook for coding agents, routes, and audits.
 
 mod agent;
+mod git;
 mod home;
 mod organs;
 
@@ -23,7 +24,7 @@ use organon_core::task::{Event, Task};
 use organon_core::time::rfc3339;
 use organon_protocol::{check_stream, Message, Outcome, Proposal};
 
-use crate::home::{append_line, write_json, Home, SessionPointer};
+use crate::home::{append_line, write_json, Home};
 
 /// Context above which every turn is expensive enough to say so.
 const LARGE_CONTEXT: u64 = 200_000;
@@ -55,12 +56,18 @@ enum Cmd {
     /// Declare, list and close tasks.
     #[command(subcommand)]
     Task(TaskCmd),
-    /// Measured spend of the current agent session (or a task).
+    /// Measured spend of the current agent session (or a task, or another session).
     Spend {
         #[arg(long)]
         task: Option<String>,
         #[arg(long)]
         transcript: Option<PathBuf>,
+        /// A session by id (as listed by `--sessions`).
+        #[arg(long)]
+        session: Option<String>,
+        /// Every session the hook has seen, each with its own spend.
+        #[arg(long)]
+        sessions: bool,
     },
     /// Who does a job: `organon route scan`, `organon route --verify <producer-model>`.
     Route {
@@ -141,23 +148,32 @@ fn now() -> i64 {
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
+    if matches!(cli.cmd, Cmd::Hook) {
+        // Even without a home folder the hook answers (with the built-in policy).
+        let home = Home::locate().unwrap_or_else(|_| Home {
+            root: std::env::temp_dir().join("organon"),
+        });
+        return Ok(hook_cmd(&home));
+    }
     let home = Home::locate()?;
     match cli.cmd {
         Cmd::Brief => brief(&home),
         Cmd::Task(t) => task(&home, t),
-        Cmd::Spend { task, transcript } => spend(&home, task, transcript.as_deref()),
+        Cmd::Spend {
+            task,
+            transcript,
+            session,
+            sessions,
+        } => spend(
+            &home,
+            task,
+            transcript.as_deref(),
+            session.as_deref(),
+            sessions,
+        ),
         Cmd::Route { job, verify } => route(&home, job.as_deref(), verify.as_deref()),
         Cmd::Check { write, command } => check(&home, write.as_deref(), &command.join(" ")),
-        Cmd::Hook => {
-            // A hook must never break the agent: on any error, say nothing and allow.
-            if let Err(e) = hook(&home) {
-                let _ = append_line(
-                    &home.root.join("hook-errors.log"),
-                    &format!("{} {e:#}", rfc3339(now())),
-                );
-            }
-            Ok(ExitCode::SUCCESS)
-        }
+        Cmd::Hook => unreachable!("handled above"),
         Cmd::Audit { proposal, messages } => audit_cmd(&home, proposal.as_deref(), &messages),
         Cmd::Init { memory } => init(&home, memory.as_deref()),
     }
@@ -259,7 +275,7 @@ fn brief(home: &Home) -> Result<ExitCode> {
         }
     }
 
-    if let Some(path) = agent::transcript(home, None) {
+    if let Some(path) = agent::transcript(home, None, now()) {
         if let Ok(s) = agent::session_spend(&path) {
             println!(
                 "session: {} · {} requests · context {} tokens · {} per turn now",
@@ -348,14 +364,24 @@ fn task(home: &Home, cmd: TaskCmd) -> Result<ExitCode> {
             };
             let mut t = Task::new(&goal, Some(effort), budget, now());
             t.slug = home.free_slug(&t.slug);
-            t.meter = agent::start(home);
+            let located = agent::locate(home, None, now());
+            if let agent::Located::Found(p) = &located {
+                t.meter = agent::start(p);
+            }
             home.save_task(&t)?;
             println!(
                 "task {} · {effort} · budget {} and {} · warns at 80%, stops at 100%",
                 t.slug, budget.usd, budget.minutes
             );
-            if t.meter.is_none() {
-                println!("  (no agent transcript found: money is not measured, only time)");
+            match located {
+                agent::Located::Ambiguous(here) => println!(
+                    "  (several agent sessions are running in this folder ({}): not guessing which one is yours, so money is not measured, only time. Run it from the session, or set ORGANON_SESSION_ID)",
+                    here.iter().map(|r| r.session_id.as_str()).collect::<Vec<_>>().join(", ")
+                ),
+                _ if t.meter.is_none() => {
+                    println!("  (no agent transcript found: money is not measured, only time)");
+                }
+                _ => {}
             }
             println!(
                 "close it: organon task done {} --outcome good|partial|bad [--left \"…\"]",
@@ -437,7 +463,13 @@ fn task(home: &Home, cmd: TaskCmd) -> Result<ExitCode> {
 
 // ---------------------------------------------------------------- spend
 
-fn spend(home: &Home, task: Option<String>, transcript: Option<&Path>) -> Result<ExitCode> {
+fn spend(
+    home: &Home,
+    task: Option<String>,
+    transcript: Option<&Path>,
+    session: Option<&str>,
+    all: bool,
+) -> Result<ExitCode> {
     if let Some(slug) = task {
         let t = home.load_task(&slug)?;
         let (s, ss) = task_standing(&t);
@@ -447,8 +479,40 @@ fn spend(home: &Home, task: Option<String>, transcript: Option<&Path>) -> Result
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let path = agent::transcript(home, transcript)
-        .context("no agent transcript found (pass --transcript)")?;
+    if all {
+        let sessions = home.sessions();
+        if sessions.is_empty() {
+            println!("no sessions recorded yet (the hook records each session it sees)");
+        }
+        for r in sessions {
+            let spent = agent::session_spend(Path::new(&r.transcript)).map_or_else(
+                |_| "transcript unreadable".to_owned(),
+                |s| format!("{} · {} requests", money(s.usd), s.requests),
+            );
+            println!(
+                "{} · {spent} · last seen {} · {}",
+                r.session_id,
+                rfc3339(r.last_seen),
+                r.cwd
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let path = match (session, agent::locate(home, transcript, now())) {
+        (Some(id), _) => agent::session_transcript(home, id)
+            .with_context(|| format!("no session '{id}' (organon spend --sessions lists them)"))?,
+        (None, agent::Located::Found(p)) => p,
+        (None, agent::Located::Ambiguous(here)) => bail!(
+            "several agent sessions are running in this folder: {}. Pick one with --session <id>",
+            here.iter()
+                .map(|r| r.session_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        (None, agent::Located::Missing) => {
+            bail!("no agent transcript found (pass --transcript or --session)")
+        }
+    };
     let s = agent::session_spend(&path)?;
     println!("session {}", path.display());
     println!(
@@ -516,7 +580,8 @@ fn check(home: &Home, write: Option<&str>, command: &str) -> Result<ExitCode> {
         None if !command.trim().is_empty() => Action::Command(command),
         None => bail!("give a command after -- or --write <path>"),
     };
-    let v = policy.decide(action);
+    let branch_of = |hint: Option<&str>| git::branch_in(&git::folder("", hint));
+    let v = policy.decide_in(action, &branch_of);
     let d = format!("{:?}", v.decision).to_lowercase();
     match v.reason {
         Some(r) => println!("{d}: {r}"),
@@ -562,38 +627,236 @@ fn init(home: &Home, memory: Option<&Path>) -> Result<ExitCode> {
 /// Tools that cost another turn without reading or writing local files.
 const SPENDING_TOOLS: &[&str] = &["Agent", "Task", "WebSearch", "WebFetch"];
 
-fn hook(home: &Home) -> Result<()> {
+/// How long the hook may take before it stops waiting for itself (`$ORGANON_HOOK_DEADLINE_MS`
+/// overrides). Below Claude Code's own hook timeout, so organon, not the agent, decides what
+/// a slow check means.
+const HOOK_DEADLINE_MS: u64 = 8_000;
+
+/// What the hook needs from Claude Code's event.
+#[derive(Debug, Clone, Default)]
+struct HookEvent {
+    name: String,
+    tool: String,
+    command: Option<String>,
+    path: Option<String>,
+    transcript: String,
+    session_id: String,
+    cwd: String,
+}
+
+impl HookEvent {
+    fn action(&self) -> Action<'_> {
+        match (&self.command, &self.path) {
+            (Some(c), _) => Action::Command(c),
+            (None, Some(p)) => Action::Write { path: p },
+            (None, None) => Action::Tool(&self.tool),
+        }
+    }
+
+    fn from_json(ev: &Value) -> Self {
+        let s = |k: &str| {
+            ev.get(k)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let input = ev.get("tool_input").cloned().unwrap_or(Value::Null);
+        let field = |k: &str| {
+            input
+                .get(k)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let tool = s("tool_name");
+        let (command, path) = match tool.as_str() {
+            "Bash" | "PowerShell" => (Some(field("command")), None),
+            "Edit" | "Write" | "MultiEdit" => (None, Some(field("file_path"))),
+            "NotebookEdit" => (None, Some(field("notebook_path"))),
+            _ => (None, None),
+        };
+        Self {
+            name: s("hook_event_name"),
+            tool,
+            command,
+            path,
+            transcript: s("transcript_path"),
+            session_id: s("session_id"),
+            cwd: s("cwd"),
+        }
+    }
+
+    /// An event that is not valid JSON (cut short, or garbled) can still say what it was
+    /// about: recover what can be recovered, so the fail-safe can classify it.
+    fn salvage(raw: &str) -> Self {
+        let tool = string_field(raw, "tool_name").unwrap_or_default();
+        let command = string_field(raw, "command");
+        let path = string_field(raw, "file_path").or_else(|| string_field(raw, "notebook_path"));
+        Self {
+            name: string_field(raw, "hook_event_name").unwrap_or_default(),
+            command: command.filter(|_| matches!(tool.as_str(), "Bash" | "PowerShell" | "")),
+            path,
+            tool,
+            transcript: String::new(),
+            session_id: String::new(),
+            cwd: string_field(raw, "cwd").unwrap_or_default(),
+        }
+    }
+}
+
+/// The value of `"key": "…"` in text that may not be valid JSON. A string cut short is taken
+/// up to where it stops.
+fn string_field(raw: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\"");
+    let mut from = 0;
+    while let Some(k) = raw[from..].find(&pat) {
+        let after = from + k + pat.len();
+        from = after;
+        let Some(rest) = raw[after..].trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let Some(body) = rest.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        let mut escaped = false;
+        for (i, c) in body.char_indices() {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => return serde_json::from_str(&format!("\"{}\"", &body[..i])).ok(),
+                _ => {}
+            }
+        }
+        return Some(body.replace("\\\"", "\"").replace("\\\\", "\\"));
+    }
+    None
+}
+
+/// The hook as Claude Code runs it. It never fails the agent's process, and its answer on an
+/// internal error depends on the action: one in an approval class (push to main, deploy,
+/// send, delete, secrets, paid) is **denied**, since letting it through unchecked would skip
+/// the person's approval; anything else is allowed, as before. An error is a crash, a
+/// panic, a malformed event, an unreadable policy, or taking longer than the deadline.
+fn hook_cmd(home: &Home) -> ExitCode {
     let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input)?;
-    let ev: Value = serde_json::from_str(&input).context("hook input is not JSON")?;
-    let s = |k: &str| ev.get(k).and_then(Value::as_str).unwrap_or_default();
-    if !s("transcript_path").is_empty() {
-        home.save_session(&SessionPointer {
-            transcript: s("transcript_path").into(),
-            session_id: s("session_id").into(),
-            cwd: s("cwd").into(),
-        })?;
-    }
-    if s("hook_event_name") != "PreToolUse" {
-        return Ok(());
-    }
-    let tool = s("tool_name");
-    let input = ev.get("tool_input").cloned().unwrap_or(Value::Null);
-    let field = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or_default();
-    let action = match tool {
-        "Bash" | "PowerShell" => Action::Command(field("command")),
-        "Edit" | "Write" | "MultiEdit" => Action::Write {
-            path: field("file_path"),
-        },
-        "NotebookEdit" => Action::Write {
-            path: field("notebook_path"),
-        },
-        _ => Action::Other,
+    let read = std::io::stdin().read_to_string(&mut input);
+    let parsed: Result<Value, _> = serde_json::from_str(&input);
+    let (ev, early) = match (read, parsed) {
+        (Err(e), _) => (
+            HookEvent::salvage(&input),
+            Some(anyhow::Error::from(e).context("reading the hook event")),
+        ),
+        (Ok(_), Err(e)) => (
+            HookEvent::salvage(&input),
+            Some(anyhow::Error::from(e).context("hook input is not JSON")),
+        ),
+        (Ok(_), Ok(v)) => (HookEvent::from_json(&v), None),
     };
+    let outcome = match early {
+        Some(e) => Err(e),
+        None => hook_with_deadline(home, &ev),
+    };
+    match outcome {
+        Ok(Some(out)) => println!("{out}"),
+        Ok(None) => {}
+        Err(e) => {
+            let _ = append_line(
+                &home.root.join("hook-errors.log"),
+                &format!("{} {e:#}", rfc3339(now())),
+            );
+            if let Some(out) = fail_safe(home, &ev, &e) {
+                println!("{out}");
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn hook_deadline() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("ORGANON_HOOK_DEADLINE_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(HOOK_DEADLINE_MS),
+    )
+}
+
+/// Run the hook on its own thread and stop waiting at the deadline. A panic on that thread
+/// arrives here as an error, like any other.
+fn hook_with_deadline(home: &Home, ev: &HookEvent) -> Result<Option<String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (home2, ev2) = (home.clone(), ev.clone());
+    std::thread::spawn(move || {
+        // Testing only: make the hook slow, to prove a slow hook fails closed.
+        if let Some(ms) = std::env::var("ORGANON_HOOK_TEST_DELAY_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+        let _ = tx.send(hook(&home2, &ev2));
+    });
+    let deadline = hook_deadline();
+    match rx.recv_timeout(deadline) {
+        Ok(r) => r,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            bail!("the hook took longer than {} ms", deadline.as_millis())
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => bail!("the hook panicked"),
+    }
+}
+
+/// The answer when the hook could not decide: deny an approval-class action, allow anything
+/// else (`None`). The built-in rules always count, so a broken policy file cannot turn the
+/// fail-safe off.
+fn fail_safe(home: &Home, ev: &HookEvent, err: &anyhow::Error) -> Option<Value> {
+    if !ev.name.is_empty() && ev.name != "PreToolUse" {
+        return None;
+    }
+    let builtin = organon_core::policy::Policy::builtin();
+    let policy = match home.policy() {
+        Ok((p, _)) => p,
+        Err(_) => builtin,
+    };
+    let branch_of = |hint: Option<&str>| git::branch_in(&git::folder(&ev.cwd, hint));
+    let rule = policy.approval_class(ev.action(), &branch_of)?;
+    let mut why: String = format!("{err:#}").chars().take(300).collect();
+    if why.is_empty() {
+        why = "unknown error".into();
+    }
+    Some(json!({ "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": format!(
+            "organon could not check this action ({why}). It is in the approval class '{}' ({}), so it is denied instead of let through unchecked. Ask the user to run it, or fix organon first (details in {}).",
+            rule.class.as_deref().unwrap_or("?"),
+            rule.reason,
+            home.root.join("hook-errors.log").display()
+        ),
+    }}))
+}
+
+/// The hook's normal path: the answer to print, if any.
+fn hook(home: &Home, ev: &HookEvent) -> Result<Option<String>> {
+    if !ev.transcript.is_empty() {
+        // Bookkeeping, not part of the decision: a failure here is logged, never fatal.
+        if let Err(e) = home.record_session(&ev.session_id, &ev.transcript, &ev.cwd, now()) {
+            let _ = append_line(
+                &home.root.join("hook-errors.log"),
+                &format!("{} recording session: {e:#}", rfc3339(now())),
+            );
+        }
+    }
+    if ev.name != "PreToolUse" {
+        return Ok(None);
+    }
+    let tool = ev.tool.as_str();
+    let action = ev.action();
     let (policy, _) = home.policy()?;
-    let mut verdict = policy.decide(action);
+    let branch_of = |hint: Option<&str>| git::branch_in(&git::folder(&ev.cwd, hint));
+    let mut verdict = policy.decide_in(action, &branch_of);
     let mut context: Option<String> = None;
-    let active = home.active_task_in(s("transcript_path"));
+    let active = home.active_task_in(&ev.transcript);
 
     if let Some(t) = &active {
         let s = cached_standing(home, t)?;
@@ -628,7 +891,7 @@ fn hook(home: &Home) -> Result<()> {
                     action: match action {
                         Action::Command(c) => c.chars().take(200).collect(),
                         Action::Write { path } => format!("write {path}"),
-                        Action::Other => tool.to_owned(),
+                        Action::Tool(t) => t.to_owned(),
                     },
                 },
             )?;
@@ -664,10 +927,7 @@ fn hook(home: &Home) -> Result<()> {
             "permissionDecisionReason": verdict.reason.unwrap_or_default(),
         }})),
     };
-    if let Some(o) = out {
-        println!("{o}");
-    }
-    Ok(())
+    Ok(out.map(|o| o.to_string()))
 }
 
 /// The task's standing, re-measured at most every [`STANDING_TTL_SECS`]: a stop can lag that

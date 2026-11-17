@@ -1,5 +1,6 @@
-//! organon's own folder (`~/.organon`, or `$ORGANON_HOME`): policy, tasks, episodes, and a
-//! pointer to the agent session the hook last saw.
+//! organon's own folder (`~/.organon`, or `$ORGANON_HOME`): policy, tasks, episodes, and one
+//! record per agent session the hook has seen (`sessions/<id>.json`), so sessions running at
+//! the same time never overwrite each other.
 
 use std::fs;
 use std::io::Write as _;
@@ -11,18 +12,37 @@ use serde::{Deserialize, Serialize};
 use organon_core::policy::{Policy, DEFAULT};
 use organon_core::task::{Event, Task};
 
+#[derive(Debug, Clone)]
 pub struct Home {
     pub root: PathBuf,
 }
 
-/// The agent session the hook saw last.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionPointer {
+/// One agent session the hook has seen: its own file, written only by its own hook calls.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionRecord {
+    pub session_id: String,
     pub transcript: String,
     #[serde(default)]
-    pub session_id: String,
-    #[serde(default)]
     pub cwd: String,
+    /// Epoch seconds.
+    pub first_seen: i64,
+    /// Epoch seconds.
+    pub last_seen: i64,
+}
+
+/// A session id as a file name: letters, digits, `-` and `_` kept, anything else `_`.
+pub fn session_file_name(id: &str) -> String {
+    let safe: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{safe}.json")
 }
 
 /// Where things are, set once with `organon init`.
@@ -54,20 +74,20 @@ impl Home {
         self.root.join("policy.json")
     }
 
-    /// The policy file if there is one, else the built-in default.
+    /// The policy file if there is one, else the built-in default. Either way the built-in
+    /// approval-class rules apply too (see [`Policy::with_floor`]): a policy file written by an
+    /// older organon, or edited, still asks before a push to `main`.
     pub fn policy(&self) -> Result<(Policy, bool)> {
+        let builtin = Policy::from_json(DEFAULT).context("built-in policy")?;
         let path = self.policy_path();
         if path.exists() {
             let text =
                 fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
             let p = Policy::from_json(&text)
                 .with_context(|| format!("{} is not a valid policy", path.display()))?;
-            Ok((p, true))
+            Ok((p.with_floor(&builtin), true))
         } else {
-            Ok((
-                Policy::from_json(DEFAULT).context("built-in policy")?,
-                false,
-            ))
+            Ok((builtin, false))
         }
     }
 
@@ -166,16 +186,59 @@ impl Home {
             .collect()
     }
 
-    pub fn session(&self) -> Option<SessionPointer> {
-        let text = fs::read_to_string(self.root.join("session.json")).ok()?;
+    fn sessions_dir(&self) -> PathBuf {
+        self.root.join("sessions")
+    }
+
+    /// Note that the hook saw this session now. Each session has its own file, so hooks of
+    /// parallel sessions never write the same file. (They used to share `session.json`, and
+    /// whichever hook ran last decided which session `organon task new` metered.)
+    pub fn record_session(&self, id: &str, transcript: &str, cwd: &str, now: i64) -> Result<()> {
+        let id = if id.is_empty() {
+            // No id given: the transcript's file name is Claude Code's session id.
+            Path::new(transcript)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            id.to_owned()
+        };
+        if id.is_empty() {
+            return Ok(());
+        }
+        let dir = self.sessions_dir();
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(session_file_name(&id));
+        let first_seen = self.session_record(&id).map_or(now, |r| r.first_seen);
+        write_json(
+            &path,
+            &SessionRecord {
+                session_id: id,
+                transcript: transcript.to_owned(),
+                cwd: cwd.to_owned(),
+                first_seen,
+                last_seen: now,
+            },
+        )
+    }
+
+    pub fn session_record(&self, id: &str) -> Option<SessionRecord> {
+        let text = fs::read_to_string(self.sessions_dir().join(session_file_name(id))).ok()?;
         serde_json::from_str(&text).ok()
     }
 
-    /// Written on every hook call, so the session whose hook ran last is the one that just
-    /// called organon (`organon task new` meters the session that ran it).
-    pub fn save_session(&self, s: &SessionPointer) -> Result<()> {
-        fs::create_dir_all(&self.root)?;
-        write_json(&self.root.join("session.json"), s)
+    /// Every session the hook has seen, most recently seen first.
+    pub fn sessions(&self) -> Vec<SessionRecord> {
+        let mut v: Vec<SessionRecord> = fs::read_dir(self.sessions_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .filter_map(|e| fs::read_to_string(e.path()).ok())
+            .filter_map(|t| serde_json::from_str(&t).ok())
+            .collect();
+        v.sort_by_key(|r: &SessionRecord| std::cmp::Reverse(r.last_seen));
+        v
     }
 
     pub fn config(&self) -> Config {
@@ -203,8 +266,10 @@ impl Home {
     }
 }
 
+/// Write through a temporary file named after this process, then rename: two processes
+/// writing the same file at once each rename a whole file, and neither reads half of one.
 pub fn write_json(path: &Path, v: &impl Serialize) -> Result<()> {
-    let tmp = path.with_extension("tmp");
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
     fs::write(&tmp, serde_json::to_string_pretty(v)? + "\n")?;
     fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
 }
