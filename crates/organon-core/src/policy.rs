@@ -340,10 +340,15 @@ const PUSH_VALUE_FLAGS: &[&str] = &["-o", "--push-option", "--repo", "--receive-
 /// Words of `git` before its subcommand that take a value.
 const GIT_VALUE_FLAGS: &[&str] = &["-C", "-c", "--git-dir", "--work-tree", "--namespace"];
 
-/// A `git push` that names no branch pushes the current one (git's default,
-/// `push.default=simple`). Add that branch as a word, so a rule about `main` sees
-/// `git push` run on `main`. The branch is found in the folder the command runs in: the
-/// agent's, a `cd` earlier in the command, or `git -C <dir>`.
+/// Make every `git push` name the branches it really pushes, so a rule about `main` sees a
+/// push of the current branch when that branch is `main`:
+/// - a push that names no refspec pushes the current branch (git's default,
+///   `push.default=simple`): the branch is added as a word;
+/// - `HEAD` and `@` are the current branch, also as the source of a refspec: `HEAD` →
+///   `main`, `+@` → `+main`, `HEAD:x` → `main:x` (the destination `x` is unchanged).
+///
+/// The branch is found in the folder the command runs in: the agent's, a `cd` earlier in the
+/// command, or `git -C <dir>`. If it cannot be read, the words stay as written.
 pub fn resolve_pushes(segs: &mut [Vec<String>], branch_of: BranchOf<'_>) {
     let mut dir: Option<String> = None;
     for seg in segs.iter_mut() {
@@ -373,26 +378,62 @@ pub fn resolve_pushes(segs: &mut [Vec<String>], branch_of: BranchOf<'_>) {
         if seg.get(i).map(String::as_str) != Some("push") {
             continue;
         }
-        let args = push_arguments(&seg[i + 1..]);
+        let start = i + 1;
+        let args = push_arguments(&seg[start..]);
         let pushes_everything = args.flags.iter().any(|f| *f == "--all" || *f == "--mirror");
         let only_tags = args.flags.contains(&"--tags");
-        if args.positional <= 1 && !pushes_everything && !only_tags {
-            if let Some(b) = branch_of(git_dir.as_deref()) {
-                seg.push(b);
+        let bare = args.positional.len() <= 1 && !pushes_everything && !only_tags;
+        // The first positional word is the remote; the rest are refspecs.
+        let refspecs: Vec<usize> = args.positional.iter().skip(1).map(|k| start + k).collect();
+        let names_head = refspecs
+            .iter()
+            .any(|&k| current_branch_ref(&seg[k], "").is_some());
+        if !bare && !names_head {
+            continue;
+        }
+        let Some(branch) = branch_of(git_dir.as_deref()) else {
+            continue;
+        };
+        for k in refspecs {
+            if let Some(w) = current_branch_ref(&seg[k], &branch) {
+                seg[k] = w;
             }
+        }
+        if bare {
+            seg.push(branch);
         }
     }
 }
 
+/// A refspec whose source is the current branch (`HEAD`, `@`, `+HEAD`, `HEAD:x`, `@:x`),
+/// rewritten with that branch's name; `None` for any other refspec.
+fn current_branch_ref(refspec: &str, branch: &str) -> Option<String> {
+    let (plus, rest) = match refspec.strip_prefix('+') {
+        Some(r) => ("+", r),
+        None => ("", refspec),
+    };
+    let (src, dst) = match rest.split_once(':') {
+        Some((s, d)) => (s, Some(d)),
+        None => (rest, None),
+    };
+    if src != "HEAD" && src != "@" {
+        return None;
+    }
+    Some(match dst {
+        Some(d) => format!("{plus}{branch}:{d}"),
+        None => format!("{plus}{branch}"),
+    })
+}
+
 struct PushArguments<'a> {
-    /// Remote and refspecs.
-    positional: usize,
+    /// Indices of the remote and refspecs, in order.
+    positional: Vec<usize>,
     flags: Vec<&'a str>,
 }
 
 fn push_arguments(words: &[String]) -> PushArguments<'_> {
     let mut out = PushArguments {
-        positional: 0,
+        positional: Vec::new(),
         flags: Vec::new(),
     };
     let mut i = 0;
@@ -415,7 +456,7 @@ fn push_arguments(words: &[String]) -> PushArguments<'_> {
         if w.starts_with('-') {
             out.flags.push(w);
         } else {
-            out.positional += 1;
+            out.positional.push(i);
         }
         i += 1;
     }
@@ -587,6 +628,51 @@ mod tests {
         ] {
             assert_eq!(decide(cmd), Decision::Allow, "{cmd}");
         }
+
+        // HEAD and @ are the current branch, as a refspec or as its source side.
+        // Regression: on main, `git push origin HEAD` and `git push origin @` were allowed.
+        let current_branch_pushes = [
+            "git push origin HEAD",
+            "git push origin @",
+            "git push -u origin HEAD",
+            "git push origin +HEAD",
+            "git push origin HEAD:refs/heads/main",
+            "cd /x && git push -u origin HEAD 2>&1",
+        ];
+        for cmd in current_branch_pushes {
+            assert_eq!(decide_on("main", cmd), Decision::Ask, "on main: {cmd}");
+        }
+        assert_eq!(decide_on("master", "git push origin @"), Decision::Ask);
+        // The same commands on a feature branch push the feature branch: allowed.
+        for cmd in &current_branch_pushes[..4] {
+            assert_eq!(
+                decide_on("feature", cmd),
+                Decision::Allow,
+                "on feature: {cmd}"
+            );
+        }
+        // The destination still decides when it is named.
+        assert_eq!(
+            decide_on("main", "git push origin HEAD:feature"),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide_on("main", "git push origin @:feature"),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide_on("feature", "git push origin HEAD:main"),
+            Decision::Ask
+        );
+        assert_eq!(
+            decide_on("feature", "git push origin @:main"),
+            Decision::Ask
+        );
+        // `HEAD` as the remote's name is not a refspec.
+        assert_eq!(
+            decide_on("main", "git push origin HEADS-UP"),
+            Decision::Allow
+        );
     }
 
     #[test]

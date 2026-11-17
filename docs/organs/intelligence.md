@@ -49,6 +49,6 @@ Like git subcommands: an organ is an executable named `organon-<organ>` on `PATH
 - After a stop, wrap-up stays allowed: file edits; reading and moving around (`cd`, `ls`, `cat`, `grep`); `cargo fmt`, `cargo clippy` and `cargo test`; `git`; `gh run` and `gh pr view`/`checks`; `mneme` and `organon`. The stop message lists these, so the agent commits what is done instead of abandoning it.
 - A stop can lag up to 30 s behind the spend that caused it (the hook re-measures at most that often).
 - Time is wall-clock: a task left open over a break uses its time budget. Close tasks, or pass `--minutes 0` for no time limit.
-- The policy reads commands as written; `bash -c`, scripts and aliases get past it. A bare `git push` is judged by the branch in `.git/HEAD`, assuming git's default `push.default=simple` (an upstream with another name is not seen).
+- The policy reads commands as written; `bash -c`, scripts and aliases get past it. A bare `git push`, and a refspec whose source is `HEAD` or `@` (`git push origin HEAD`, `+@`, `HEAD:x`), are judged by the branch in `.git/HEAD`; a bare push assumes git's default `push.default=simple` (an upstream with another name is not seen).
 - The deadline cannot cover a hook that never starts (organon missing from `PATH`): Claude Code then lets the call through.
 - The audit checks structure, not truth: a cited passage can still be misread. Research verifies quotes; entailment checking is an open question.

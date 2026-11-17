@@ -469,9 +469,13 @@ fn a_bare_push_on_main_asks() {
     let push = |cmd: &str| e.hook_raw(&event("s", &e.transcript, &cwd, "Bash", &command(cmd)), &[]);
     assert!(is_ask(&push("git push")), "on main");
     assert!(is_ask(&push("git push origin")), "on main, remote only");
+    assert!(is_ask(&push("git push origin HEAD")), "HEAD on main");
+    assert!(is_ask(&push("git push -u origin @")), "@ on main");
     assert_eq!(push("git push origin feature"), "", "a named branch");
     fs::write(repo.join(".git").join("HEAD"), "ref: refs/heads/feature\n").unwrap();
     assert_eq!(push("git push"), "", "on a feature branch");
+    assert_eq!(push("git push origin HEAD"), "", "HEAD on a feature branch");
+    assert_eq!(push("git push -u origin @"), "", "@ on a feature branch");
 }
 
 // ------------------------------------------------------------ 3. parallel sessions
