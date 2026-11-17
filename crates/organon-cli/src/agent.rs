@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use organon_core::meter::{read_claude_code, Session, SessionSpend};
 use organon_core::task::{MeterStart, Task};
 
-use crate::home::{user_home, Home};
+use crate::home::{user_home, Home, SessionRecord};
 
 fn projects_dir() -> Option<PathBuf> {
     std::env::var_os("CLAUDE_CONFIG_DIR")
@@ -60,30 +60,85 @@ pub fn own_transcript() -> Option<PathBuf> {
         .find(|p| p.file_name().is_some_and(|n| n == name.as_str()))
 }
 
-/// The transcript to read: the one given, else the calling session's own, else the one the
-/// hook saw last (any session's, when several run at once), else the newest session of the
-/// current folder.
-pub fn transcript(home: &Home, explicit: Option<&Path>) -> Option<PathBuf> {
+/// A session counts as running if its hook ran within this many seconds.
+const ACTIVE_SECS: i64 = 600;
+
+/// Where the transcript to read was found, or why none was picked.
+pub enum Located {
+    Found(PathBuf),
+    /// Several sessions are running in this folder and nothing says which one is calling.
+    Ambiguous(Vec<SessionRecord>),
+    Missing,
+}
+
+/// The transcript of a session by id: its record, else Claude Code's file of that name.
+pub fn session_transcript(home: &Home, id: &str) -> Option<PathBuf> {
+    if let Some(r) = home.session_record(id) {
+        return Some(PathBuf::from(r.transcript));
+    }
+    let name = format!("{}.jsonl", id.trim());
+    transcripts()
+        .into_iter()
+        .find(|p| p.file_name().is_some_and(|n| n == name.as_str()))
+}
+
+fn same_folder(a: &str, b: &Path) -> bool {
+    let a = Path::new(a);
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// The transcript to read, in this order:
+/// 1. the one given;
+/// 2. the calling session's own (`CLAUDE_CODE_SESSION_ID`, set by Claude Code);
+/// 3. the session named by `ORGANON_SESSION_ID` (for runners and other agents);
+/// 4. the one session running in the current folder, from the hook's per-session records.
+///    Several running there: [`Located::Ambiguous`], never a guess;
+/// 5. the newest transcript of the current folder (when no hook has recorded anything).
+pub fn locate(home: &Home, explicit: Option<&Path>, now: i64) -> Located {
     if let Some(p) = explicit {
-        return Some(p.to_owned());
+        return Located::Found(p.to_owned());
     }
     if let Some(p) = own_transcript() {
-        return Some(p);
+        return Located::Found(p);
     }
-    if let Some(s) = home.session() {
-        let p = PathBuf::from(&s.transcript);
-        if p.exists() {
-            return Some(p);
-        }
+    if let Ok(id) = std::env::var("ORGANON_SESSION_ID") {
+        return session_transcript(home, &id).map_or(Located::Missing, Located::Found);
     }
-    let cwd = std::env::current_dir().ok()?;
-    let dir = projects_dir()?.join(project_folder(&cwd));
+    let Ok(cwd) = std::env::current_dir() else {
+        return Located::Missing;
+    };
+    let here: Vec<SessionRecord> = home
+        .sessions()
+        .into_iter()
+        .filter(|r| now - r.last_seen <= ACTIVE_SECS && same_folder(&r.cwd, &cwd))
+        .collect();
+    match here.len() {
+        1 => return Located::Found(PathBuf::from(&here[0].transcript)),
+        0 => {}
+        _ => return Located::Ambiguous(here),
+    }
+    let Some(dir) = projects_dir().map(|d| d.join(project_folder(&cwd))) else {
+        return Located::Missing;
+    };
     fs::read_dir(dir)
-        .ok()?
+        .into_iter()
+        .flatten()
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
         .max_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+        .map_or(Located::Missing, Located::Found)
+}
+
+/// [`locate`], when only a found transcript matters.
+pub fn transcript(home: &Home, explicit: Option<&Path>, now: i64) -> Option<PathBuf> {
+    match locate(home, explicit, now) {
+        Located::Found(p) => Some(p),
+        _ => None,
+    }
 }
 
 /// Read a transcript from `offset` on, plus its subagents' transcripts.
@@ -137,8 +192,8 @@ fn known_rates(except: &Path) -> BTreeMap<String, f64> {
 
 /// Where a new task starts in the current session, with rates calibrated on all before it
 /// (or, for models this session has no total for yet, on other sessions).
-pub fn start(home: &Home) -> Option<MeterStart> {
-    let path = transcript(home, None)?;
+pub fn start(path: &Path) -> Option<MeterStart> {
+    let path = path.to_owned();
     let (session, len) = read(&path, 0).ok()?;
     let mut rates = known_rates(&path);
     rates.extend(session.rates());

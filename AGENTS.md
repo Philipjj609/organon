@@ -22,5 +22,7 @@ Every bug fix gets a regression test. `tests/hook.rs` drives the hook end to end
 **Rules:**
 1. Intelligence coordinates; organs do the work. Never re-implement an organ's job here.
 2. Measured or labelled: an estimate is shown as `≈`, and an unknown is shown as `?`. Never present one as a fact.
-3. A hook never breaks the agent. On an error it allows and logs to `~/.organon/hook-errors.log`.
+3. A hook never breaks the agent's process, and it fails closed only where it must. On an error (crash, panic, malformed event, unreadable policy, past its deadline) it logs to `~/.organon/hook-errors.log`, then **denies** an action in an approval class (`push-main`, `deploy`, `send`, `delete`, `secrets`, `paid`) and allows anything else.
 4. A budget stop is final for its task. Never make it retryable.
+5. Approval-class rules are a floor: the built-in ones always apply, whatever `policy.json` says. A policy file can add rules, never drop or weaken them.
+6. Each agent session has its own record (`sessions/<id>.json`). Never write state that one session's hook shares with another's.
