@@ -18,7 +18,15 @@ pub const DEFAULT: &str = include_str!("../../../policy/default.json");
 /// The kinds of action a person approves before an agent may take them. A rule tagged with
 /// one of these is part of the policy's floor: see [`Policy::with_floor`] and
 /// [`Policy::approval_class`].
-pub const APPROVAL_CLASSES: &[&str] = &["push-main", "deploy", "send", "delete", "secrets", "paid"];
+pub const APPROVAL_CLASSES: &[&str] = &[
+    "push-main",
+    "deploy",
+    "send",
+    "merge",
+    "delete",
+    "secrets",
+    "paid",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1183,9 +1191,98 @@ mod tests {
     }
 
     #[test]
-    fn sends_ask() {
+    fn merging_a_pull_request_asks_in_its_own_class() {
+        for cmd in ["gh pr merge 12 --squash", "gh pr merge 3"] {
+            assert_eq!(decide(cmd), Decision::Ask, "{cmd}");
+            assert_eq!(class_of(cmd).as_deref(), Some("merge"), "{cmd}");
+        }
+        // Only the merge itself is in the class: reading and opening pull requests is free.
+        for cmd in ["gh pr view 12", "gh pr create --fill", "gh pr checks 12"] {
+            assert_eq!(decide(cmd), Decision::Allow, "{cmd}");
+        }
+    }
+
+    fn with_merge_exception() -> Policy {
+        let mut p = policy();
+        p.exceptions.push(Exception {
+            class: "merge".into(),
+            repo: "*/Projects/ergon".into(),
+            reason: "test".into(),
+        });
+        p
+    }
+
+    #[test]
+    fn a_merge_exception_lifts_a_plain_merge_in_its_repository_only() {
+        let p = with_merge_exception();
         for cmd in [
             "gh pr merge 12 --squash",
+            "gh pr merge 12 --squash --delete-branch --match-head-commit abc123",
+            "gh pr merge 12 --rebase",
+            "gh pr merge --merge",
+            "cd C:/Users/x/Projects/ergon && gh pr merge 3 --squash",
+        ] {
+            assert_eq!(decide_at(&p, cmd), Decision::Allow, "{cmd}");
+        }
+        // Whatever names another repository, skips the checks, or is not a merge still asks.
+        for cmd in [
+            "gh pr merge 12 --admin",
+            "gh pr merge 12 --squash --repo Philipjj609/Koda",
+            "gh pr merge 12 --repo=Philipjj609/Koda",
+            "gh pr merge 12 -R Philipjj609/Koda",
+            "gh pr merge 12 -RPhilipjj609/Koda",
+            "gh pr merge 12 -r",
+            "gh pr merge https://github.com/Philipjj609/Koda/pull/12 --squash",
+            "gh pr --repo Philipjj609/Koda merge 12",
+            "gh pr -R Philipjj609/Koda merge 12",
+            "echo x | mail a@b.c",
+            "npm publish",
+        ] {
+            assert_eq!(decide_at(&p, cmd), Decision::Ask, "{cmd}");
+        }
+        // A plain merge in another folder asks.
+        assert_eq!(
+            decide_at(&p, "cd C:/Users/x/Projects/Koda && gh pr merge 12 --squash"),
+            Decision::Ask
+        );
+        // So does one whose folder cannot be known, or whose repository is unknown.
+        for cmd in [
+            "cd $OTHER && gh pr merge 12 --squash",
+            "cd C:/Users/x/Projects/ergon; gh pr merge 12 --squash",
+            "gh pr merge 12 --squash | cat",
+            "cd C:/Users/x/Projects && cd ergon && gh pr merge 12 --squash",
+        ] {
+            assert_eq!(decide_at(&p, cmd), Decision::Ask, "{cmd}");
+        }
+        assert_eq!(
+            p.decide_in(Action::Command("gh pr merge 12 --squash"), &no_branch)
+                .decision,
+            Decision::Ask
+        );
+        // The fail-safe ignores exceptions: the merge is still in its class.
+        assert_eq!(
+            p.approval_class(Action::Command("gh pr merge 12 --squash"), &no_branch)
+                .and_then(|r| r.class.as_deref()),
+            Some("merge")
+        );
+    }
+
+    #[test]
+    fn a_send_exception_does_not_lift_a_merge() {
+        let mut p = policy();
+        p.exceptions.push(Exception {
+            class: "send".into(),
+            repo: "*/Projects/ergon".into(),
+            reason: "test".into(),
+        });
+        assert_eq!(decide_at(&p, "gh pr merge 12 --squash"), Decision::Ask);
+        // ...and it lifts the rest of its class there, as before.
+        assert_eq!(decide_at(&p, "npm publish"), Decision::Allow);
+    }
+
+    #[test]
+    fn sends_ask() {
+        for cmd in [
             "echo hi | mail -s x a@b.c",
             "Send-MailMessage -To a@b.c -Subject x",
             r#"curl -s "https://api.telegram.org/bot$T/sendMessage" -d chat_id=1"#,

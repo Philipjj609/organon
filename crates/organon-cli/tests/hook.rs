@@ -444,6 +444,43 @@ fn pushes_to_main_deploys_and_sends_ask() {
 }
 
 #[test]
+fn a_merge_exception_lets_a_plain_merge_through_in_its_repository_only() {
+    let e = env("merge-exception");
+    fs::create_dir_all(&e.home).unwrap();
+    fs::write(
+        e.home.join("policy.json"),
+        r#"{"efforts":{"lookup":{"usd":1.0,"minutes":15}},"routes":{},"rules":[],
+            "exceptions":[{"class":"merge","repo":"*/repo","reason":"my own repository"}]}"#,
+    )
+    .unwrap();
+    let root = e.home.parent().unwrap().to_owned();
+    let mut cwds = Vec::new();
+    for name in ["repo", "other"] {
+        let dir = root.join(name);
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/feature\n").unwrap();
+        cwds.push(dir.to_string_lossy().into_owned());
+    }
+    let run = |cwd: &str, cmd: &str| {
+        e.hook_raw(&event("s", &e.transcript, cwd, "Bash", &command(cmd)), &[])
+    };
+    // In the excepted repository a plain merge goes through, anything else about it asks.
+    assert_eq!(run(&cwds[0], "gh pr merge 7 --squash --delete-branch"), "");
+    for cmd in [
+        "gh pr merge 7 --admin",
+        "gh pr merge 7 --repo Philipjj609/Koda",
+        "gh pr merge 7 -R Philipjj609/Koda",
+        "echo x | mail a@b.c",
+    ] {
+        let out = run(&cwds[0], cmd);
+        assert!(is_ask(&out), "{cmd}: {out}");
+    }
+    // In any other repository it still asks.
+    let out = run(&cwds[1], "gh pr merge 7 --squash");
+    assert!(is_ask(&out), "{out}");
+}
+
+#[test]
 fn an_old_policy_file_still_gets_the_new_rules() {
     let e = env("old-policy");
     fs::create_dir_all(&e.home).unwrap();
