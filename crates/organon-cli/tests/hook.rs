@@ -703,6 +703,39 @@ fn a_session_env_file_whose_names_are_not_in_the_policy_list_stops_the_merge_exc
 }
 
 #[test]
+fn a_policy_with_an_invalid_merge_env_names_denies_a_merge_instead_of_lifting_it() {
+    // The shipped rules still count: an unreadable policy fails closed on a merge. Broad
+    // patterns, a pattern that could match a barred name and a bad character all do it.
+    for (i, bad) in ["*", "*_*", "LD_*", "G*", "VERCEL-*", ""]
+        .iter()
+        .enumerate()
+    {
+        let policy = format!(
+            r#"{{"efforts":{{"lookup":{{"usd":1.0,"minutes":15}}}},"routes":{{}},"rules":[],
+            "exceptions":[{{"class":"merge","repo":"*/repo","reason":"my own repository"}}],
+            "merge_env_names":["{bad}"]}}"#
+        );
+        let (e, cwd) = merge_exception_env(&format!("merge-bad-env-names-{i}"), &policy);
+        let ev = event(
+            "s",
+            &e.transcript,
+            &cwd,
+            "Bash",
+            &command("gh pr merge 7 --squash"),
+        );
+        let out = e.hook_raw(&ev, &[]);
+        assert!(is_deny(&out), "{bad:?}: {out}");
+        assert!(
+            out.contains("merge_env_names"),
+            "{bad:?}: names the field: {out}"
+        );
+        // Anything that is not in an approval class is let through as before.
+        let ev = event("s", &e.transcript, &cwd, "Bash", &command("git status"));
+        assert_eq!(e.hook_raw(&ev, &[]), "", "{bad:?}");
+    }
+}
+
+#[test]
 fn a_claude_env_file_whose_names_are_not_in_the_policy_list_stops_the_merge_exception() {
     let run = |name: &str, policy: &str, text: &str| {
         let (e, cwd) = merge_exception_env(name, policy);

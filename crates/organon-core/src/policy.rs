@@ -2553,6 +2553,55 @@ mod tests {
     }
 
     #[test]
+    fn a_merge_exception_needs_every_reading_certain_of_the_folder_and_a_command_under_the_cap() {
+        let p = with_merge_exception();
+        let r = "C:/Users/x/Projects/ergon";
+        // The excepted folder still lifts a plain merge after the parser changes.
+        for cmd in [
+            "gh pr merge 7 --squash".to_owned(),
+            format!("cd {r} && gh pr merge 7 --squash"),
+        ] {
+            assert_eq!(decide_at(&p, &here(&cmd)), Decision::Allow, "{cmd}");
+        }
+        // A `!` part (a failed `cd` then runs the merge where it stood), a `cd` with more
+        // than one argument (it fails and stays put), a lone `&`: the folder is not certain.
+        for cmd in [
+            format!("cd {r} && ! gh pr merge 7 --squash"),
+            format!("! cd {r} && gh pr merge 7 --squash"),
+            format!("cd {r} M && gh pr merge 7"),
+            format!("cd {r} M && gh pr merge 7 --squash"),
+            format!("cd {r} & gh pr merge 7"),
+            format!("cd {r} && gh pr merge 7 & echo"),
+        ] {
+            assert_eq!(decide_at(&p, &here(&cmd)), Decision::Ask, "{cmd}");
+        }
+        // Over 64 KB nothing is lifted, even a command that is only a plain merge and
+        // spaces: it asks.
+        let pad = " ".repeat(70 * 1024);
+        for cmd in [
+            format!("gh pr merge 7 --squash{pad}"),
+            format!("cd {r} && gh pr merge 7 --squash{pad}"),
+            format!("gh pr merge 7 --squash {} ", "-d ".repeat(30 * 1024)),
+        ] {
+            assert!(cmd.len() > MAX_COMMAND_BYTES);
+            assert_eq!(
+                decide_at(&p, &here(&cmd)),
+                Decision::Ask,
+                "{} bytes",
+                cmd.len()
+            );
+        }
+        // And the same plain merge under the cap is fine.
+        assert_eq!(
+            decide_at(
+                &p,
+                &here(&format!("gh pr merge 7 --squash{}", " ".repeat(1024)))
+            ),
+            Decision::Allow
+        );
+    }
+
+    #[test]
     fn a_merge_exception_is_not_fooled_by_steering_the_target_in_the_same_command() {
         let p = with_merge_exception();
         assert_eq!(decide_at(&p, "gh pr merge 3"), Decision::Allow);
