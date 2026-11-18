@@ -166,14 +166,27 @@ impl Policy {
         branch_of: BranchOf<'_>,
         repo_of: RepoOf<'_>,
     ) -> Verdict {
+        if matches!(action, Action::Command(c) if c.len() > MAX_COMMAND_BYTES) {
+            return Verdict {
+                decision: Decision::Ask,
+                reason: Some("The command is too long for organon to check.".into()),
+            };
+        }
         let mut best = Verdict {
             decision: Decision::Allow,
             reason: None,
         };
-        for r in self.matching(action, branch_of, repo_of) {
-            if r.decision > best.decision {
+        for (r, bash) in self.matching(action, branch_of, repo_of) {
+            // Text that only cmd or PowerShell reads as a command (a bash quote that they do
+            // not know) may be a commit message: a deny there is an ask.
+            let decision = if r.decision == Decision::Deny && !bash {
+                Decision::Ask
+            } else {
+                r.decision
+            };
+            if decision > best.decision {
                 best = Verdict {
-                    decision: r.decision,
+                    decision,
                     reason: Some(r.reason.clone()),
                 };
             }
@@ -188,6 +201,7 @@ impl Policy {
     pub fn approval_class(&self, action: Action<'_>, branch_of: BranchOf<'_>) -> Option<&Rule> {
         self.matching(action, branch_of, &no_repo)
             .into_iter()
+            .map(|(r, _)| r)
             .find(|r| r.class.is_some())
     }
 
@@ -196,23 +210,26 @@ impl Policy {
         action: Action<'_>,
         branch_of: BranchOf<'_>,
         repo_of: RepoOf<'_>,
-    ) -> Vec<&Rule> {
-        let mut out = Vec::new();
+    ) -> Vec<(&Rule, bool)> {
+        // Each rule with whether a bash reading of the command matched it.
+        let mut out: Vec<(&Rule, bool)> = Vec::new();
         match action {
             Action::Command(cmd) => {
                 // Every reading of the command is judged and a rule that matches under any of
                 // them counts. An exception lifts a rule only when every reading is certain of
                 // the folders and they all find the same programs in the same folders.
-                let reads: Vec<Reading> = readings(cmd)
+                let reads: Vec<Reading> = parse_all(cmd)
                     .into_iter()
-                    .map(|mut segs| {
-                        let certain = folders_are_certain(cmd, &segs);
+                    .map(|p| {
+                        let mut segs = p.segs;
+                        let certain = !p.bang && folders_are_certain(cmd, &segs);
                         let dirs = segment_dirs(&segs);
                         resolve_pushes(&mut segs, branch_of);
                         Reading {
                             segs,
                             certain,
                             dirs,
+                            bash: p.bash,
                         }
                     })
                     .collect();
@@ -223,9 +240,11 @@ impl Policy {
                         // Some(None): looked up, no repository; looked up at most once per part.
                         let mut repo: Option<Option<String>> = None;
                         for r in &self.rules {
-                            if !r.command.as_deref().is_some_and(|p| matches(p, seg))
-                                || out.contains(&r)
-                            {
+                            if !r.command.as_deref().is_some_and(|p| matches(p, seg)) {
+                                continue;
+                            }
+                            if let Some(seen) = out.iter_mut().find(|(o, _)| *o == r) {
+                                seen.1 |= read.bash;
                                 continue;
                             }
                             if agree && r.decision == Decision::Ask && !self.exceptions.is_empty() {
@@ -236,7 +255,7 @@ impl Policy {
                                     }
                                 }
                             }
-                            out.push(r);
+                            out.push((r, read.bash));
                         }
                     }
                 }
@@ -246,13 +265,15 @@ impl Policy {
                 out.extend(
                     self.rules
                         .iter()
-                        .filter(|r| r.path.as_deref().is_some_and(|p| glob(p, &path))),
+                        .filter(|r| r.path.as_deref().is_some_and(|p| glob(p, &path)))
+                        .map(|r| (r, true)),
                 );
             }
             Action::Tool(name) => out.extend(
                 self.rules
                     .iter()
-                    .filter(|r| r.tool.as_deref().is_some_and(|p| glob(p, name))),
+                    .filter(|r| r.tool.as_deref().is_some_and(|p| glob(p, name)))
+                    .map(|r| (r, true)),
             ),
         }
         out
@@ -272,6 +293,9 @@ impl Policy {
     #[must_use]
     pub fn allowed_after_budget(&self, cmd: &str) -> bool {
         // Allowed only if every reading of the command agrees.
+        if cmd.len() > MAX_COMMAND_BYTES {
+            return false;
+        }
         readings(cmd).iter().all(|segs| {
             !segs.is_empty()
                 && segs
@@ -287,11 +311,17 @@ impl Policy {
     }
 }
 
+/// The longest command the policy reads. A longer one is not parsed: it asks. The hook has
+/// ten seconds, and the readings and the rules are matched part by part.
+pub const MAX_COMMAND_BYTES: usize = 64 * 1024;
+
 /// One reading of a command: its parts, and where each works (see [`readings`]).
 struct Reading {
     segs: Vec<Vec<String>>,
     certain: bool,
     dirs: Vec<Option<String>>,
+    /// Whether a bash reading gives these parts.
+    bash: bool,
 }
 
 impl Reading {
@@ -344,6 +374,8 @@ struct Syntax {
     /// Bash `${...}`, inside which a `&` is text.
     braces: bool,
     amp: Amp,
+    /// Whether this is a reading of bash (as opposed to PowerShell or cmd).
+    bash: bool,
 }
 
 /// Bash as the splitter first read it: `\` escapes, a `"` always ends a double-quoted
@@ -357,6 +389,7 @@ const OLD: Syntax = Syntax {
     ansi_c: false,
     braces: false,
     amp: Amp::Keep,
+    bash: true,
 };
 /// Bash with a lone `&` as a separator.
 const BASH: Syntax = Syntax {
@@ -380,6 +413,7 @@ const POWERSHELL: Syntax = Syntax {
     ansi_c: false,
     braces: false,
     amp: Amp::Split { amp_gt: false },
+    bash: false,
 };
 /// cmd: `^` is the escape, `'` is not a quote, and `&` always separates (`&>f` included).
 const CMD: Syntax = Syntax {
@@ -390,6 +424,7 @@ const CMD: Syntax = Syntax {
     ansi_c: false,
     braces: false,
     amp: Amp::Split { amp_gt: false },
+    bash: false,
 };
 
 impl Syntax {
@@ -432,17 +467,45 @@ pub fn segments(cmd: &str) -> Vec<Vec<String>> {
 /// others cannot hide a part from the policy.
 #[must_use]
 pub fn readings(cmd: &str) -> Vec<Vec<Vec<String>>> {
-    let mut out: Vec<Vec<Vec<String>>> = Vec::new();
+    parse_all(cmd).into_iter().map(|p| p.segs).collect()
+}
+
+/// One distinct reading of a command, and what is known about how it was read.
+struct Parsed {
+    segs: Vec<Vec<String>>,
+    /// Whether a bash reading gives these parts (and not only PowerShell or cmd).
+    bash: bool,
+    /// Whether a part started with `!`, which inverts its status: a failed `cd` then lets
+    /// the next part run in the folder before it.
+    bang: bool,
+}
+
+fn parse_all(cmd: &str) -> Vec<Parsed> {
+    let mut out: Vec<Parsed> = Vec::new();
     for syntax in [OLD, BASH, BASH_QUOTING, POWERSHELL, CMD] {
-        let segs = split(cmd, syntax);
-        if !out.contains(&segs) {
-            out.push(segs);
+        let (segs, bang) = split_marked(cmd, syntax);
+        match out.iter_mut().find(|p| p.segs == segs) {
+            Some(p) => {
+                p.bash |= syntax.bash;
+                p.bang |= bang;
+            }
+            None => out.push(Parsed {
+                segs,
+                bash: syntax.bash,
+                bang,
+            }),
         }
     }
     out
 }
 
 fn split(cmd: &str, sh: Syntax) -> Vec<Vec<String>> {
+    split_marked(cmd, sh).0
+}
+
+/// [`split`], also saying whether a part started with `!`.
+fn split_marked(cmd: &str, sh: Syntax) -> (Vec<Vec<String>>, bool) {
+    let mut bang = false;
     let mut out = Vec::new();
     let mut words: Vec<String> = Vec::new();
     let mut word = String::new();
@@ -454,8 +517,9 @@ fn split(cmd: &str, sh: Syntax) -> Vec<Vec<String>> {
             words.push(std::mem::take(word));
         }
     };
-    let end = |words: &mut Vec<String>, out: &mut Vec<Vec<String>>| {
-        let mut ws = strip_leading(std::mem::take(words));
+    let mut end = |words: &mut Vec<String>, out: &mut Vec<Vec<String>>| {
+        let (mut ws, negated) = strip_leading(std::mem::take(words));
+        bang |= negated && !ws.is_empty();
         if let Some(p) = ws.first_mut() {
             *p = program_name(p);
         }
@@ -499,6 +563,11 @@ fn split(cmd: &str, sh: Syntax) -> Vec<Vec<String>> {
             None => match c {
                 _ if sh.is_single(c) => quote = Some(Quote::Single),
                 _ if sh.is_double(c) => quote = Some(Quote::Double),
+                // `$$` is the process id: what follows it is not `${`, `$'` or `$(`.
+                '$' if chars.peek() == Some(&'$') => {
+                    chars.next();
+                    word.push_str("$$");
+                }
                 '$' if sh.ansi_c && chars.peek() == Some(&'\'') => {
                     chars.next();
                     quote = Some(Quote::AnsiC);
@@ -557,7 +626,7 @@ fn split(cmd: &str, sh: Syntax) -> Vec<Vec<String>> {
     }
     push_word(&mut word, &mut words);
     end(&mut words, &mut out);
-    out
+    (out, bang)
 }
 
 fn dq_escape_char(sh: Syntax) -> char {
@@ -601,22 +670,27 @@ fn take_braces(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, word: &mut 
 }
 
 /// Words that can come before a command without being it: `{ git push; }`, `then git push`.
+/// (`!` too, but it is noted: it inverts the status, see [`Parsed::bang`].)
 const SHELL_KEYWORDS: &[&str] = &[
-    "{", "}", "!", "if", "then", "elif", "else", "do", "while", "until", "time",
+    "{", "}", "if", "then", "elif", "else", "do", "while", "until", "time",
 ];
 
-/// Drop what comes before a command's program: `VAR=value` assignments, shell keywords and
-/// redirections (`>f`, `> f`, `>>f`, `2>f`, `&>f`, `N>&M`, `<f`, `0<&0`, `<<EOF`), which a
+/// Drop what comes before a command's program: `VAR=value` assignments, shell keywords, `!`
+/// (which is reported) and redirections (`>f`, `> f`, `>>f`, `2>f`, `&>f`, `N>&M`, `<f`, `0<&0`, `<<EOF`), which a
 /// shell allows anywhere in a command.
-fn strip_leading(words: Vec<String>) -> Vec<String> {
+fn strip_leading(words: Vec<String>) -> (Vec<String>, bool) {
     let mut i = 0;
+    let mut bang = false;
     while i < words.len() {
         let w = words[i].as_str();
         let digits = w.trim_start_matches(|c: char| c.is_ascii_digit());
         let all_digits = !w.is_empty() && digits.is_empty();
         let next = words.get(i + 1).map(String::as_str);
         let is_gt = |s: Option<&str>| matches!(s, Some(">" | ">>"));
-        if is_assignment(w) || SHELL_KEYWORDS.contains(&w) {
+        if w == "!" {
+            bang = true;
+            i += 1;
+        } else if is_assignment(w) || SHELL_KEYWORDS.contains(&w) {
             i += 1;
         } else if is_gt(Some(w)) {
             i += 2; // `>` and its target
@@ -633,7 +707,7 @@ fn strip_leading(words: Vec<String>) -> Vec<String> {
             break;
         }
     }
-    words.into_iter().skip(i).collect()
+    (words.into_iter().skip(i).collect(), bang)
 }
 
 fn is_assignment(w: &str) -> bool {
@@ -809,7 +883,8 @@ pub fn folders_are_certain(cmd: &str, segs: &[Vec<String>]) -> bool {
                         || w.starts_with('\\')
                         || (w.len() >= 2 && w.as_bytes()[1] == b':')
                 };
-                !targets.is_empty()
+                // `cd a b` fails in bash and leaves the folder as it was.
+                targets.len() == 1
                     && !seg[1..].iter().any(|w| w == "-")
                     && targets.iter().all(|w| literal(w) && absolute(w))
             }
@@ -1359,6 +1434,94 @@ mod tests {
         assert_eq!(at("git push origin main &"), Decision::Ask);
         assert_eq!(at("echo 'a & b' && git push origin main"), Decision::Ask);
         assert_eq!(at(r#"echo "\"" && git push origin main"#), Decision::Ask);
+    }
+
+    #[test]
+    fn a_cd_that_fails_does_not_move_the_exception() {
+        // The agent works in a repository on `main` without an exception. `cd M M` fails in
+        // bash (too many arguments) and `!` turns that into success, so the push runs here.
+        let p = with_exception();
+        let on_main = |_: Option<&str>| Some("main".to_owned());
+        let repo =
+            |hint: Option<&str>| Some(hint.unwrap_or("C:/Users/x/Projects/other").to_owned());
+        let at = |cmd: &str| p.decide_at(Action::Command(cmd), &on_main, &repo).decision;
+        let m = "/c/Users/x/Projects/mneme-memory";
+        for cmd in [
+            format!("! cd {m} {m} && git push origin main"),
+            format!("! cd {m} {m} && git push"),
+            format!("cd {m} {m} && git push origin main"),
+            format!("cd {m} {m} && git push"),
+            format!("! cd {m} && git push origin main"),
+            format!("! cd {m} && git push"),
+            format!("set-location {m} {m} && git push origin main"),
+        ] {
+            assert_eq!(at(&cmd), Decision::Ask, "{cmd}");
+        }
+        // The same without the trap: one `cd` to the excepted repository lifts it.
+        assert_eq!(
+            at(&format!("cd {m} && git push origin main")),
+            Decision::Allow
+        );
+        // `!` in front of a command is still read as the command it negates.
+        assert_eq!(
+            segments("! git push origin main"),
+            [vec!["git", "push", "origin", "main"]]
+        );
+        assert_eq!(decide("! git push origin main"), Decision::Ask);
+    }
+
+    #[test]
+    fn a_process_id_is_not_the_start_of_an_expansion() {
+        for cmd in [
+            r##"echo \" $${ & git push origin main #} \""##,
+            r##"echo "\"" $$'\' & git push origin main"##,
+            r##"echo $$$'\'' & git push origin main"##,
+            r##"echo $$(true) & git push origin main"##,
+            r##"echo $$ & git push origin main"##,
+        ] {
+            assert_eq!(decide(cmd), Decision::Ask, "{cmd}");
+        }
+        assert_eq!(
+            segments("echo $${ & git push"),
+            [vec!["echo", "$${"], vec!["git", "push"]]
+        );
+    }
+
+    #[test]
+    fn text_only_cmd_or_powershell_reads_as_a_command_asks_instead_of_denying() {
+        for cmd in [
+            "git commit -m 'Ask before git push; rm -rf needs approval'",
+            "git commit -m 'done; gh repo delete x'",
+            "gh pr create --body 'note; gh repo delete x'",
+            "gh pr create --body 'a' --title 'b & gh repo delete x'",
+        ] {
+            assert_eq!(decide(cmd), Decision::Ask, "{cmd}");
+        }
+        // Where bash reads it as a command too, the deny stays.
+        for cmd in [
+            "gh repo delete x",
+            "echo hi; gh repo delete x",
+            "echo 'a' ; gh repo delete x",
+            "echo hi & gh repo delete x",
+            "gh pr create --body 'a' && gh repo delete x",
+        ] {
+            assert_eq!(decide(cmd), Decision::Deny, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_command_over_64_kb_asks_without_being_read() {
+        let p = policy();
+        let long = format!("echo {}", "a ".repeat(MAX_COMMAND_BYTES / 2));
+        assert!(long.len() > MAX_COMMAND_BYTES);
+        let start = std::time::Instant::now();
+        let v = p.decide(Action::Command(&long));
+        assert_eq!(v.decision, Decision::Ask);
+        assert!(!p.allowed_after_budget(&long));
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
+        // Just under the limit is read as usual.
+        let ok = format!("echo {}", "a ".repeat(100));
+        assert_eq!(p.decide(Action::Command(&ok)).decision, Decision::Allow);
     }
 
     #[test]
