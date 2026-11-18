@@ -1,7 +1,7 @@
 //! The one git fact the policy needs: which branch a folder has checked out, so a bare
 //! `git push` on `main` is seen as a push to `main`. Read from `.git/HEAD` (no git process).
 
-use organon_core::policy::Inherited;
+use organon_core::policy::{env_name_allowed, Inherited};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -92,14 +92,18 @@ fn drive_path(p: &str) -> String {
 /// files Claude Code sources before each command (the one `CLAUDE_ENV_FILE` names, and every
 /// `*.sh` in `<claude config dir>/session-env/<session id>/`). `session_id` is the hook
 /// event's; `None` (the `check` command) reads no session folder, and an empty or odd one
-/// (anything but letters, digits, `-`, `_`) counts as unreadable.
-pub fn inherited(session_id: Option<&str>) -> Inherited {
+/// (anything but letters, digits, `-`, `_`) counts as unreadable. `allowed_names` is the
+/// policy's `merge_env_names`: the variables those files may set. Only `GH_REPO` and `GH_HOST`
+/// are looked for in this process's own environment; other variables in Claude Code's own
+/// environment are out of scope.
+pub fn inherited(session_id: Option<&str>, allowed_names: &[String]) -> Inherited {
     let config = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| crate::home::user_home().map(|h| h.join(".claude")));
     inherited_in(
         session_id,
         config.as_deref(),
+        allowed_names,
         &|k| std::env::var_os(k),
         &|p| fs::read(p),
         &|d| {
@@ -122,6 +126,7 @@ type ListShell<'a> = &'a dyn Fn(&Path) -> std::io::Result<Vec<PathBuf>>;
 fn inherited_in(
     session_id: Option<&str>,
     config_dir: Option<&Path>,
+    allowed: &[String],
     var: VarOf<'_>,
     read: ReadFile<'_>,
     list: ListShell<'_>,
@@ -158,7 +163,7 @@ fn inherited_in(
         match read(path) {
             Ok(bytes) => {
                 // Anything not provably harmless may steer `gh`: nothing is lifted.
-                if judge_shell_file(&String::from_utf8_lossy(&bytes)) {
+                if judge_shell_file(&String::from_utf8_lossy(&bytes), allowed) {
                     out.gh_target = true;
                     out.init_unsafe = true;
                 }
@@ -177,37 +182,24 @@ fn inherited_in(
 /// Whether a file the shell sources before each command is NOT provably harmless.
 ///
 /// This is an allow-list over the raw text, not a search for bad words: a shell has more ways
-/// to steer `gh` (a split name, a variable, a function, an alias, `PATH`, `GIT_DIR`, git config)
-/// than any list of them can hold, so a file is safe only if every line is one of these and
-/// anything else, anywhere, makes the whole file unsafe:
+/// to steer `gh` (a split name, a variable, a function, an alias, `PATH`, `GIT_DIR`, git
+/// config, arithmetic on a special variable) than any list of them can hold, so a file is safe
+/// only if every line is one of these, and anything else, anywhere, makes the whole file
+/// unsafe:
 /// - the line (minus one trailing `\r`) is blank, or a comment (spaces, `#`, any text);
 /// - or it is `NAME=VALUE` or `export NAME=VALUE` and nothing else, where `NAME` is
-///   `[A-Za-z_][A-Za-z0-9_]*` and is not, in any case, one that starts with `GH_`, `GIT_` or
-///   `XDG_` or is one of `PATH`, `HOME`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `BASH_ENV`,
-///   `ENV`, `PROMPT_COMMAND`, `SHELLOPTS`, `BASHOPTS`, `IFS`, `PS4`, `CDPATH`;
+///   `[A-Za-z_][A-Za-z0-9_]*` and passes [`env_name_allowed`]: it matches one of `allowed`
+///   (the policy's `merge_env_names`, empty by default, so no assignment passes) and is not
+///   one of the barred names and prefixes kept in `organon_core::policy`, a second guard that
+///   is deliberately not claimed to be complete;
 /// - and `VALUE` is plain (`[A-Za-z0-9_./:@,+=-]*`), or one pair of double quotes, or one pair
 ///   of single quotes, around those characters and spaces: no `$`, backtick, `;`, `&`, `|`, `(`,
 ///   `{`, `<` or `>`;
 /// - and the file has no backslash and no control character other than the line ends.
 ///
 /// An empty file is safe.
-fn judge_shell_file(text: &str) -> bool {
+fn judge_shell_file(text: &str, allowed: &[String]) -> bool {
     const PLAIN: &str = "_./:@,+=-";
-    const BARRED: [&str; 13] = [
-        "path",
-        "home",
-        "userprofile",
-        "appdata",
-        "localappdata",
-        "bash_env",
-        "env",
-        "prompt_command",
-        "shellopts",
-        "bashopts",
-        "ifs",
-        "ps4",
-        "cdpath",
-    ];
     let plain = |c: char| c.is_ascii_alphanumeric() || PLAIN.contains(c);
     let value_ok = |v: &str| {
         if let Some(q) = v.chars().next().filter(|c| matches!(c, '"' | '\'')) {
@@ -219,13 +211,11 @@ fn judge_shell_file(text: &str) -> bool {
         }
     };
     let name_ok = |n: &str| {
-        let lower = n.to_ascii_lowercase();
         let mut cs = n.chars();
         cs.next()
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
             && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
-            && !["gh_", "git_", "xdg_"].iter().any(|p| lower.starts_with(p))
-            && !BARRED.contains(&lower.as_str())
+            && env_name_allowed(allowed, n)
     };
     if text.contains('\\') {
         return true;
@@ -288,11 +278,30 @@ mod tests {
                 },
             )
         };
+        // What a policy's `merge_env_names` might list for these files.
+        let allowed_names = || -> Vec<String> {
+            [
+                "VERCEL_PLUGIN_*",
+                "FOO",
+                "A",
+                "B",
+                "C",
+                "D",
+                "E",
+                "PATHX",
+                "GHX",
+                "GITX",
+                "MYHOME",
+            ]
+            .map(String::from)
+            .to_vec()
+        };
         let run = |sid: Option<&str>,
                    env: &[(&'static str, &'static str)],
                    files: &[(&'static str, &'static str)]| {
             let (r, l) = disk(files);
-            inherited_in(sid, Some(cfg), &vars(env), &r, &l)
+            let allowed = allowed_names();
+            inherited_in(sid, Some(cfg), &allowed, &vars(env), &r, &l)
         };
         let clean = Inherited::default();
         assert_eq!(run(Some("s"), &[], &[]), clean, "no folder, nothing set");
@@ -310,6 +319,8 @@ mod tests {
             "export VERCEL_PLUGIN_SETUP_MODE=\"1\"\r\nFOO=bar\r\n",
             "# a note: gh_repo $x `y` (z); a.\n   # indented\n\nA=1.5\nexport B=x/y:z@w,v+u=t-s\nC=\nD='a b'\nE=\"a b\"\n",
             "export A=1",
+            // U+2028 is no line end for the shell: still one comment.
+            "# a\u{2028}export GH_REPO=x\n",
             "export PATHX=1\nexport GHX=1\nexport GITX=1\nexport MYHOME=1\n",
         ];
         let unsafe_files = [
@@ -382,6 +393,17 @@ mod tests {
             "# tab\tin a comment\n",
             "export A=\u{0}\n",
             "export A=\u{1b}[0m\n",
+            // Names the policy does not list, however harmless they look.
+            "export XYZ=1\n",
+            "export vercel_plugin=1\n",
+            "export VERCEL_PLUGINX=1\n",
+            // Pinned: a quote inside quotes, a BOM, non-ASCII, a bare `=1`.
+            "export A=\"it's\"\n",
+            "export A='say \"x\"'\n",
+            "\u{feff}export A=1\n",
+            "export A=caf\u{e9}\n",
+            "export \u{e9}A=1\n",
+            "=1\n",
         ];
         let e = [("CLAUDE_ENV_FILE", "/tmp/env.sh")];
         let sh = |text: &'static str| [("/cfg/session-env/s/hook-1.sh", text)];
@@ -418,7 +440,59 @@ mod tests {
         assert!(!run(Some("s"), &[], &[]).init_unsafe);
         // No config folder known: a session's files cannot be found.
         let (r, l) = disk(&[]);
-        assert!(inherited_in(Some("s"), None, &vars(&[]), &r, &l).init_unsafe);
+        assert!(inherited_in(Some("s"), None, &[], &vars(&[]), &r, &l).init_unsafe);
+    }
+
+    #[test]
+    fn a_barred_name_is_unsafe_even_when_the_allow_list_would_match_it() {
+        // `judge_shell_file` does not validate the list (the policy does at load): here the
+        // list is as broad as it can be, to show the barred names are a second guard.
+        let broad: Vec<String> = [
+            "*", "*_*", "O*", "E*", "L*", "D*", "P*", "H*", "G*", "S*", "R*",
+        ]
+        .map(String::from)
+        .to_vec();
+        for line in [
+            "export OPTIND=PATH=0",
+            "OPTIND=PATH=0",
+            "export EXECIGNORE=x",
+            "export LD_PRELOAD=/x/y.so",
+            "export LD_LIBRARY_PATH=/x",
+            "export LD_AUDIT=/x",
+            "export DYLD_INSERT_LIBRARIES=/x",
+            "export GCONV_PATH=/x",
+            "export PATHEXT=.EXE",
+            "export HTTPS_PROXY=http://x",
+            "export http_proxy=http://x",
+            "export ALL_PROXY=x",
+            "export SSL_CERT_FILE=/x",
+            "export SSL_CERT_DIR=/x",
+            "export GITHUB_TOKEN=x",
+            "export GITHUB_ENTERPRISE_TOKEN=x",
+            "export RANDOM=1",
+            "export SECONDS=1",
+            "export LINENO=1",
+            "export HISTCMD=1",
+            "export BASH_ARGV0=x",
+            "export BASH_ENV=x",
+            "export PATH=x",
+            "export GH_REPO=o/r",
+            "export GIT_DIR=x",
+            "export NODE_OPTIONS=x",
+        ] {
+            let text = format!("{line}\n");
+            assert!(judge_shell_file(&text, &broad), "{line}");
+            assert!(judge_shell_file(&text, &[]), "{line}: empty list");
+        }
+        // A listed, unbarred name passes; the same line with an empty list does not.
+        let vercel = ["VERCEL_PLUGIN_*".to_string()];
+        let text = "export VERCEL_PLUGIN_SETUP_MODE=\"greenfield\"\n";
+        assert!(!judge_shell_file(text, &vercel));
+        assert!(judge_shell_file(text, &[]));
+        assert!(
+            !judge_shell_file("# only a comment\n\n", &[]),
+            "no assignment: fine"
+        );
     }
 
     #[test]

@@ -582,7 +582,12 @@ fn check(home: &Home, write: Option<&str>, command: &str) -> Result<ExitCode> {
     };
     let branch_of = |hint: Option<&str>| git::branch_in(&git::folder("", hint));
     let repo_of = |hint: Option<&str>| git::repo_root(&git::folder("", hint));
-    let v = policy.decide_with_env(action, &branch_of, &repo_of, git::inherited(None));
+    let v = policy.decide_with_env(
+        action,
+        &branch_of,
+        &repo_of,
+        git::inherited(None, &policy.merge_env_names),
+    );
     let d = format!("{:?}", v.decision).to_lowercase();
     match v.reason {
         Some(r) => println!("{d}: {r}"),
@@ -860,7 +865,7 @@ fn hook(home: &Home, ev: &HookEvent) -> Result<Option<String>> {
         action,
         &branch_of,
         &repo_of,
-        git::inherited(Some(&ev.session_id)),
+        git::inherited(Some(&ev.session_id), &policy.merge_env_names),
     );
     let mut context: Option<String> = None;
     let active = home.active_task_in(&ev.transcript);

@@ -606,6 +606,7 @@ const SAFE_ENV_FILES: [&str; 5] = [
     "export VERCEL_PLUGIN_SETUP_MODE=\"1\"\r\nFOO=bar\r\n",
     "\n# a note\n\nexport FOO=1\n",
     "A=b\nexport C='d e'\n",
+    // (Their names are the ones `MERGE_EXCEPTION_ENV` lists.)
 ];
 
 /// Env files that can steer `gh` to another repository (or cannot be shown not to).
@@ -633,9 +634,106 @@ const UNSAFE_ENV_FILES: [&str; 20] = [
     ". ./x.sh\n",
 ];
 
+/// The same exception, with the variable names its env files may set listed in policy.
+const MERGE_EXCEPTION_ENV: &str = r#"{"efforts":{"lookup":{"usd":1.0,"minutes":15}},"routes":{},"rules":[],
+    "exceptions":[{"class":"merge","repo":"*/repo","reason":"my own repository"}],
+    "merge_env_names":["VERCEL_PLUGIN_*","FOO","A","C"]}"#;
+
+/// Names the policy above does not list, or that no policy may list: each makes a file ask.
+const UNLISTED_NAME_ENV_FILES: [&str; 9] = [
+    "export VERCEL_OTHER=1\n",
+    "export NOT_LISTED=1\n",
+    "export VERCEL_PLUGIN_SETUP_MODE=\"1\"\nexport NOT_LISTED=1\n",
+    "export OPTIND=PATH=0\n",
+    "export EXECIGNORE=x\n",
+    "export LD_PRELOAD=/x/y.so\n",
+    "export PATHEXT=.EXE\n",
+    "export HTTPS_PROXY=http://x\n",
+    "export GITHUB_TOKEN=x\n",
+];
+
+#[test]
+fn a_session_env_file_whose_names_are_not_in_the_policy_list_stops_the_merge_exception() {
+    // The default list is empty: any assignment asks, comments and blank lines do not.
+    let (e, cwd) = merge_exception_env("merge-session-names-default", MERGE_EXCEPTION);
+    let ev = event(
+        "s",
+        &e.transcript,
+        &cwd,
+        "Bash",
+        &command("gh pr merge 7 --squash"),
+    );
+    let dir = e.claude_dir().join("session-env").join("s");
+    fs::create_dir_all(&dir).unwrap();
+    let with = |e: &Env, ev: &str, content: &str| {
+        let file = e
+            .claude_dir()
+            .join("session-env")
+            .join("s")
+            .join("hook-1.sh");
+        fs::write(&file, content).unwrap();
+        let out = e.hook_raw(ev, &[]);
+        fs::remove_file(file).unwrap();
+        out
+    };
+    for text in ["", "\n# a note\n\n"] {
+        assert_eq!(with(&e, &ev, text), "", "{text:?}");
+    }
+    for text in SAFE_ENV_FILES.iter().filter(|t| t.contains('=')) {
+        let out = with(&e, &ev, text);
+        assert!(is_ask(&out), "default list: {text:?}: {out}");
+    }
+    // With `VERCEL_PLUGIN_*` listed the real plugin files go through; others do not.
+    let (e, cwd) = merge_exception_env("merge-session-names-listed", MERGE_EXCEPTION_ENV);
+    let ev = event(
+        "s",
+        &e.transcript,
+        &cwd,
+        "Bash",
+        &command("gh pr merge 7 --squash"),
+    );
+    let dir = e.claude_dir().join("session-env").join("s");
+    fs::create_dir_all(&dir).unwrap();
+    let real = "export VERCEL_PLUGIN_BOOTSTRAP_HINTS=\"1\"\nexport VERCEL_PLUGIN_SETUP_MODE=\"greenfield\"\n";
+    assert_eq!(with(&e, &ev, real), "");
+    for text in UNLISTED_NAME_ENV_FILES {
+        let out = with(&e, &ev, text);
+        assert!(is_ask(&out), "{text:?}: {out}");
+    }
+}
+
+#[test]
+fn a_claude_env_file_whose_names_are_not_in_the_policy_list_stops_the_merge_exception() {
+    let run = |name: &str, policy: &str, text: &str| {
+        let (e, cwd) = merge_exception_env(name, policy);
+        let ev = event(
+            "s",
+            &e.transcript,
+            &cwd,
+            "Bash",
+            &command("gh pr merge 7 --squash"),
+        );
+        let file = e.home.parent().unwrap().join("env.sh");
+        fs::write(&file, text).unwrap();
+        e.hook_raw(&ev, &[("CLAUDE_ENV_FILE", &file.to_string_lossy())])
+    };
+    let real = "export VERCEL_PLUGIN_BOOTSTRAP_HINTS=\"1\"\nexport VERCEL_PLUGIN_SETUP_MODE=\"greenfield\"\n";
+    assert_eq!(run("env-names-listed", MERGE_EXCEPTION_ENV, real), "");
+    let out = run("env-names-default", MERGE_EXCEPTION, real);
+    assert!(is_ask(&out), "default list: {out}");
+    for (i, text) in UNLISTED_NAME_ENV_FILES.iter().enumerate() {
+        let out = run(
+            &format!("env-names-unlisted-{i}"),
+            MERGE_EXCEPTION_ENV,
+            text,
+        );
+        assert!(is_ask(&out), "{text:?}: {out}");
+    }
+}
+
 #[test]
 fn a_session_env_file_that_is_not_plain_assignments_stops_the_merge_exception() {
-    let (e, cwd) = merge_exception_env("merge-session-env", MERGE_EXCEPTION);
+    let (e, cwd) = merge_exception_env("merge-session-env", MERGE_EXCEPTION_ENV);
     let ev = event(
         "s",
         &e.transcript,
@@ -671,7 +769,7 @@ fn a_session_env_file_that_is_not_plain_assignments_stops_the_merge_exception() 
 
 #[test]
 fn a_claude_env_file_that_is_not_plain_assignments_stops_the_merge_exception() {
-    let (e, cwd) = merge_exception_env("merge-env-file", MERGE_EXCEPTION);
+    let (e, cwd) = merge_exception_env("merge-env-file", MERGE_EXCEPTION_ENV);
     let dir = e.home.parent().unwrap().to_owned();
     let ev = event(
         "s",

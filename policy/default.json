@@ -135,6 +135,7 @@
     { "path": "*/projections/view.html", "decision": "deny", "reason": "Projections are generated: change the memory and run `mneme build` (mneme invariant 2)." },
     { "path": "*/projections/wiki/*", "decision": "deny", "reason": "Projections are generated: change the memory and run `mneme build` (mneme invariant 2)." }
   ],
+  "merge_env_names": [],
   "after_budget": [
     "organon",
     "mneme",

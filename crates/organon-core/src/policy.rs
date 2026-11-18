@@ -64,6 +64,128 @@ pub struct Policy {
     /// Repositories where a person lifted one approval class (see [`Exception`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exceptions: Vec<Exception>,
+    /// Names of variables a shell env file may set without making a `merge` exception ask:
+    /// glob patterns of letters, digits and `_` with `*` (for example `VERCEL_PLUGIN_*`),
+    /// matched ignoring case. Empty by default, so any assignment in such a file asks; blank
+    /// lines and comments never do. Checked when the policy is read: see [`env_name_allowed`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merge_env_names: Vec<String>,
+}
+
+/// Name prefixes (lower case) of variables a shell env file may never set to lift a `merge`:
+/// they steer `gh`, git, the dynamic loader, the shell itself or credentials. A second guard
+/// behind the policy's allow-list; it is not claimed to be complete, the allow-list is the
+/// control.
+const BARRED_PREFIXES: &[&str] = &[
+    "gh_", "git_", "xdg_", "ld_", "dyld_", "bash", "github_", "ssl_", "curl_", "node_",
+];
+
+/// Exact names (lower case) barred the same way: where programs are found, what the shell
+/// evaluates or runs by itself, and the special variables that take arithmetic or have side
+/// effects when assigned (`OPTIND=PATH=0` sets `PATH`).
+const BARRED_NAMES: &[&str] = &[
+    "path",
+    "pathext",
+    "home",
+    "userprofile",
+    "appdata",
+    "localappdata",
+    "env",
+    "prompt_command",
+    "shellopts",
+    "ifs",
+    "ps0",
+    "ps1",
+    "ps2",
+    "ps3",
+    "ps4",
+    "cdpath",
+    "execignore",
+    "globignore",
+    "fignore",
+    "gconv_path",
+    "optind",
+    "optarg",
+    "random",
+    "srandom",
+    "seconds",
+    "lineno",
+    "histcmd",
+    "epochseconds",
+    "epochrealtime",
+    "funcname",
+    "histfile",
+    "histcontrol",
+    "histsize",
+    "histfilesize",
+    "histtimeformat",
+    "histignore",
+    "mail",
+    "mailpath",
+    "mailcheck",
+    "timeformat",
+    "tmout",
+    "inputrc",
+    "shell",
+    "comspec",
+    "systemroot",
+    "windir",
+    "tmpdir",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "ftp_proxy",
+    "no_proxy",
+    "proxy",
+];
+
+/// Whether a variable name is one a shell env file may never set (see [`BARRED_PREFIXES`]),
+/// ignoring case: also any name ending in `_proxy`.
+#[must_use]
+pub fn env_name_barred(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    BARRED_PREFIXES.iter().any(|p| n.starts_with(p))
+        || BARRED_NAMES.contains(&n.as_str())
+        || n.ends_with("_proxy")
+}
+
+/// Whether `merge_env_names` lets a file set the variable `name`: it matches one pattern
+/// (ignoring case) and is not barred.
+#[must_use]
+pub fn env_name_allowed(patterns: &[String], name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    !env_name_barred(&n) && patterns.iter().any(|p| glob(&p.to_ascii_lowercase(), &n))
+}
+
+/// Why `pattern` is not a fit entry for `merge_env_names`, if it is not: it holds a character
+/// other than a letter, a digit, `_` or `*`, it is empty or a bare `*`, or it could match a
+/// barred name or a name starting with a barred prefix.
+fn bad_env_pattern(pattern: &str) -> Option<&'static str> {
+    if pattern.is_empty() || pattern.chars().all(|c| c == '*') {
+        return Some("is empty or only `*`");
+    }
+    if !pattern
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '*')
+    {
+        return Some("has a character other than letters, digits, `_` and `*`");
+    }
+    let p = pattern.to_ascii_lowercase();
+    let literal_start = p.split('*').next().unwrap_or_default();
+    let starts_like_a_barred_prefix = BARRED_PREFIXES.iter().any(|b| {
+        if p.contains('*') {
+            literal_start.starts_with(b) || b.starts_with(literal_start)
+        } else {
+            p.starts_with(b)
+        }
+    });
+    let matches_a_barred_name = if p.contains('*') {
+        BARRED_NAMES.iter().any(|n| glob(&p, n))
+    } else {
+        env_name_barred(&p)
+    };
+    (starts_like_a_barred_prefix || matches_a_barred_name)
+        .then_some("could match a variable a shell env file may never set")
 }
 
 /// A person's standing yes for one approval class in some repositories: an `ask` rule of
@@ -253,9 +375,20 @@ fn runs_gh(seg: &[String]) -> bool {
 
 impl Policy {
     /// # Errors
-    /// When the JSON does not describe a policy.
+    /// When the JSON does not describe a policy, or `merge_env_names` has a pattern that is
+    /// empty, a bare `*`, uses a character other than letters, digits, `_` and `*`, or could
+    /// match a variable a shell env file may never set (`LD_*`, `*_*`, `G*`, `PATH`...).
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(s)
+        use serde::de::Error;
+        let p: Self = serde_json::from_str(s)?;
+        for n in &p.merge_env_names {
+            if let Some(why) = bad_env_pattern(n) {
+                return Err(serde_json::Error::custom(format!(
+                    "merge_env_names: \"{n}\" {why}"
+                )));
+            }
+        }
+        Ok(p)
     }
 
     /// The policy shipped with organon.
@@ -1865,6 +1998,113 @@ mod tests {
         // Applying the floor twice adds nothing.
         let n = floored.rules.len();
         assert_eq!(floored.with_floor(&Policy::builtin()).rules.len(), n);
+    }
+
+    fn policy_with_env_names(names: &str) -> Result<Policy, serde_json::Error> {
+        let mut v: serde_json::Value = serde_json::from_str(DEFAULT).unwrap();
+        v["merge_env_names"] = serde_json::from_str(names).unwrap();
+        Policy::from_json(&v.to_string())
+    }
+
+    #[test]
+    fn merge_env_names_are_checked_when_the_policy_is_read() {
+        // The shipped policy lists none.
+        assert!(Policy::builtin().merge_env_names.is_empty());
+        // A policy without the field is fine too.
+        assert!(
+            Policy::from_json(r#"{"efforts":{},"routes":{},"rules":[]}"#)
+                .unwrap()
+                .merge_env_names
+                .is_empty()
+        );
+        let ok = policy_with_env_names(r#"["VERCEL_PLUGIN_*", "MY_TOOL_MODE", "vercel_x"]"#)
+            .expect("plain names and prefixes are accepted");
+        assert_eq!(ok.merge_env_names.len(), 3);
+        for bad in [
+            "*",
+            "**",
+            "",
+            "*_*",
+            "LD_*",
+            "ld_preload",
+            "L*",
+            "*LD_*",
+            "DYLD_*",
+            "G*",
+            "GH_*",
+            "GIT_*",
+            "GITHUB_*",
+            "GITHUB_TOKEN",
+            "XDG_*",
+            "BASH*",
+            "SSL_*",
+            "PATH",
+            "PATH*",
+            "P*",
+            "PATHEXT",
+            "OPTIND",
+            "O*",
+            "EXECIGNORE",
+            "E*",
+            "*_PROXY",
+            "HTTPS_PROXY",
+            "*PROXY",
+            "R*",
+            "SECONDS",
+            "VERCEL-PLUGIN",
+            "VERCEL PLUGIN_*",
+            "VERCEL_?",
+            "VERCEL_[A-Z]*",
+            "VERCEL_PLUGIN=*",
+            "VERCEL_\u{e9}*",
+        ] {
+            let e = policy_with_env_names(&format!("[{}]", serde_json::to_string(bad).unwrap()))
+                .expect_err(bad);
+            assert!(e.to_string().contains("merge_env_names"), "{bad}: {e}");
+        }
+        // One bad entry spoils the list, wherever it stands.
+        assert!(policy_with_env_names(r#"["VERCEL_PLUGIN_*", "LD_*"]"#).is_err());
+    }
+
+    #[test]
+    fn a_name_is_allowed_only_when_listed_and_not_barred() {
+        let list = ["VERCEL_PLUGIN_*".to_string(), "OPTIND".to_string()];
+        assert!(env_name_allowed(&list, "VERCEL_PLUGIN_SETUP_MODE"));
+        assert!(env_name_allowed(&list, "vercel_plugin_x"));
+        assert!(!env_name_allowed(&list, "VERCEL_OTHER"));
+        assert!(!env_name_allowed(&[], "VERCEL_PLUGIN_SETUP_MODE"));
+        // Listed but barred (a list that skipped validation): still no.
+        assert!(!env_name_allowed(&list, "OPTIND"));
+        for n in [
+            "PATH",
+            "Path",
+            "PATHEXT",
+            "EXECIGNORE",
+            "LD_PRELOAD",
+            "DYLD_FOO",
+            "GCONV_PATH",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+            "MY_PROXY",
+            "SSL_CERT_FILE",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "GIT_DIR",
+            "OPTIND",
+            "RANDOM",
+            "SECONDS",
+            "LINENO",
+            "HISTCMD",
+            "BASH_ARGV0",
+            "BASH_ENV",
+            "NODE_OPTIONS",
+            "CURL_CA_BUNDLE",
+        ] {
+            assert!(env_name_barred(n), "{n}");
+        }
+        for n in ["VERCEL_PLUGIN_SETUP_MODE", "FOO", "MY_TOOL"] {
+            assert!(!env_name_barred(n), "{n}");
+        }
     }
 
     #[test]
