@@ -14,8 +14,10 @@ struct Env {
 }
 
 fn env(name: &str) -> Env {
-    let root =
-        std::env::temp_dir().join(format!("organon-hook-test-{name}-{}", std::process::id()));
+    // Under cargo's own scratch folder, not the system TEMP: on Windows runners TEMP is an 8.3
+    // short name with a `~`, which a literal-safe `cd <path>` command may not contain.
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("organon-hook-test-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
     let transcript = root.join("session.jsonl");
