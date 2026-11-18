@@ -175,7 +175,8 @@ fn inherited_in(
 /// What a file the shell sources says, read after deleting quotes, backslash, backtick and
 /// caret (which the shell removes, so `GH_RE""PO` is `GH_REPO`) and lower-casing it: whether it
 /// names `GH_REPO` or `GH_HOST`, and whether it does something its text cannot show
-/// (`eval`, `source`, `.` sourcing, `${`, `$(`).
+/// (`eval`, `source`, `.` sourcing) or has a `$` or a backtick anywhere, which can build a name
+/// the text does not show.
 fn judge_shell_file(text: &str) -> (bool, bool) {
     let t: String = text
         .chars()
@@ -189,7 +190,10 @@ fn judge_shell_file(text: &str) -> (bool, bool) {
             && cs.get(i + 1).is_some_and(|n| n.is_whitespace())
             && (i == 0 || cs[i - 1].is_whitespace() || ";&|(".contains(cs[i - 1]))
     });
-    let unsafe_ = ["eval", "source", "${", "$("].iter().any(|w| t.contains(w)) || dot_command;
+    // Any `$` or backtick in the raw text may build a name the text does not show
+    // (`X=H_REPO` then `export G$X=o/other`): restrict, do not enumerate.
+    let expands = text.contains('$') || text.contains('`');
+    let unsafe_ = expands || ["eval", "source"].iter().any(|w| t.contains(w)) || dot_command;
     (gh, unsafe_)
 }
 
@@ -257,6 +261,17 @@ mod tests {
         let r = run(Some("s"), &e, &[("/tmp/env.sh", "export GH_RE\\PO=x\n")]);
         assert!(r.gh_target, "backslash too");
         assert_eq!(run(Some("s"), &e, &[]), clean, "not created yet");
+        for text in [
+            "X=H_REPO\nexport G$X=o/other\n",
+            "export A=`date`\n",
+            "export A=$B\n",
+        ] {
+            let r = run(Some("s"), &e, &[("/tmp/env.sh", text)]);
+            assert!(
+                r.init_unsafe,
+                "a $ or a backtick in CLAUDE_ENV_FILE: {text}"
+            );
+        }
         let r = run(Some("s"), &e, &[("/tmp/env.sh", "DENIED")]);
         assert!(r.gh_target && r.init_unsafe, "unreadable: nothing lifted");
         assert_eq!(
@@ -277,6 +292,10 @@ mod tests {
             "export A=$(date)\n",
             ". ./x.sh\n",
             "export A=1; . ./x.sh\n",
+            "X=H_REPO\nexport G$X=o/other\n",
+            "export A=$B\n",
+            "export A=`date`\n",
+            "export A='$B'\n",
         ] {
             assert!(run(Some("s"), &[], &sh(text)).init_unsafe, "{text}");
         }

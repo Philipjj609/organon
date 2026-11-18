@@ -158,8 +158,8 @@ fn names_a_gh_target(cmd: &str, raw: &[Vec<String>]) -> bool {
 ///   history character, redirection, subshell, `;`, `|`, `||`, lone `&` or newline: nothing a
 ///   shell expands, rewrites or chains;
 /// - the first part, if there is a second, is `cd`, `Set-Location` or `sl` and one absolute
-///   path with forward slashes (`C:/...` or `/...`, letters, digits and `. _ / - +` only, no
-///   `..` component);
+///   path with forward slashes (`C:/...` on Windows, `/...` elsewhere; letters, digits and
+///   `. _ / - +` only, no `..` component);
 /// - the merge is exactly [`plain_merge`].
 fn lone_merge(cmd: &str) -> Option<Option<&str>> {
     if !cmd
@@ -193,12 +193,14 @@ fn lone_merge(cmd: &str) -> Option<Option<&str>> {
     }
 }
 
-/// One absolute path with forward slashes: `C:/a/b` or `/a/b`, made of letters, digits and
-/// `. _ / - +`, with no `..` component.
+/// One absolute path with forward slashes, made of letters, digits and `. _ / - +` with no `..`
+/// component. On Windows it must start with a drive letter (`C:/a/b`): a `/a/b` or Git Bash
+/// `/c/a/b` means one folder to Git Bash and another to PowerShell (`C:/c/a/b`), so it is not
+/// accepted there. Elsewhere only `/a/b` is.
 fn is_plain_absolute_path(p: &str) -> bool {
     let rest = match p.as_bytes() {
-        [b'/', ..] => p,
-        [d, b':', b'/', ..] if d.is_ascii_alphabetic() => &p[2..],
+        [d, b':', b'/', ..] if cfg!(windows) && d.is_ascii_alphabetic() => &p[2..],
+        [b'/', ..] if !cfg!(windows) => p,
         _ => return false,
     };
     rest.chars()
@@ -1438,6 +1440,15 @@ mod tests {
         p
     }
 
+    /// The test paths are written as Windows drive paths; elsewhere they are POSIX ones.
+    fn here(cmd: &str) -> String {
+        if cfg!(windows) {
+            cmd.to_owned()
+        } else {
+            cmd.replace("C:/Users/x/Projects", "/home/x/Projects")
+        }
+    }
+
     #[test]
     fn a_merge_exception_lifts_only_a_whole_command_that_is_a_plain_merge() {
         let p = with_merge_exception();
@@ -1459,7 +1470,7 @@ mod tests {
             "sl C:/Users/x/Projects/ergon && gh pr merge 3 --squash",
             "cd C:/Users/x/Projects/ergon&&gh pr merge 3",
         ] {
-            assert_eq!(decide_at(&p, cmd), Decision::Allow, "{cmd}");
+            assert_eq!(decide_at(&p, &here(cmd)), Decision::Allow, "{cmd}");
         }
         // Every other word asks: other repositories, skipping the checks, other changes.
         for cmd in [
@@ -1548,11 +1559,14 @@ mod tests {
             "echo x | mail a@b.c",
             "npm publish",
         ] {
-            assert_eq!(decide_at(&p, cmd), Decision::Ask, "{cmd}");
+            assert_eq!(decide_at(&p, &here(cmd)), Decision::Ask, "{cmd}");
         }
         // A plain merge in another folder asks.
         assert_eq!(
-            decide_at(&p, "cd C:/Users/x/Projects/Koda && gh pr merge 12 --squash"),
+            decide_at(
+                &p,
+                &here("cd C:/Users/x/Projects/Koda && gh pr merge 12 --squash")
+            ),
             Decision::Ask
         );
         assert_eq!(
@@ -1571,6 +1585,60 @@ mod tests {
                 .and_then(|r| r.class.as_deref()),
             Some("merge")
         );
+    }
+
+    #[test]
+    fn a_merge_cd_target_must_mean_one_folder_to_every_shell() {
+        // Git Bash reads `/c/Projects/owned` as `C:/Projects/owned`, PowerShell as
+        // `C:/c/Projects/owned`; organon cannot know which shell runs the command. On Windows
+        // only a drive-letter path names one folder in both; elsewhere only a `/...` path does.
+        let p = with_merge_exception();
+        let tail = "&& gh pr merge 7 --squash";
+        for prog in ["cd", "Set-Location", "sl"] {
+            let drive = format!("{prog} C:/Users/x/Projects/ergon {tail}");
+            let posix = format!("{prog} /home/x/Projects/ergon {tail}");
+            let git_bash = format!("{prog} /c/Users/x/Projects/ergon {tail}");
+            let drive_less = format!("{prog} /Users/x/Projects/ergon {tail}");
+            let lower = format!("{prog} c:/Users/x/Projects/ergon {tail}");
+            let (allowed, asks) = if cfg!(windows) {
+                (vec![drive, lower], vec![posix, git_bash, drive_less])
+            } else {
+                (vec![posix, git_bash, drive_less], vec![drive, lower])
+            };
+            for cmd in allowed {
+                assert_eq!(decide_at(&p, &cmd), Decision::Allow, "{cmd}");
+            }
+            for cmd in asks {
+                assert_eq!(decide_at(&p, &cmd), Decision::Ask, "{cmd}");
+            }
+        }
+        // The exact input from the review: the folder it names is not the folder it enters.
+        if cfg!(windows) {
+            let q = {
+                let mut q = policy();
+                q.exceptions.push(Exception {
+                    class: "merge".into(),
+                    repo: "C:/Projects/owned".into(),
+                    reason: "test".into(),
+                });
+                q
+            };
+            for cmd in [
+                "Set-Location /c/Projects/owned && gh pr merge 7 --squash",
+                "cd /c/Projects/owned && gh pr merge 7 --squash",
+                "sl /c && gh pr merge 7",
+                "cd /Projects/owned && gh pr merge 7",
+                "cd C:\\Projects\\owned && gh pr merge 7",
+                "cd C: && gh pr merge 7",
+                "cd C:Projects/owned && gh pr merge 7",
+            ] {
+                let at = |h: Option<&str>| Some(h.unwrap_or("C:/Projects/owned").to_owned());
+                let d = q
+                    .decide_with_env(Action::Command(cmd), &no_branch, &at, Inherited::default())
+                    .decision;
+                assert_eq!(d, Decision::Ask, "{cmd}");
+            }
+        }
     }
 
     #[test]
@@ -1619,7 +1687,7 @@ mod tests {
             "git fetch origin && gh pr merge 3 --squash",
             "gh pr checks 3 && gh pr merge 3 --squash",
         ] {
-            assert_eq!(decide_at(&p, cmd), Decision::Ask, "{cmd}");
+            assert_eq!(decide_at(&p, &here(cmd)), Decision::Ask, "{cmd}");
         }
         // GH_REPO / GH_HOST in what the process inherited, or an init file that cannot be
         // judged.
@@ -1632,7 +1700,7 @@ mod tests {
             Decision::Ask
         );
         assert_eq!(
-            decide_with_init_unsafe(&p, "cd C:/Users/x/Projects/ergon && gh pr merge 3"),
+            decide_with_init_unsafe(&p, &here("cd C:/Users/x/Projects/ergon && gh pr merge 3")),
             Decision::Ask
         );
     }

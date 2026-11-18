@@ -579,6 +579,23 @@ fn a_merge_exception_only_lifts_a_whole_command_that_is_a_plain_merge_end_to_end
         let out = run(&cmd);
         assert!(is_ask(&out), "{cmd}: {out}");
     }
+    // A `cd` target that Git Bash and PowerShell read as different folders asks. On Windows
+    // that is `/c/...` (PowerShell enters `C:/c/...`) or any path without a drive; elsewhere
+    // a `C:/...` path is no absolute path at all.
+    let wrong: Vec<String> = if cfg!(windows) {
+        let rest = repo.get(2..).unwrap_or_default(); // "/Users/x/..."
+        let drive = repo[..1].to_ascii_lowercase();
+        vec![format!("/{drive}{rest}"), rest.to_owned()]
+    } else {
+        vec![format!("C:{repo}")]
+    };
+    for target in wrong {
+        for prog in ["cd", "Set-Location", "sl"] {
+            let cmd = format!("{prog} {target} && gh pr merge 7 --squash");
+            let out = run(&cmd);
+            assert!(is_ask(&out), "{cmd}: {out}");
+        }
+    }
 }
 
 #[test]
@@ -612,6 +629,10 @@ fn a_session_env_file_that_sets_gh_repo_or_runs_text_stops_the_merge_exception()
         "source ./x.sh\n",
         ". ./x.sh\n",
         "export A=${B}\n",
+        // a name built from a variable: no `gh_repo` appears in the text
+        "X=H_REPO\nexport G$X=o/other\n",
+        "export A=$B\n",
+        "export A=`date`\n",
     ] {
         let out = with("hook-1.sh", text);
         assert!(is_ask(&out), "{text}: {out}");
@@ -643,6 +664,11 @@ fn a_claude_env_file_that_sets_gh_repo_stops_the_merge_exception() {
     let out = with("export GH_REPO=x\n", "env-repo.sh");
     assert!(is_ask(&out), "{out}");
     let out = with("export gh_host=h\n", "env-host.sh");
+    assert!(is_ask(&out), "{out}");
+    // A `$` or a backtick can build the name, so any file with one asks.
+    let out = with("X=H_REPO\nexport G$X=o/other\n", "env-built.sh");
+    assert!(is_ask(&out), "{out}");
+    let out = with("export A=`date`\n", "env-tick.sh");
     assert!(is_ask(&out), "{out}");
     // A file that names neither lets the merge through.
     assert_eq!(with("export FOO=1\n", "env-foo.sh"), "");
