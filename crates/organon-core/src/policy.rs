@@ -187,14 +187,16 @@ impl Policy {
         out
     }
 
-    /// Whether every part of `cmd` is something allowed after the budget ran out.
+    /// Whether every part of `cmd` is something allowed after the budget ran out. A wrap-up
+    /// entry must be the command's leading words exactly (`gh pr create` is `gh`, `pr`,
+    /// `create` in that order at the start), never words found later among its arguments.
     #[must_use]
     pub fn allowed_after_budget(&self, cmd: &str) -> bool {
         let segs = segments(cmd);
         !segs.is_empty()
             && segs
                 .iter()
-                .all(|s| self.after_budget.iter().any(|p| matches(p, s)))
+                .all(|s| self.after_budget.iter().any(|p| leads_with(p, s)))
     }
 
     /// The budget for an effort.
@@ -299,6 +301,15 @@ fn matches(pattern: &str, seg: &[String]) -> bool {
     matches_words(pattern, seg) || unwrap_runner(seg).is_some_and(|s| matches_words(pattern, &s))
 }
 
+/// Whether `seg` begins with exactly the words of `pattern` (the first may be a glob).
+fn leads_with(pattern: &str, seg: &[String]) -> bool {
+    let words: Vec<&str> = pattern.split_whitespace().collect();
+    !words.is_empty()
+        && seg.len() >= words.len()
+        && glob(words[0], &seg[0])
+        && words[1..].iter().zip(&seg[1..]).all(|(p, w)| p == w)
+}
+
 fn matches_words(pattern: &str, seg: &[String]) -> bool {
     let mut p = pattern.split_whitespace();
     let (Some(first), Some(prog)) = (p.next(), seg.first()) else {
@@ -389,20 +400,12 @@ pub fn resolve_pushes(segs: &mut [Vec<String>], branch_of: BranchOf<'_>) {
         let args = push_arguments(&seg[start..]);
         let pushes_everything = args.flags.iter().any(|f| *f == "--all" || *f == "--mirror");
         let only_tags = args.flags.contains(&"--tags");
-        // The first positional word is the remote and the rest are refspecs, unless `--repo`
-        // already named the remote: then every positional word is a refspec.
-        let named_repo = args
-            .flags
-            .iter()
-            .any(|f| *f == "--repo" || f.starts_with("--repo="));
-        let skip = usize::from(!named_repo);
-        let bare = args.positional.len() <= skip && !pushes_everything && !only_tags;
-        let refspecs: Vec<usize> = args
-            .positional
-            .iter()
-            .skip(skip)
-            .map(|k| start + k)
-            .collect();
+        // As git does: the first positional word is the remote and the rest are refspecs, even
+        // with `--repo`. A positional repository overrides `--repo` (git builtin/push.c), so
+        // `git push --repo origin HEAD:feature` pushes the current branch to a remote named
+        // `HEAD:feature`. `--repo` (a value flag) only counts when no positional word is given.
+        let bare = args.positional.len() <= 1 && !pushes_everything && !only_tags;
+        let refspecs: Vec<usize> = args.positional.iter().skip(1).map(|k| start + k).collect();
         let names_head = refspecs
             .iter()
             .any(|&k| current_branch_ref(&seg[k], "").is_some());
@@ -710,6 +713,11 @@ mod tests {
             "codex exec -",
             "pnpm install",
             "gh api repos/x/y",
+            // `create` / `edit` as argument values are not the subcommand
+            "gh pr review 3 --approve --body create",
+            "gh pr comment 3 --body edit",
+            "gh pr merge 3 --subject create",
+            "gh issue create --title x",
         ] {
             assert!(!p.allowed_after_budget(cmd), "{cmd}");
         }
@@ -721,35 +729,47 @@ mod tests {
     }
 
     #[test]
-    fn push_with_repo_names_the_remote_so_every_word_is_a_refspec() {
-        // On main: the destination decides.
+    fn push_with_repo_follows_git_a_positional_repository_wins() {
+        // git builtin/push.c: `--repo` names the remote only when no positional repository is
+        // given; a positional one overrides it, and the refspecs follow it.
+        // On main, these all push main:
         for cmd in [
-            "git push --repo origin HEAD:feature",
-            "git push --repo=origin HEAD:feature",
-            "git push --repo origin @:feature",
-            "git push --repo origin feature",
-        ] {
-            assert_eq!(decide_on("main", cmd), Decision::Allow, "{cmd}");
-        }
-        for cmd in [
-            "git push --repo origin HEAD",
-            "git push --repo=origin HEAD",
             "git push --repo origin",
             "git push --repo=origin",
-            "git push --repo origin main",
-            "git push --repo origin HEAD:main",
+            // the remote is `HEAD:feature` (a positional repository), the push is bare: main
+            "git push --repo origin HEAD:feature",
+            "git push --repo=origin HEAD:feature",
+            // the remote is `origin`, the push is bare: main
+            "git push --repo upstream origin",
+            "git push --repo upstream origin main",
+            "git push --repo upstream origin HEAD",
+            "git push --rep origin",
+            "git push --no-repo origin",
         ] {
             assert_eq!(decide_on("main", cmd), Decision::Ask, "{cmd}");
         }
-        // On a feature branch: only a push that names main asks.
+        // ...and these push to feature:
+        for cmd in [
+            "git push --repo upstream origin HEAD:feature",
+            "git push --repo=upstream origin @:feature",
+            "git push --no-repo origin HEAD:feature",
+        ] {
+            assert_eq!(decide_on("main", cmd), Decision::Allow, "{cmd}");
+        }
+        // On a feature branch a bare push is the feature branch.
+        assert_eq!(
+            decide_on("feature", "git push --repo origin"),
+            Decision::Allow
+        );
         assert_eq!(
             decide_on("feature", "git push --repo origin HEAD"),
             Decision::Allow
         );
         assert_eq!(
-            decide_on("feature", "git push --repo origin"),
-            Decision::Allow
+            decide_on("feature", "git push --repo upstream origin HEAD:main"),
+            Decision::Ask
         );
+        // Conservative: a remote spelled like a refspec to main still asks.
         assert_eq!(
             decide_on("feature", "git push --repo origin HEAD:main"),
             Decision::Ask
