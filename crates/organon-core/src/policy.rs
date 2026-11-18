@@ -491,9 +491,16 @@ pub fn folders_are_certain(cmd: &str, segs: &[Vec<String>]) -> bool {
             Some("cd" | "set-location" | "sl") => {
                 let targets: Vec<&String> =
                     seg[1..].iter().filter(|w| !w.starts_with('-')).collect();
+                // A relative `cd` can be redirected by CDPATH (set in the command or inherited),
+                // so only an absolute target is certain.
+                let absolute = |w: &&String| {
+                    w.starts_with('/')
+                        || w.starts_with('\\')
+                        || (w.len() >= 2 && w.as_bytes()[1] == b':')
+                };
                 !targets.is_empty()
                     && !seg[1..].iter().any(|w| w == "-")
-                    && targets.iter().all(|w| literal(w))
+                    && targets.iter().all(|w| literal(w) && absolute(w))
             }
             Some("git") => {
                 let mut ok = !seg
@@ -812,11 +819,23 @@ mod tests {
         }
         // A subshell's push is read at all (it was not before parentheses split commands).
         assert_eq!(decide("(cd /other && git push origin main)"), Decision::Ask);
-        // A relative cd stays inside the composed folder.
+        // A relative cd may be redirected by CDPATH: unknown, so it asks.
         assert_eq!(
             decide_at(
                 &p,
                 "cd C:/Users/x/Projects && cd mneme-memory && git push origin main"
+            ),
+            Decision::Ask
+        );
+        assert_eq!(
+            decide_from_mm(&p, "CDPATH=/unapproved cd repo && git push origin main"),
+            Decision::Ask
+        );
+        // `git -C` with a relative path is not affected by CDPATH and still composes.
+        assert_eq!(
+            decide_at(
+                &p,
+                "cd C:/Users/x/Projects && git -C mneme-memory push origin main"
             ),
             Decision::Allow
         );
