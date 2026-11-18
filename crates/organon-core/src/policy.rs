@@ -200,28 +200,44 @@ impl Policy {
         let mut out = Vec::new();
         match action {
             Action::Command(cmd) => {
-                let mut segs = segments(cmd);
-                let certain = folders_are_certain(cmd, &segs);
-                let dirs = segment_dirs(&segs);
-                resolve_pushes(&mut segs, branch_of);
-                for (seg, dir) in segs.iter().zip(&dirs) {
-                    // Some(None): looked up, no repository; looked up at most once per part.
-                    let mut repo: Option<Option<String>> = None;
-                    for r in &self.rules {
-                        if !r.command.as_deref().is_some_and(|p| matches(p, seg))
-                            || out.contains(&r)
-                        {
-                            continue;
+                // Every reading of the command is judged and a rule that matches under any of
+                // them counts. An exception lifts a rule only when every reading is certain of
+                // the folders and they all find the same programs in the same folders.
+                let reads: Vec<Reading> = readings(cmd)
+                    .into_iter()
+                    .map(|mut segs| {
+                        let certain = folders_are_certain(cmd, &segs);
+                        let dirs = segment_dirs(&segs);
+                        resolve_pushes(&mut segs, branch_of);
+                        Reading {
+                            segs,
+                            certain,
+                            dirs,
                         }
-                        if certain && r.decision == Decision::Ask && !self.exceptions.is_empty() {
-                            if let Some(class) = r.class.as_deref() {
-                                let here = repo.get_or_insert_with(|| repo_of(dir.as_deref()));
-                                if here.as_deref().is_some_and(|f| self.excepted(class, f)) {
-                                    continue;
+                    })
+                    .collect();
+                let agree = reads.iter().all(|r| r.certain)
+                    && reads.windows(2).all(|w| w[0].shape() == w[1].shape());
+                for read in &reads {
+                    for (seg, dir) in read.segs.iter().zip(&read.dirs) {
+                        // Some(None): looked up, no repository; looked up at most once per part.
+                        let mut repo: Option<Option<String>> = None;
+                        for r in &self.rules {
+                            if !r.command.as_deref().is_some_and(|p| matches(p, seg))
+                                || out.contains(&r)
+                            {
+                                continue;
+                            }
+                            if agree && r.decision == Decision::Ask && !self.exceptions.is_empty() {
+                                if let Some(class) = r.class.as_deref() {
+                                    let here = repo.get_or_insert_with(|| repo_of(dir.as_deref()));
+                                    if here.as_deref().is_some_and(|f| self.excepted(class, f)) {
+                                        continue;
+                                    }
                                 }
                             }
+                            out.push(r);
                         }
-                        out.push(r);
                     }
                 }
             }
@@ -255,11 +271,13 @@ impl Policy {
     /// `create` in that order at the start), never words found later among its arguments.
     #[must_use]
     pub fn allowed_after_budget(&self, cmd: &str) -> bool {
-        let segs = segments(cmd);
-        !segs.is_empty()
-            && segs
-                .iter()
-                .all(|s| self.after_budget.iter().any(|p| leads_with(p, s)))
+        // Allowed only if every reading of the command agrees.
+        readings(cmd).iter().all(|segs| {
+            !segs.is_empty()
+                && segs
+                    .iter()
+                    .all(|s| self.after_budget.iter().any(|p| leads_with(p, s)))
+        })
     }
 
     /// The budget for an effort.
@@ -269,17 +287,166 @@ impl Policy {
     }
 }
 
-/// Split a shell command into simple commands (at `&&`, `||`, `;`, `|`, a lone `&`, newlines,
-/// outside quotes) and each into words. A lone `&` ends a command in bash (background), cmd
-/// and PowerShell alike; the redirections `2>&1`, `>&2`, `>&-`, `&>f` and `&>>f` do not. A
-/// leading call operator (`& "C:/x/tool.exe"`) leaves an empty part, which is dropped. Leading `VAR=value` words are dropped and the program is
-/// reduced to its file name (`/usr/bin/git`, `git.exe` → `git`).
+/// One reading of a command: its parts, and where each works (see [`readings`]).
+struct Reading {
+    segs: Vec<Vec<String>>,
+    certain: bool,
+    dirs: Vec<Option<String>>,
+}
+
+impl Reading {
+    /// The programs and folders of the parts, which readings must agree on.
+    fn shape(&self) -> Vec<(&str, Option<&str>)> {
+        self.segs
+            .iter()
+            .zip(&self.dirs)
+            .map(|(s, d)| (s[0].as_str(), d.as_deref()))
+            .collect()
+    }
+}
+
+/// How a shell treats a lone `&`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Amp {
+    /// It stays inside the command (how the splitter first worked).
+    Keep,
+    /// It ends a command, unless it is part of a redirection: after `>` or `<` (`2>&1`,
+    /// `>&2`, `<&0`), and, when `amp_gt`, before `>` (`&>f`, `&>>f`).
+    Split { amp_gt: bool },
+}
+
+/// What a backslash-like escape does inside double quotes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DqEscape {
+    /// Nothing: a `\` is a literal character and a `"` ends the string (how the splitter
+    /// first worked).
+    None,
+    /// Bash: `\` before `"`, `\`, `$` or a backtick.
+    Bash,
+    /// PowerShell: the backtick escapes any character.
+    PowerShell,
+}
+
+/// The quoting and separator rules of one reading of a command. [`readings`] judges a
+/// command under several of them because the same text splits differently in bash,
+/// PowerShell and cmd.
+#[derive(Clone, Copy)]
+struct Syntax {
+    /// The escape outside quotes: `\` in bash, a backtick in PowerShell, `^` in cmd.
+    escape: Option<char>,
+    dq_escape: DqEscape,
+    /// Whether `'...'` quotes (it does not in cmd).
+    single_quotes: bool,
+    /// PowerShell also reads the typographic quotes as quotes.
+    smart_quotes: bool,
+    /// Bash `$'...'`, which has backslash escapes.
+    ansi_c: bool,
+    /// Bash `${...}`, inside which a `&` is text.
+    braces: bool,
+    amp: Amp,
+}
+
+/// Bash as the splitter first read it: `\` escapes, a `"` always ends a double-quoted
+/// string, and a lone `&` stays in the command. Keeping this reading means no command is
+/// ever judged more leniently than it was before the others were added.
+const OLD: Syntax = Syntax {
+    escape: Some('\\'),
+    dq_escape: DqEscape::None,
+    single_quotes: true,
+    smart_quotes: false,
+    ansi_c: false,
+    braces: false,
+    amp: Amp::Keep,
+};
+/// Bash with a lone `&` as a separator.
+const BASH: Syntax = Syntax {
+    braces: true,
+    amp: Amp::Split { amp_gt: true },
+    ..OLD
+};
+/// Bash with the quoting that [`BASH`] leaves out: `\"` in double quotes and `$'...'`.
+const BASH_QUOTING: Syntax = Syntax {
+    dq_escape: DqEscape::Bash,
+    ansi_c: true,
+    ..BASH
+};
+/// PowerShell: the backtick is the escape and `\` is a plain character. `&>` is not a
+/// redirection there, so every `&` that is not `2>&1`-like ends a command.
+const POWERSHELL: Syntax = Syntax {
+    escape: Some('`'),
+    dq_escape: DqEscape::PowerShell,
+    single_quotes: true,
+    smart_quotes: true,
+    ansi_c: false,
+    braces: false,
+    amp: Amp::Split { amp_gt: false },
+};
+/// cmd: `^` is the escape, `'` is not a quote, and `&` always separates (`&>f` included).
+const CMD: Syntax = Syntax {
+    escape: Some('^'),
+    dq_escape: DqEscape::None,
+    single_quotes: false,
+    smart_quotes: false,
+    ansi_c: false,
+    braces: false,
+    amp: Amp::Split { amp_gt: false },
+};
+
+impl Syntax {
+    fn is_single(&self, c: char) -> bool {
+        (c == '\'' && self.single_quotes)
+            || (self.smart_quotes && matches!(c, '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}'))
+    }
+
+    fn is_double(&self, c: char) -> bool {
+        c == '"' || (self.smart_quotes && matches!(c, '\u{201c}' | '\u{201d}' | '\u{201e}'))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Quote {
+    Single,
+    Double,
+    /// Bash `$'...'`.
+    AnsiC,
+}
+
+/// Split a shell command into simple commands (at `&&`, `||`, `;`, `|`, a lone `&`, newlines
+/// and parentheses, outside quotes) and each into words, reading it as bash does. A lone `&`
+/// ends a command; the redirections `2>&1`, `>&2`, `<&0`, `&>f` and `&>>f` do not, and
+/// neither does a `&` inside `${...}`. A leading call operator (`& "C:/x/tool.exe"`) leaves an
+/// empty part, which is dropped. Leading `VAR=value` words and redirections (`>f`, `2>&1`,
+/// `<f`) are dropped and the program is reduced to its file name (`/usr/bin/git`, `git.exe`
+/// → `git`).
+///
+/// The hook does not rely on this reading alone: see [`readings`].
 #[must_use]
 pub fn segments(cmd: &str) -> Vec<Vec<String>> {
+    split(cmd, BASH)
+}
+
+/// The command split under every reading that a shell could give it: bash as the splitter
+/// first read it, bash with a lone `&` as a separator, bash with `\"` and `$'...'`
+/// understood, PowerShell and cmd. Identical results are listed once. A policy decision
+/// takes the strictest over all of them, so a command a shell reads differently from the
+/// others cannot hide a part from the policy.
+#[must_use]
+pub fn readings(cmd: &str) -> Vec<Vec<Vec<String>>> {
+    let mut out: Vec<Vec<Vec<String>>> = Vec::new();
+    for syntax in [OLD, BASH, BASH_QUOTING, POWERSHELL, CMD] {
+        let segs = split(cmd, syntax);
+        if !out.contains(&segs) {
+            out.push(segs);
+        }
+    }
+    out
+}
+
+fn split(cmd: &str, sh: Syntax) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     let mut words: Vec<String> = Vec::new();
     let mut word = String::new();
-    let mut quote: Option<char> = None;
+    let mut quote: Option<Quote> = None;
     let mut chars = cmd.chars().peekable();
     let mut prev = ' ';
     let push_word = |word: &mut String, words: &mut Vec<String>| {
@@ -288,10 +455,7 @@ pub fn segments(cmd: &str) -> Vec<Vec<String>> {
         }
     };
     let end = |words: &mut Vec<String>, out: &mut Vec<Vec<String>>| {
-        let mut ws: Vec<String> = std::mem::take(words)
-            .into_iter()
-            .skip_while(|w| is_assignment(w))
-            .collect();
+        let mut ws = strip_leading(std::mem::take(words));
         if let Some(p) = ws.first_mut() {
             *p = program_name(p);
         }
@@ -301,52 +465,175 @@ pub fn segments(cmd: &str) -> Vec<Vec<String>> {
     };
     while let Some(c) = chars.next() {
         let before = std::mem::replace(&mut prev, c);
-        match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
-            (Some(_), c) => word.push(c),
-            (None, '\'' | '"') => quote = Some(c),
-            (None, '\\') => {
-                if let Some(n) = chars.next() {
-                    if n != '\n' {
-                        word.push(n);
+        match quote {
+            Some(Quote::Single) => {
+                if sh.is_single(c) {
+                    quote = None;
+                } else {
+                    word.push(c);
+                }
+            }
+            Some(Quote::AnsiC) => match c {
+                '\\' => word.extend(chars.next()),
+                '\'' => quote = None,
+                _ => word.push(c),
+            },
+            Some(Quote::Double) => {
+                if sh.is_double(c) {
+                    quote = None;
+                } else if sh.dq_escape != DqEscape::None && c == dq_escape_char(sh) {
+                    match chars.peek() {
+                        Some(&n)
+                            if sh.dq_escape == DqEscape::PowerShell
+                                || matches!(n, '"' | '\\' | '$' | '`') =>
+                        {
+                            word.push(n);
+                            chars.next();
+                        }
+                        _ => word.push(c),
+                    }
+                } else {
+                    word.push(c);
+                }
+            }
+            None => match c {
+                _ if sh.is_single(c) => quote = Some(Quote::Single),
+                _ if sh.is_double(c) => quote = Some(Quote::Double),
+                '$' if sh.ansi_c && chars.peek() == Some(&'\'') => {
+                    chars.next();
+                    quote = Some(Quote::AnsiC);
+                }
+                '$' if sh.braces && chars.peek() == Some(&'{') => {
+                    word.push(c);
+                    take_braces(&mut chars, &mut word);
+                }
+                _ if Some(c) == sh.escape => {
+                    if let Some(n) = chars.next() {
+                        if n == '\r' && chars.peek() == Some(&'\n') {
+                            chars.next();
+                        } else if n != '\n' {
+                            word.push(n);
+                        }
                     }
                 }
-            }
-            (None, '&' | '|') => {
-                if chars.peek() == Some(&c) {
-                    chars.next();
-                } else if c == '|' && chars.peek() == Some(&'&') {
-                    chars.next(); // `|&` is a pipe
-                } else if c == '&' && (before == '>' || chars.peek() == Some(&'>')) {
-                    // `2>&1`, `>&2`, `>&-`, `&>f` and `&>>f` stay inside the command.
+                '&' | '|' => {
+                    if chars.peek() == Some(&c) {
+                        chars.next();
+                    } else if c == '|' && chars.peek() == Some(&'&') {
+                        chars.next(); // `|&` is a pipe
+                    } else if c == '&' && keeps_amp(sh, before, chars.peek().copied()) {
+                        word.push(c);
+                        continue;
+                    }
+                    push_word(&mut word, &mut words);
+                    end(&mut words, &mut out);
+                }
+                // `(` and `)` also end a command, so a subshell's commands are still read.
+                ';' | '\n' | '(' | ')' => {
+                    push_word(&mut word, &mut words);
+                    end(&mut words, &mut out);
+                }
+                _ if c.is_whitespace() => push_word(&mut word, &mut words),
+                '<' => {
+                    // `a<f` → `a`, `<f`; a file descriptor stays with it (`0<&0`).
+                    if !word.chars().all(|c| c.is_ascii_digit()) {
+                        push_word(&mut word, &mut words);
+                    }
                     word.push(c);
-                    continue;
                 }
-                push_word(&mut word, &mut words);
-                end(&mut words, &mut out);
-            }
-            // `(` and `)` also end a command, so a subshell's commands are still read.
-            (None, ';' | '\n' | '(' | ')') => {
-                push_word(&mut word, &mut words);
-                end(&mut words, &mut out);
-            }
-            (None, c) if c.is_whitespace() => push_word(&mut word, &mut words),
-            (None, '>') => {
-                // Redirections are their own words: `a>>b` → `a`, `>>`, `b`.
-                push_word(&mut word, &mut words);
-                let mut op = String::from('>');
-                if chars.peek() == Some(&'>') {
-                    chars.next();
-                    op.push('>');
+                '>' => {
+                    // Redirections are their own words: `a>>b` → `a`, `>>`, `b`.
+                    push_word(&mut word, &mut words);
+                    let mut op = String::from('>');
+                    if chars.peek() == Some(&'>') {
+                        chars.next();
+                        op.push('>');
+                    }
+                    words.push(op);
                 }
-                words.push(op);
-            }
-            (None, c) => word.push(c),
+                _ => word.push(c),
+            },
         }
     }
     push_word(&mut word, &mut words);
     end(&mut words, &mut out);
     out
+}
+
+fn dq_escape_char(sh: Syntax) -> char {
+    match sh.dq_escape {
+        DqEscape::PowerShell => '`',
+        _ => '\\',
+    }
+}
+
+/// Whether a lone `&` stays in the word: `before` is the character before it and `next` the
+/// one after.
+fn keeps_amp(sh: Syntax, before: char, next: Option<char>) -> bool {
+    match sh.amp {
+        Amp::Keep => true,
+        Amp::Split { amp_gt } => before == '>' || before == '<' || (amp_gt && next == Some('>')),
+    }
+}
+
+/// After a `${` was read: copy it and everything up to the matching `}` into `word`
+/// unchanged, so a `&` or `;` in it is text. Quotes and backslashes inside are honoured.
+fn take_braces(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, word: &mut String) {
+    let mut depth = 0_u32;
+    let mut quote: Option<char> = None;
+    while let Some(c) = chars.next() {
+        word.push(c);
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('"'), '\\') | (None, '\\') => word.extend(chars.next()),
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '{') => depth += 1,
+            (None, '}') => {
+                depth -= 1;
+                if depth == 0 {
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Words that can come before a command without being it: `{ git push; }`, `then git push`.
+const SHELL_KEYWORDS: &[&str] = &[
+    "{", "}", "!", "if", "then", "elif", "else", "do", "while", "until", "time",
+];
+
+/// Drop what comes before a command's program: `VAR=value` assignments, shell keywords and
+/// redirections (`>f`, `> f`, `>>f`, `2>f`, `&>f`, `N>&M`, `<f`, `0<&0`, `<<EOF`), which a
+/// shell allows anywhere in a command.
+fn strip_leading(words: Vec<String>) -> Vec<String> {
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i].as_str();
+        let digits = w.trim_start_matches(|c: char| c.is_ascii_digit());
+        let all_digits = !w.is_empty() && digits.is_empty();
+        let next = words.get(i + 1).map(String::as_str);
+        let is_gt = |s: Option<&str>| matches!(s, Some(">" | ">>"));
+        if is_assignment(w) || SHELL_KEYWORDS.contains(&w) {
+            i += 1;
+        } else if is_gt(Some(w)) {
+            i += 2; // `>` and its target
+        } else if (w == "&" || all_digits) && is_gt(next) {
+            i += 3; // `&>f`, `2>f`, `2>&1`
+        } else if digits.starts_with('<') {
+            // `<f`, `0<&0` are one word; `<`, `<<` and `<<<` take the next word.
+            i += if digits.chars().all(|c| c == '<') {
+                2
+            } else {
+                1
+            };
+        } else {
+            break;
+        }
+    }
+    words.into_iter().skip(i).collect()
 }
 
 fn is_assignment(w: &str) -> bool {
@@ -646,8 +933,18 @@ fn push_arguments(words: &[String]) -> PushArguments<'_> {
             i += 2; // the redirection and its target
             continue;
         }
-        if next_is_redirect && w.chars().all(|c| c.is_ascii_digit()) {
-            i += 1; // `2` of `2>&1`
+        if next_is_redirect && (w == "&" || w.chars().all(|c| c.is_ascii_digit())) {
+            i += 1; // `2` of `2>&1`, `&` of `&>f`
+            continue;
+        }
+        let after_digits = w.trim_start_matches(|c: char| c.is_ascii_digit());
+        if after_digits.starts_with('<') {
+            // `<f`, `0<&0`; `<` and `<<` take the next word as well.
+            i += if after_digits.chars().all(|c| c == '<') {
+                2
+            } else {
+                1
+            };
             continue;
         }
         if PUSH_VALUE_FLAGS.contains(&w) {
@@ -923,6 +1220,153 @@ mod tests {
             assert_eq!(decide(cmd), Decision::Ask, "{cmd}");
         }
         assert_eq!(decide("echo x & gh repo delete a/b"), Decision::Deny);
+    }
+
+    #[test]
+    fn input_redirections_and_braces_do_not_hide_arguments() {
+        for cmd in [
+            "git push <&0 origin main",
+            "git push origin <&- main",
+            "git push 0<&0 origin main",
+            "git push <in.txt origin main",
+            "git push ${x:+&} origin main",
+            "git push ${x:-a;b} origin main",
+            "git push ${x:-'}'&} origin main",
+            "gh pr merge ${x:+&} 1",
+            "npm publish ${x:+&}",
+            "vercel ${x:+&} --prod",
+            "git reset ${x:+&} --hard",
+            "rm <&0 -rf build",
+        ] {
+            assert_eq!(decide(cmd), Decision::Ask, "{cmd}");
+        }
+        assert_eq!(decide("gh repo <&0 delete a/b"), Decision::Deny);
+        assert_eq!(
+            segments("git push ${x:+&} origin main"),
+            [vec!["git", "push", "${x:+&}", "origin", "main"]]
+        );
+        assert_eq!(
+            segments("git push <&0 origin main"),
+            [vec!["git", "push", "<&0", "origin", "main"]]
+        );
+    }
+
+    #[test]
+    fn another_shells_escapes_and_quotes_do_not_hide_a_command() {
+        for cmd in [
+            // PowerShell: `\` is not an escape.
+            r"echo x\& git push origin main",
+            // Bash: `\"` inside double quotes.
+            r#"echo "\"" & git push origin main"#,
+            r#"echo "\"" ; git push origin main"#,
+            // Bash: `$'...'` with an escaped quote.
+            r"echo $'\'' & git push origin main",
+            // PowerShell: a backtick-escaped quote.
+            "echo \"`\"\" ; git push origin main",
+            "echo \"`\"\" & git push origin main",
+            // PowerShell's typographic quotes close a string that began with a straight one.
+            "echo \u{201c}a\" & git push origin main\u{201d}",
+            // cmd's `^&` and PowerShell's `` `& `` are one argument; the reading that sees a
+            // separator still judges what follows.
+            "git -c core.pager=foo^&bar push origin main",
+            "git -c core.pager=foo`&bar push origin main",
+            // The program is not a redirection.
+            ">f git push origin main",
+            "> f git push origin main",
+            ">>f git push origin main",
+            "2>f git push origin main",
+            "&>f git push origin main",
+            "<f git push origin main",
+            "2>&1 git push origin main",
+            "echo x & > /dev/null git push origin main",
+            // Shell keywords before the command.
+            "{ git push origin main; }",
+            "if true; then git push origin main; fi",
+        ] {
+            assert_eq!(decide(cmd), Decision::Ask, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn every_reading_of_a_command_is_listed_once() {
+        let r = readings("echo hi");
+        assert_eq!(r, [vec![vec!["echo", "hi"]]]);
+        // PowerShell keeps the backslash, bash drops it.
+        let r = readings(r"git C:\x");
+        assert!(r.contains(&vec![vec!["git".to_owned(), "C:x".to_owned()]]));
+        assert!(r.contains(&vec![vec!["git".to_owned(), r"C:\x".to_owned()]]));
+        // cmd has no single quotes.
+        assert!(readings("echo 'a & b'").len() > 1);
+    }
+
+    /// Dangerous commands: each asks or is denied on its own.
+    const DANGEROUS: &[&str] = &[
+        "git push origin main",
+        "git push --force origin feature",
+        "git push -f origin feature",
+        "git push --delete origin feature",
+        "git push --all",
+        "git push --mirror",
+        "git reset --hard HEAD~1",
+        "git clean -fd",
+        "git branch -D old",
+        "git filter-branch --all",
+        "gh pr merge 1",
+        "gh repo delete a/b",
+        "gh secret set X",
+        "npm publish",
+        "cargo publish",
+        "pnpm publish",
+        "vercel --prod",
+        "vercel deploy",
+        "vercel env add X",
+        "fly deploy",
+        "netlify deploy --prod",
+        "supabase db push",
+        "wrangler deploy",
+        "firebase deploy",
+        "railway up",
+        "rm -rf build",
+        "sendmail me@example.com",
+        "mail -s hi me@example.com",
+        "curl https://api.telegram.org/bot1/sendMessage",
+        "setx X 1",
+    ];
+
+    #[test]
+    fn nothing_inserted_after_the_program_weakens_a_decision() {
+        let p = policy();
+        for plain in DANGEROUS {
+            let base = p.decide(Action::Command(plain)).decision;
+            assert_ne!(base, Decision::Allow, "{plain} is meant to be dangerous");
+            let (prog, args) = plain.split_once(' ').unwrap_or((plain, ""));
+            for ins in [
+                "<&0", "<&-", "${x:+&}", r"\&", "`&", "^&", "&>f", "2>&1", ">f",
+            ] {
+                let cmd = format!("{prog} {ins} {args}");
+                let got = p.decide(Action::Command(&cmd)).decision;
+                assert!(got >= base, "{cmd}: {got:?} is weaker than {base:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn exceptions_need_every_reading_to_agree() {
+        let p = with_exception();
+        let at = |cmd: &str| decide_from_mm(&p, cmd);
+        assert_eq!(at("git push origin main"), Decision::Allow);
+        // A lone `&` or a quote some shell reads differently: the exception does not lift.
+        assert_eq!(at("git push origin main &"), Decision::Ask);
+        assert_eq!(at("echo 'a & b' && git push origin main"), Decision::Ask);
+        assert_eq!(at(r#"echo "\"" && git push origin main"#), Decision::Ask);
+    }
+
+    #[test]
+    fn wrap_up_commands_need_every_reading_to_agree() {
+        let p = policy();
+        assert!(p.allowed_after_budget("cargo test --all"));
+        assert!(!p.allowed_after_budget("cargo test & cargo build --release"));
+        assert!(!p.allowed_after_budget(r#"echo "\" & cargo build --release""#));
     }
 
     #[test]
