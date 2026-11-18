@@ -102,12 +102,19 @@ impl Policy {
     /// This policy plus every approval-class rule of `floor` it does not already have.
     /// The rules are combined, strictest wins, so a policy file can add to the floor but can
     /// neither drop nor weaken it: an old or edited `policy.json` still asks before a push to
-    /// `main`.
+    /// `main`. The floor's wrap-up commands (`after_budget`) are added the same way, so an
+    /// older policy file still lets a task whose budget is spent open its pull request and
+    /// close itself.
     #[must_use]
     pub fn with_floor(mut self, floor: &Policy) -> Self {
         for r in floor.rules.iter().filter(|r| r.class.is_some()) {
             if !self.rules.contains(r) {
                 self.rules.push(r.clone());
+            }
+        }
+        for c in &floor.after_budget {
+            if !self.after_budget.contains(c) {
+                self.after_budget.push(c.clone());
             }
         }
         self
@@ -382,9 +389,20 @@ pub fn resolve_pushes(segs: &mut [Vec<String>], branch_of: BranchOf<'_>) {
         let args = push_arguments(&seg[start..]);
         let pushes_everything = args.flags.iter().any(|f| *f == "--all" || *f == "--mirror");
         let only_tags = args.flags.contains(&"--tags");
-        let bare = args.positional.len() <= 1 && !pushes_everything && !only_tags;
-        // The first positional word is the remote; the rest are refspecs.
-        let refspecs: Vec<usize> = args.positional.iter().skip(1).map(|k| start + k).collect();
+        // The first positional word is the remote and the rest are refspecs, unless `--repo`
+        // already named the remote: then every positional word is a refspec.
+        let named_repo = args
+            .flags
+            .iter()
+            .any(|f| *f == "--repo" || f.starts_with("--repo="));
+        let skip = usize::from(!named_repo);
+        let bare = args.positional.len() <= skip && !pushes_everything && !only_tags;
+        let refspecs: Vec<usize> = args
+            .positional
+            .iter()
+            .skip(skip)
+            .map(|k| start + k)
+            .collect();
         let names_head = refspecs
             .iter()
             .any(|&k| current_branch_ref(&seg[k], "").is_some());
@@ -672,6 +690,69 @@ mod tests {
         assert_eq!(
             decide_on("main", "git push origin HEADS-UP"),
             Decision::Allow
+        );
+    }
+
+    #[test]
+    fn wrap_up_after_a_budget_stop_includes_the_pull_request_and_closing_the_task() {
+        let p = policy();
+        for cmd in [
+            "gh pr create --base main --head x --title t --body b",
+            "gh pr edit 3 --body b",
+            "organon task done t --outcome partial --left \"x\"",
+            "git push -u origin x",
+            "cat report.md",
+        ] {
+            assert!(p.allowed_after_budget(cmd), "{cmd}");
+        }
+        for cmd in [
+            "gh pr merge 3",
+            "codex exec -",
+            "pnpm install",
+            "gh api repos/x/y",
+        ] {
+            assert!(!p.allowed_after_budget(cmd), "{cmd}");
+        }
+        // An older policy file without them gets them from the floor.
+        let mut old = policy();
+        old.after_budget.retain(|c| !c.starts_with("gh pr"));
+        let old = old.with_floor(&policy());
+        assert!(old.allowed_after_budget("gh pr create --title t"));
+    }
+
+    #[test]
+    fn push_with_repo_names_the_remote_so_every_word_is_a_refspec() {
+        // On main: the destination decides.
+        for cmd in [
+            "git push --repo origin HEAD:feature",
+            "git push --repo=origin HEAD:feature",
+            "git push --repo origin @:feature",
+            "git push --repo origin feature",
+        ] {
+            assert_eq!(decide_on("main", cmd), Decision::Allow, "{cmd}");
+        }
+        for cmd in [
+            "git push --repo origin HEAD",
+            "git push --repo=origin HEAD",
+            "git push --repo origin",
+            "git push --repo=origin",
+            "git push --repo origin main",
+            "git push --repo origin HEAD:main",
+        ] {
+            assert_eq!(decide_on("main", cmd), Decision::Ask, "{cmd}");
+        }
+        // On a feature branch: only a push that names main asks.
+        assert_eq!(
+            decide_on("feature", "git push --repo origin HEAD"),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide_on("feature", "git push --repo origin"),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide_on("feature", "git push --repo origin HEAD:main"),
+            Decision::Ask
         );
     }
 
