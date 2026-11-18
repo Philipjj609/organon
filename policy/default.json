@@ -137,7 +137,7 @@
     "cargo clippy",
     "gh run",
     "gh pr view",
-    "gh pr checks",
+    "gh pr checks", "gh pr create", "gh pr edit",
     "cd", "pwd", "ls", "cat", "head", "tail", "grep", "rg", "wc", "diff", "echo",
     "set-location", "get-content", "get-childitem", "select-string"
   ]
