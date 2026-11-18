@@ -824,6 +824,20 @@ fn fail_safe(home: &Home, ev: &HookEvent, err: &anyhow::Error) -> Option<Value> 
         Ok((p, _)) => p,
         Err(_) => builtin,
     };
+    // Too long to read in the time there is: deny it rather than guess what it is.
+    if ev
+        .command
+        .as_deref()
+        .is_some_and(|c| c.len() > organon_core::policy::MAX_COMMAND_BYTES)
+    {
+        return Some(json!({ "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": format!(
+                "organon could not check this command ({err:#}) and it is too long to read, so it is denied instead of let through unchecked. Ask the user to run it, or split it up."
+            ),
+        }}));
+    }
     let branch_of = |hint: Option<&str>| git::branch_in(&git::folder(&ev.cwd, hint));
     let rule = policy.approval_class(ev.action(), &branch_of)?;
     let mut why: String = format!("{err:#}").chars().take(300).collect();
@@ -910,7 +924,12 @@ fn hook(home: &Home, ev: &HookEvent) -> Result<Option<String>> {
         }
         // Only what may actually run is on the trail.
         if let (Action::Command(cmd), true) = (action, verdict.decision != Decision::Deny) {
-            for seg in segments(cmd) {
+            let segs = if cmd.len() > organon_core::policy::MAX_COMMAND_BYTES {
+                Vec::new()
+            } else {
+                segments(cmd)
+            };
+            for seg in segs {
                 if organs::is_organ(&seg[0]) && seg[0] != "organon" {
                     home.append_event(
                         &t.slug,
