@@ -18,6 +18,10 @@ pub fn branch_in(dir: &Path) -> Option<String> {
 /// The root folder of the repository (or worktree) `dir` is in, with forward slashes.
 /// Used to apply the policy's exceptions.
 pub fn repo_root(dir: &Path) -> Option<String> {
+    // A folder that does not exist names no repository (never the one above it).
+    if !dir.is_dir() {
+        return None;
+    }
     dir.ancestors()
         .find(|a| a.join(".git").exists())
         .map(|a| a.to_string_lossy().replace('\\', "/"))
@@ -100,6 +104,11 @@ mod tests {
             Some(want)
         );
         assert_eq!(repo_root(&root.join("elsewhere")), None);
+        assert_eq!(
+            repo_root(&root.join("repo").join("$OTHER")),
+            None,
+            "missing folder"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

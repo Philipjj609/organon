@@ -478,15 +478,36 @@ pub fn folders_are_certain(cmd: &str, segs: &[Vec<String>]) -> bool {
     {
         return false;
     }
+    // A path the shell would expand (variables, home, globs) cannot be read from the text.
+    let literal = |w: &String| !w.contains(['$', '%', '~', '*', '?', '{', '[']);
     segs.iter()
         .all(|seg| match seg.first().map(String::as_str) {
             Some("pushd" | "popd") => false,
             Some("cd" | "set-location" | "sl") => {
-                seg[1..].iter().any(|w| !w.starts_with('-')) && !seg[1..].iter().any(|w| w == "-")
+                let targets: Vec<&String> =
+                    seg[1..].iter().filter(|w| !w.starts_with('-')).collect();
+                !targets.is_empty()
+                    && !seg[1..].iter().any(|w| w == "-")
+                    && targets.iter().all(|w| literal(w))
             }
-            Some("git") => !seg
-                .iter()
-                .any(|w| w.starts_with("--git-dir") || w.starts_with("--work-tree")),
+            Some("git") => {
+                let mut ok = !seg
+                    .iter()
+                    .any(|w| w.starts_with("--git-dir") || w.starts_with("--work-tree"));
+                let mut i = 1;
+                while i < seg.len() && seg[i].starts_with('-') {
+                    let w = seg[i].as_str();
+                    // `-C<path>` attached is not followed: unknown.
+                    if w.starts_with("-C") && w.len() > 2 {
+                        ok = false;
+                    }
+                    if w == "-C" && !seg.get(i + 1).is_some_and(literal) {
+                        ok = false;
+                    }
+                    i += if GIT_VALUE_FLAGS.contains(&w) { 2 } else { 1 };
+                }
+                ok
+            }
             _ => true,
         })
 }
@@ -772,6 +793,11 @@ mod tests {
             "cd - && git push origin main",
             "git push origin main & git push origin main",
             "echo $(cd /other) && git push origin main",
+            "git -C/other/repo push origin main",
+            "git -C \"$OTHER_REPO\" push origin main",
+            "cd $OTHER && git push origin main",
+            "cd ~/other && git push origin main",
+            "git -C %OTHER% push origin main",
         ] {
             assert_eq!(decide_from_mm(&p, cmd), Decision::Ask, "{cmd}");
         }
