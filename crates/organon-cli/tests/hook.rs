@@ -83,6 +83,9 @@ impl Env {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_organon"));
         cmd.env_remove("CLAUDE_CODE_SESSION_ID")
             .env_remove("ORGANON_SESSION_ID")
+            // gh's target must not leak in from the machine running the tests.
+            .env_remove("GH_REPO")
+            .env_remove("GH_HOST")
             .env("CLAUDE_CONFIG_DIR", self.claude_dir())
             .env("ORGANON_HOME", &self.home)
             .env("ORGANON_STANDING_TTL", "0");
@@ -478,6 +481,22 @@ fn a_merge_exception_lets_a_plain_merge_through_in_its_repository_only() {
     // In any other repository it still asks.
     let out = run(&cwds[1], "gh pr merge 7 --squash");
     assert!(is_ask(&out), "{out}");
+    // A target that may come from GH_REPO (in the command, or inherited by the hook) asks.
+    let out = run(&cwds[0], "GH_REPO=Philipjj609/Koda gh pr merge 7 --squash");
+    assert!(is_ask(&out), "{out}");
+    let out = run(&cwds[0], "export GH_HOST=h && gh pr merge 7");
+    assert!(is_ask(&out), "{out}");
+    for var in ["GH_REPO", "GH_HOST"] {
+        let ev = event(
+            "s",
+            &e.transcript,
+            &cwds[0],
+            "Bash",
+            &command("gh pr merge 7 --squash"),
+        );
+        let out = e.hook_raw(&ev, &[(var, "Philipjj609/Koda")]);
+        assert!(is_ask(&out), "{var}: {out}");
+    }
 }
 
 #[test]

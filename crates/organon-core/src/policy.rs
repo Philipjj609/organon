@@ -116,6 +116,27 @@ pub fn no_repo(_: Option<&str>) -> Option<String> {
     None
 }
 
+/// Whether this process's environment sets `name` (to anything).
+fn process_env_has(name: &str) -> bool {
+    std::env::var_os(name).is_some()
+}
+
+/// Whether `gh` could be pointed at another repository or host than its folder's: `GH_REPO` or
+/// `GH_HOST` is set in the environment, or named anywhere in the command (an assignment, `export`,
+/// `env`, `$env:`, `set`), in any case, as Windows variable names are not case-sensitive.
+fn gh_target_may_come_from_elsewhere(cmd: &str, env_has: &dyn Fn(&str) -> bool) -> bool {
+    let text = cmd.to_ascii_lowercase();
+    ["GH_REPO", "GH_HOST"]
+        .iter()
+        .any(|v| env_has(v) || text.contains(&v.to_ascii_lowercase()))
+}
+
+/// Whether a simple command runs `gh` (also through `npx`).
+fn runs_gh(seg: &[String]) -> bool {
+    seg.first().is_some_and(|p| p == "gh")
+        || unwrap_runner(seg).is_some_and(|s| s.first().is_some_and(|p| p == "gh"))
+}
+
 impl Policy {
     /// # Errors
     /// When the JSON does not describe a policy.
@@ -174,11 +195,27 @@ impl Policy {
         branch_of: BranchOf<'_>,
         repo_of: RepoOf<'_>,
     ) -> Verdict {
+        self.decide_with_env(action, branch_of, repo_of, &process_env_has)
+    }
+
+    /// [`Policy::decide_at`] with the process environment given as a function (does it set this
+    /// variable?), so a test need not touch the real one. The environment matters for one thing:
+    /// `GH_REPO` and `GH_HOST` make `gh` work on another repository than the folder's, so while
+    /// either is set, in the environment or anywhere in the command text (`GH_REPO=x gh ...`,
+    /// `export GH_REPO=x`, `$env:GH_REPO=...`), no [`Exception`] lifts a `gh` command.
+    #[must_use]
+    pub fn decide_with_env(
+        &self,
+        action: Action<'_>,
+        branch_of: BranchOf<'_>,
+        repo_of: RepoOf<'_>,
+        env_has: &dyn Fn(&str) -> bool,
+    ) -> Verdict {
         let mut best = Verdict {
             decision: Decision::Allow,
             reason: None,
         };
-        for r in self.matching(action, branch_of, repo_of) {
+        for r in self.matching(action, branch_of, repo_of, env_has) {
             if r.decision > best.decision {
                 best = Verdict {
                     decision: r.decision,
@@ -194,7 +231,7 @@ impl Policy {
     /// rather than let through unchecked.
     #[must_use]
     pub fn approval_class(&self, action: Action<'_>, branch_of: BranchOf<'_>) -> Option<&Rule> {
-        self.matching(action, branch_of, &no_repo)
+        self.matching(action, branch_of, &no_repo, &process_env_has)
             .into_iter()
             .find(|r| r.class.is_some())
     }
@@ -204,6 +241,7 @@ impl Policy {
         action: Action<'_>,
         branch_of: BranchOf<'_>,
         repo_of: RepoOf<'_>,
+        env_has: &dyn Fn(&str) -> bool,
     ) -> Vec<&Rule> {
         let mut out = Vec::new();
         match action {
@@ -211,6 +249,7 @@ impl Policy {
                 let mut segs = segments(cmd);
                 let certain = folders_are_certain(cmd, &segs);
                 let dirs = segment_dirs(&segs);
+                let gh_target = gh_target_may_come_from_elsewhere(cmd, env_has);
                 resolve_pushes(&mut segs, branch_of);
                 for (seg, dir) in segs.iter().zip(&dirs) {
                     // Some(None): looked up, no repository; looked up at most once per part.
@@ -221,7 +260,11 @@ impl Policy {
                         {
                             continue;
                         }
-                        if certain && r.decision == Decision::Ask && !self.exceptions.is_empty() {
+                        if certain
+                            && r.decision == Decision::Ask
+                            && !self.exceptions.is_empty()
+                            && !(gh_target && runs_gh(seg))
+                        {
                             if let Some(class) = r.class.as_deref() {
                                 let here = repo.get_or_insert_with(|| repo_of(dir.as_deref()));
                                 if here.as_deref().is_some_and(|f| self.excepted(class, f)) {
@@ -718,8 +761,13 @@ mod tests {
         Some(hint.unwrap_or("C:/Users/x/Projects/ergon").to_owned())
     }
 
+    /// A process environment that sets nothing: the tests do not depend on the real one.
+    fn no_env(_: &str) -> bool {
+        false
+    }
+
     fn decide_at(p: &Policy, cmd: &str) -> Decision {
-        p.decide_at(Action::Command(cmd), &no_branch, &repo_at)
+        p.decide_with_env(Action::Command(cmd), &no_branch, &repo_at, &no_env)
             .decision
     }
 
@@ -811,7 +859,7 @@ mod tests {
     }
 
     fn decide_from_mm(p: &Policy, cmd: &str) -> Decision {
-        p.decide_at(Action::Command(cmd), &no_branch, &repo_from_mm)
+        p.decide_with_env(Action::Command(cmd), &no_branch, &repo_from_mm, &no_env)
             .decision
     }
 
@@ -1265,6 +1313,57 @@ mod tests {
                 .and_then(|r| r.class.as_deref()),
             Some("merge")
         );
+    }
+
+    #[test]
+    fn a_merge_exception_does_not_lift_a_gh_command_whose_target_may_come_from_gh_repo() {
+        let p = with_merge_exception();
+        // In the excepted folder with a clean environment a plain merge is lifted.
+        assert_eq!(decide_at(&p, "gh pr merge 3"), Decision::Allow);
+        // GH_REPO / GH_HOST named in the command, in any spelling.
+        for cmd in [
+            "GH_REPO=Philipjj609/Koda gh pr merge 3",
+            "gh_repo=x gh pr merge 3",
+            "GH_HOST=github.example.com gh pr merge 3",
+            "export GH_REPO=x && gh pr merge 3",
+            "export GH_REPO=x; gh pr merge 3",
+            "export GH_HOST=h && gh pr merge 3",
+            "$env:GH_REPO='x'; gh pr merge 3",
+            "$env:gh_repo = 'x'; gh pr merge 3",
+            "set GH_REPO=x&& gh pr merge 3",
+            "cd C:/Users/x/Projects/ergon && GH_REPO=x gh pr merge 3",
+        ] {
+            assert_eq!(decide_at(&p, cmd), Decision::Ask, "{cmd}");
+        }
+        // GH_REPO / GH_HOST set in the process environment (injected here).
+        for var in ["GH_REPO", "GH_HOST", "gh_repo"] {
+            let env = |name: &str| name.eq_ignore_ascii_case(var);
+            let v = p.decide_with_env(
+                Action::Command("gh pr merge 3 --squash"),
+                &no_branch,
+                &repo_at,
+                &env,
+            );
+            assert_eq!(v.decision, Decision::Ask, "{var}");
+        }
+        // Another variable, or a non-gh command, is not affected.
+        let other = |name: &str| name == "GH_TOKEN";
+        let v = p.decide_with_env(
+            Action::Command("gh pr merge 3"),
+            &no_branch,
+            &repo_at,
+            &other,
+        );
+        assert_eq!(v.decision, Decision::Allow);
+        let q = with_exception();
+        let gh_repo = |name: &str| name == "GH_REPO";
+        let v = q.decide_with_env(
+            Action::Command("git -C C:/Users/x/Projects/mneme-memory push origin main"),
+            &no_branch,
+            &repo_at,
+            &gh_repo,
+        );
+        assert_eq!(v.decision, Decision::Allow, "git is not gh");
     }
 
     #[test]
