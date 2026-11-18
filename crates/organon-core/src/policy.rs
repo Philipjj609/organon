@@ -166,15 +166,18 @@ impl Policy {
         branch_of: BranchOf<'_>,
         repo_of: RepoOf<'_>,
     ) -> Verdict {
-        if matches!(action, Action::Command(c) if c.len() > MAX_COMMAND_BYTES) {
-            return Verdict {
+        // Over the cap only the first reading is made (see `matching`), and the answer is at
+        // least an ask: what it cannot check, it does not allow.
+        let mut best = if matches!(action, Action::Command(c) if c.len() > MAX_COMMAND_BYTES) {
+            Verdict {
                 decision: Decision::Ask,
-                reason: Some("The command is too long for organon to check.".into()),
-            };
-        }
-        let mut best = Verdict {
-            decision: Decision::Allow,
-            reason: None,
+                reason: Some("The command is too long for organon to check fully.".into()),
+            }
+        } else {
+            Verdict {
+                decision: Decision::Allow,
+                reason: None,
+            }
         };
         for (r, bash) in self.matching(action, branch_of, repo_of) {
             // Text that only cmd or PowerShell reads as a command (a bash quote that they do
@@ -218,7 +221,20 @@ impl Policy {
                 // Every reading of the command is judged and a rule that matches under any of
                 // them counts. An exception lifts a rule only when every reading is certain of
                 // the folders and they all find the same programs in the same folders.
-                let reads: Vec<Reading> = parse_all(cmd)
+                // Over the cap, only the first reading is made: it is cheap, and it still finds
+                // what the policy found before the other readings existed. No exception
+                // lifts anything there.
+                let oversize = cmd.len() > MAX_COMMAND_BYTES;
+                let parsed = if oversize {
+                    vec![Parsed {
+                        segs: split(cmd, OLD),
+                        bash: true,
+                        bang: true,
+                    }]
+                } else {
+                    parse_all(cmd)
+                };
+                let reads: Vec<Reading> = parsed
                     .into_iter()
                     .map(|p| {
                         let mut segs = p.segs;
@@ -683,31 +699,42 @@ fn strip_leading(words: Vec<String>) -> (Vec<String>, bool) {
     let mut bang = false;
     while i < words.len() {
         let w = words[i].as_str();
-        let digits = w.trim_start_matches(|c: char| c.is_ascii_digit());
-        let all_digits = !w.is_empty() && digits.is_empty();
-        let next = words.get(i + 1).map(String::as_str);
-        let is_gt = |s: Option<&str>| matches!(s, Some(">" | ">>"));
         if w == "!" {
             bang = true;
             i += 1;
         } else if is_assignment(w) || SHELL_KEYWORDS.contains(&w) {
             i += 1;
-        } else if is_gt(Some(w)) {
-            i += 2; // `>` and its target
-        } else if (w == "&" || all_digits) && is_gt(next) {
-            i += 3; // `&>f`, `2>f`, `2>&1`
-        } else if digits.starts_with('<') {
-            // `<f`, `0<&0` are one word; `<`, `<<` and `<<<` take the next word.
-            i += if digits.chars().all(|c| c == '<') {
-                2
-            } else {
-                1
-            };
+        } else if let n @ 1.. = redirection_len(&words, i) {
+            i += n;
         } else {
             break;
         }
     }
     (words.into_iter().skip(i).collect(), bang)
+}
+
+/// How many words the redirection starting at `words[i]` takes, 0 if there is none:
+/// `>f`, `> f`, `>>f`, `2>f`, `&>f`, `2>&1` (after the split into words) and `<f`, `0<&0`,
+/// `<<EOF` (one word); `<`, `<<` and `<<<` take the next word as their target.
+fn redirection_len(words: &[String], i: usize) -> usize {
+    let w = words[i].as_str();
+    let is_gt = |s: Option<&str>| matches!(s, Some(">" | ">>"));
+    let digits = w.trim_start_matches(|c: char| c.is_ascii_digit());
+    let all_digits = !w.is_empty() && digits.is_empty();
+    let next = words.get(i + 1).map(String::as_str);
+    if is_gt(Some(w)) {
+        2 // `>` and its target
+    } else if (w == "&" || all_digits) && is_gt(next) {
+        3 // `&>f`, `2>f`, `2>&1`
+    } else if digits.starts_with('<') {
+        if digits.chars().all(|c| c == '<') {
+            2
+        } else {
+            1
+        }
+    } else {
+        0
+    }
 }
 
 fn is_assignment(w: &str) -> bool {
@@ -752,7 +779,17 @@ fn matches_words(pattern: &str, seg: &[String]) -> bool {
     let mut i = 1;
     for pw in p {
         if pw == "$" {
-            return seg[i..].iter().all(|w| w.starts_with('-'));
+            // Nothing but flags follows. A redirection is not an argument, wherever it is.
+            let rest = &seg[i..];
+            let mut j = 0;
+            while j < rest.len() {
+                match redirection_len(rest, j) {
+                    0 if rest[j].starts_with('-') => j += 1,
+                    0 => return false,
+                    n => j += n,
+                }
+            }
+            return true;
         }
         match seg[i..].iter().position(|w| glob(pw, w)) {
             Some(k) => i += k + 1,
@@ -1522,6 +1559,59 @@ mod tests {
         // Just under the limit is read as usual.
         let ok = format!("echo {}", "a ".repeat(100));
         assert_eq!(p.decide(Action::Command(&ok)).decision, Decision::Allow);
+    }
+
+    #[test]
+    fn a_bare_deploy_with_a_redirection_still_asks() {
+        for cmd in [
+            "vercel",
+            "vercel --yes",
+            "vercel --yes</dev/null",
+            "vercel --yes<in",
+            "vercel --prod0<&0",
+            "vercel 2>&1",
+            "vercel --yes 2>&1 | tail -5",
+            "vercel > log.txt",
+            "vercel >> log.txt",
+            "vercel &> log.txt",
+            "vercel <&0",
+            "vercel < in",
+            "vercel <<EOF",
+            "vercel --yes>out",
+            "npx vercel 2>&1",
+            "npx vercel --yes</dev/null",
+        ] {
+            assert_eq!(decide(cmd), Decision::Ask, "{cmd}");
+        }
+        // Redirections do not make a command with a real argument a bare deploy.
+        assert_eq!(decide("vercel ls 2>&1"), Decision::Allow);
+        assert_eq!(decide("vercel env ls </dev/null"), Decision::Allow);
+    }
+
+    #[test]
+    fn a_deny_in_a_command_over_64_kb_still_denies() {
+        let p = policy();
+        let text = "x ".repeat(35 * 1024);
+        let deny_first = format!("gh repo delete x; echo {text}");
+        let append = format!("echo {text} >> memory/log.jsonl");
+        for cmd in [&deny_first, &append] {
+            assert!(cmd.len() > MAX_COMMAND_BYTES);
+            let start = std::time::Instant::now();
+            let v = p.decide(Action::Command(cmd));
+            assert_eq!(v.decision, Decision::Deny);
+            assert!(start.elapsed() < std::time::Duration::from_millis(500));
+        }
+        // An ask stays an ask, and nothing else is let through.
+        let ask = format!("git push origin main; echo {text}");
+        assert_eq!(p.decide(Action::Command(&ask)).decision, Decision::Ask);
+    }
+
+    #[test]
+    fn the_example_in_the_docs_asks() {
+        let example = "git commit -m 'run tests & git push origin main after review'";
+        let docs = include_str!("../../../docs/organs/intelligence.md");
+        assert!(docs.contains(example));
+        assert_eq!(decide(example), Decision::Ask);
     }
 
     #[test]
