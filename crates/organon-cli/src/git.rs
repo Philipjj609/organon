@@ -86,9 +86,82 @@ fn drive_path(p: &str) -> String {
     }
 }
 
+/// Whether the environment a command will run in could point `gh` at another repository or
+/// host than its folder's: `GH_REPO` or `GH_HOST` is set in this process (a session inherits
+/// it), or the file named by `CLAUDE_ENV_FILE` (Claude Code sources it before each command)
+/// mentions either. A file that is set but cannot be read for another reason than not
+/// existing yet counts as yes: nothing can be said about it, so nothing is lifted.
+pub fn gh_target_in_environment() -> bool {
+    gh_target_in(&|k| std::env::var_os(k), &|p| fs::read(p))
+}
+
+fn gh_target_in(
+    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    read: &dyn Fn(&Path) -> std::io::Result<Vec<u8>>,
+) -> bool {
+    if ["GH_REPO", "GH_HOST"].iter().any(|k| var(k).is_some()) {
+        return true;
+    }
+    let Some(file) = var("CLAUDE_ENV_FILE").filter(|f| !f.is_empty()) else {
+        return false;
+    };
+    match read(Path::new(&file)) {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes).to_lowercase();
+            text.contains("gh_repo") || text.contains("gh_host")
+        }
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_environment_can_name_the_target_of_gh() {
+        use std::ffi::OsString;
+        use std::io::{Error, ErrorKind};
+        let vars = |set: &[(&'static str, &'static str)]| {
+            let set = set.to_vec();
+            move |k: &str| {
+                set.iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| OsString::from(v))
+            }
+        };
+        let file = |text: &'static str| move |_: &Path| Ok(text.as_bytes().to_vec());
+        let never = |_: &Path| Err(Error::new(ErrorKind::NotFound, "no"));
+        assert!(!gh_target_in(&vars(&[]), &never));
+        assert!(gh_target_in(&vars(&[("GH_REPO", "x/y")]), &never));
+        assert!(gh_target_in(&vars(&[("GH_HOST", "h")]), &never));
+        let f = vars(&[("CLAUDE_ENV_FILE", "/tmp/env.sh")]);
+        assert!(!gh_target_in(
+            &f,
+            &file(
+                "export PATH=/x
+"
+            )
+        ));
+        assert!(gh_target_in(
+            &f,
+            &file(
+                "export Gh_Repo=x/y
+"
+            )
+        ));
+        assert!(gh_target_in(
+            &f,
+            &file(
+                "export GH_HOST=h
+"
+            )
+        ));
+        assert!(!gh_target_in(&f, &never), "not created yet");
+        let denied = |_: &Path| Err(Error::new(ErrorKind::PermissionDenied, "no"));
+        assert!(gh_target_in(&f, &denied), "unreadable: nothing lifted");
+        assert!(!gh_target_in(&vars(&[("CLAUDE_ENV_FILE", "")]), &denied));
+    }
 
     #[test]
     fn git_bash_paths_name_windows_drives() {

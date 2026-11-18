@@ -86,6 +86,7 @@ impl Env {
             // gh's target must not leak in from the machine running the tests.
             .env_remove("GH_REPO")
             .env_remove("GH_HOST")
+            .env_remove("CLAUDE_ENV_FILE")
             .env("CLAUDE_CONFIG_DIR", self.claude_dir())
             .env("ORGANON_HOME", &self.home)
             .env("ORGANON_STANDING_TTL", "0");
@@ -497,6 +498,105 @@ fn a_merge_exception_lets_a_plain_merge_through_in_its_repository_only() {
         let out = e.hook_raw(&ev, &[(var, "Philipjj609/Koda")]);
         assert!(is_ask(&out), "{var}: {out}");
     }
+}
+
+/// A repository with a `merge` exception, and the hook run from inside it.
+fn merge_exception_env(name: &str, policy: &str) -> (Env, String) {
+    let e = env(name);
+    fs::create_dir_all(&e.home).unwrap();
+    fs::write(e.home.join("policy.json"), policy).unwrap();
+    let dir = e.home.parent().unwrap().join("repo");
+    fs::create_dir_all(dir.join(".git")).unwrap();
+    fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/feature\n").unwrap();
+    let cwd = dir.to_string_lossy().into_owned();
+    (e, cwd)
+}
+
+const MERGE_EXCEPTION: &str = r#"{"efforts":{"lookup":{"usd":1.0,"minutes":15}},"routes":{},"rules":[],
+    "exceptions":[{"class":"merge","repo":"*/repo","reason":"my own repository"}]}"#;
+
+#[test]
+fn a_merge_exception_only_lifts_the_plain_merge_allow_list_end_to_end() {
+    let (e, cwd) = merge_exception_env("merge-allow-list", MERGE_EXCEPTION);
+    let run = |cmd: &str| e.hook_raw(&event("s", &e.transcript, &cwd, "Bash", &command(cmd)), &[]);
+    for cmd in [
+        "gh pr merge 12 --squash",
+        "gh pr merge 12 --squash --delete-branch --match-head-commit abc123",
+        "gh pr merge 12 --rebase",
+        "gh pr merge 12 --merge",
+        "gh pr merge 12 -s",
+        "gh pr merge 3 --squash && git pull",
+    ] {
+        assert_eq!(run(cmd), "", "{cmd}");
+    }
+    for cmd in [
+        "gh pr merge 7 -sR Philipjj609/Koda",
+        "gh pr merge 7 -dR Philipjj609/Koda",
+        "gh pr merge 7 -sdRPhilipjj609/Koda",
+        "gh pr merge 7 -sd",
+        "gh -R Philipjj609/Koda pr merge 7",
+        "gh --repo Philipjj609/Koda pr merge 7",
+        "gh --repo=Philipjj609/Koda pr merge 7",
+        "gh pr merge 7 --auto",
+        "gh pr merge 7 --admin",
+        r#"export GH_RE""PO=X && gh pr merge 7"#,
+        r"export GH_RE\PO=X && gh pr merge 7",
+        "git remote set-url origin https://github.com/Philipjj609/Koda && gh pr merge 7",
+        "gh repo set-default Philipjj609/Koda && gh pr merge 7",
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=url.https://github.com/Philipjj609/Koda.insteadOf GIT_CONFIG_VALUE_0=https://github.com/Philipjj609/repo gh pr merge 7",
+    ] {
+        let out = run(cmd);
+        assert!(is_ask(&out), "{cmd}: {out}");
+    }
+}
+
+#[test]
+fn a_claude_env_file_that_sets_gh_repo_stops_the_merge_exception() {
+    let (e, cwd) = merge_exception_env("merge-env-file", MERGE_EXCEPTION);
+    let dir = e.home.parent().unwrap().to_owned();
+    let ev = event(
+        "s",
+        &e.transcript,
+        &cwd,
+        "Bash",
+        &command("gh pr merge 7 --squash"),
+    );
+    let with = |content: &str, name: &str| {
+        let file = dir.join(name);
+        fs::write(&file, content).unwrap();
+        e.hook_raw(&ev, &[("CLAUDE_ENV_FILE", &file.to_string_lossy())])
+    };
+    let out = with("export GH_REPO=x\n", "env-repo.sh");
+    assert!(is_ask(&out), "{out}");
+    let out = with("export gh_host=h\n", "env-host.sh");
+    assert!(is_ask(&out), "{out}");
+    // A file that names neither lets the merge through.
+    assert_eq!(with("export FOO=1\n", "env-foo.sh"), "");
+    // So does a file that does not exist (nothing was set), or no file at all.
+    let missing = dir.join("no-such-file.sh");
+    assert_eq!(
+        e.hook_raw(&ev, &[("CLAUDE_ENV_FILE", &missing.to_string_lossy())]),
+        ""
+    );
+    assert_eq!(e.hook_raw(&ev, &[]), "");
+}
+
+#[test]
+fn an_old_policy_with_gh_pr_merge_in_send_still_asks_despite_a_merge_exception() {
+    // Written by `organon init` before the merge class: the rule is `send`.
+    let old = r#"{"efforts":{"lookup":{"usd":1.0,"minutes":15}},"routes":{},"rules":[
+        {"command":"gh pr merge","decision":"ask","class":"send","reason":"old"}
+    ],"exceptions":[{"class":"merge","repo":"*/repo","reason":"my own repository"}]}"#;
+    let (e, cwd) = merge_exception_env("merge-old-policy", old);
+    let ev = event(
+        "s",
+        &e.transcript,
+        &cwd,
+        "Bash",
+        &command("gh pr merge 7 --squash"),
+    );
+    let out = e.hook_raw(&ev, &[]);
+    assert!(is_ask(&out), "{out}");
 }
 
 #[test]

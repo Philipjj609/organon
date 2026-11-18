@@ -46,6 +46,8 @@ organon task done --outcome partial --left "no benchmark on our own frames"
 
 Design and evidence: [docs/organs/intelligence.md](docs/organs/intelligence.md).
 
+A `merge` exception in `policy.json` (`{"class": "merge", "repo": "*/my-repo", "reason": "…"}`) lets only a plain `gh pr merge [<number>]` with `--squash`/`-s`, `--merge`/`-m`, `--rebase`, `--delete-branch`/`-d` or `--match-head-commit <sha>` through in that repository. Every other form still asks: `--admin`, `--auto`, `-R`/`--repo`, URLs, bundled short flags, a leading `VAR=value`, and any command that sets or names `GH_REPO`, `GH_HOST`, git config or a remote. Limits: a remote or default repository changed in an earlier separate command cannot be seen from the text, and wrappers such as `env`, `command` or `exec` hide `gh` from every rule. If your `policy.json` was written by `organon init` before this class existed, it still has `gh pr merge` in class `send`; remove that rule or change its class to `merge`, otherwise the exception has no effect (merges keep asking).
+
 Each repo is published separately. Anyone can use one piece, fork it, or replace it with their own, as long as it speaks the protocol.
 
 ## Read next
