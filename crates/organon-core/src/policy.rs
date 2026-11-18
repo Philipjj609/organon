@@ -53,6 +53,21 @@ pub struct Policy {
     /// Commands still allowed once a task's budget is exhausted, so it can be wrapped up.
     #[serde(default)]
     pub after_budget: Vec<String>,
+    /// Repositories where a person lifted one approval class (see [`Exception`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exceptions: Vec<Exception>,
+}
+
+/// A person's standing yes for one approval class in some repositories: an `ask` rule of
+/// that class does not count for a command that works in a repository whose folder matches
+/// `repo` (a [`glob`], compared with forward slashes and ignoring case). An exception never
+/// lowers a `deny`, never applies when the folder is unknown, and does not change
+/// [`Policy::approval_class`], so the fail-safe stays strict.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Exception {
+    pub class: String,
+    pub repo: String,
+    pub reason: String,
 }
 
 /// What an agent is about to do.
@@ -80,6 +95,16 @@ pub type BranchOf<'a> = &'a dyn Fn(Option<&str>) -> Option<String>;
 /// A [`BranchOf`] that knows no branch.
 #[must_use]
 pub fn no_branch(_: Option<&str>) -> Option<String> {
+    None
+}
+
+/// Finds the root folder of the repository a command works in, with the same hint as
+/// [`BranchOf`]. Used only to apply [`Exception`]s.
+pub type RepoOf<'a> = &'a dyn Fn(Option<&str>) -> Option<String>;
+
+/// A [`RepoOf`] that knows no repository: no exception applies.
+#[must_use]
+pub fn no_repo(_: Option<&str>) -> Option<String> {
     None
 }
 
@@ -122,11 +147,23 @@ impl Policy {
     /// [`Policy::decide`], knowing which branch a bare `git push` would push.
     #[must_use]
     pub fn decide_in(&self, action: Action<'_>, branch_of: BranchOf<'_>) -> Verdict {
+        self.decide_at(action, branch_of, &no_repo)
+    }
+
+    /// [`Policy::decide_in`], also knowing which repository each part of a command works in,
+    /// so the policy's [`Exception`]s can apply.
+    #[must_use]
+    pub fn decide_at(
+        &self,
+        action: Action<'_>,
+        branch_of: BranchOf<'_>,
+        repo_of: RepoOf<'_>,
+    ) -> Verdict {
         let mut best = Verdict {
             decision: Decision::Allow,
             reason: None,
         };
-        for r in self.matching(action, branch_of) {
+        for r in self.matching(action, branch_of, repo_of) {
             if r.decision > best.decision {
                 best = Verdict {
                     decision: r.decision,
@@ -142,24 +179,41 @@ impl Policy {
     /// rather than let through unchecked.
     #[must_use]
     pub fn approval_class(&self, action: Action<'_>, branch_of: BranchOf<'_>) -> Option<&Rule> {
-        self.matching(action, branch_of)
+        self.matching(action, branch_of, &no_repo)
             .into_iter()
             .find(|r| r.class.is_some())
     }
 
-    fn matching(&self, action: Action<'_>, branch_of: BranchOf<'_>) -> Vec<&Rule> {
+    fn matching(
+        &self,
+        action: Action<'_>,
+        branch_of: BranchOf<'_>,
+        repo_of: RepoOf<'_>,
+    ) -> Vec<&Rule> {
         let mut out = Vec::new();
         match action {
             Action::Command(cmd) => {
                 let mut segs = segments(cmd);
+                let dirs = segment_dirs(&segs);
                 resolve_pushes(&mut segs, branch_of);
-                for seg in &segs {
+                for (seg, dir) in segs.iter().zip(&dirs) {
+                    // Some(None): looked up, no repository; looked up at most once per part.
+                    let mut repo: Option<Option<String>> = None;
                     for r in &self.rules {
-                        if r.command.as_deref().is_some_and(|p| matches(p, seg))
-                            && !out.contains(&r)
+                        if !r.command.as_deref().is_some_and(|p| matches(p, seg))
+                            || out.contains(&r)
                         {
-                            out.push(r);
+                            continue;
                         }
+                        if r.decision == Decision::Ask && !self.exceptions.is_empty() {
+                            if let Some(class) = r.class.as_deref() {
+                                let here = repo.get_or_insert_with(|| repo_of(dir.as_deref()));
+                                if here.as_deref().is_some_and(|f| self.excepted(class, f)) {
+                                    continue;
+                                }
+                            }
+                        }
+                        out.push(r);
                     }
                 }
             }
@@ -178,6 +232,14 @@ impl Policy {
             ),
         }
         out
+    }
+
+    /// Whether a person lifted `class` for the repository in `folder`.
+    fn excepted(&self, class: &str, folder: &str) -> bool {
+        let folder = folder.replace('\\', "/").to_lowercase();
+        self.exceptions
+            .iter()
+            .any(|e| e.class == class && glob(&e.repo.replace('\\', "/").to_lowercase(), &folder))
     }
 
     /// Whether every part of `cmd` is something allowed after the budget ran out.
@@ -349,6 +411,39 @@ const GIT_VALUE_FLAGS: &[&str] = &["-C", "-c", "--git-dir", "--work-tree", "--na
 ///
 /// The branch is found in the folder the command runs in: the agent's, a `cd` earlier in the
 /// command, or `git -C <dir>`. If it cannot be read, the words stay as written.
+/// The folder hint of each simple command: the last `cd` before it, or its own `git -C`.
+/// `None` means the agent's own folder.
+#[must_use]
+pub fn segment_dirs(segs: &[Vec<String>]) -> Vec<Option<String>> {
+    let mut dir: Option<String> = None;
+    let mut out = Vec::with_capacity(segs.len());
+    for seg in segs {
+        match seg.first().map(String::as_str) {
+            Some("cd" | "set-location" | "pushd" | "sl") => {
+                dir = seg[1..].iter().find(|w| !w.starts_with('-')).cloned();
+                out.push(dir.clone());
+            }
+            Some("git") => {
+                let mut here = dir.clone();
+                let mut i = 1;
+                while i < seg.len() && seg[i].starts_with('-') {
+                    if seg[i] == "-C" {
+                        here = seg.get(i + 1).cloned();
+                    }
+                    i += if GIT_VALUE_FLAGS.contains(&seg[i].as_str()) {
+                        2
+                    } else {
+                        1
+                    };
+                }
+                out.push(here);
+            }
+            _ => out.push(dir.clone()),
+        }
+    }
+    out
+}
+
 pub fn resolve_pushes(segs: &mut [Vec<String>], branch_of: BranchOf<'_>) {
     let mut dir: Option<String> = None;
     for seg in segs.iter_mut() {
@@ -497,6 +592,101 @@ mod tests {
 
     fn decide(cmd: &str) -> Decision {
         policy().decide(Action::Command(cmd)).decision
+    }
+
+    fn with_exception() -> Policy {
+        let mut p = policy();
+        p.exceptions.push(Exception {
+            class: "push-main".into(),
+            repo: "*/Projects/mneme-memory".into(),
+            reason: "test".into(),
+        });
+        p
+    }
+
+    /// The repository of a folder hint is the hint itself; no hint is the agent's own repo.
+    fn repo_at(hint: Option<&str>) -> Option<String> {
+        Some(hint.unwrap_or("C:/Users/x/Projects/ergon").to_owned())
+    }
+
+    fn decide_at(p: &Policy, cmd: &str) -> Decision {
+        p.decide_at(Action::Command(cmd), &no_branch, &repo_at)
+            .decision
+    }
+
+    #[test]
+    fn an_exception_lifts_its_class_only_in_its_repository() {
+        let p = with_exception();
+        let mm = "C:/Users/x/Projects/mneme-memory";
+        assert_eq!(
+            decide_at(&p, &format!("cd {mm} && git push origin main")),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide_at(&p, &format!("git -C {mm} push origin main")),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide_at(
+                &p,
+                r#"git -C "c:\users\x\projects\MNEME-MEMORY" push origin main"#
+            ),
+            Decision::Allow
+        );
+        // Another repository, or the agent's own folder: still asks.
+        assert_eq!(decide_at(&p, "git push origin main"), Decision::Ask);
+        assert_eq!(
+            decide_at(&p, "cd C:/Users/x/Projects/ergon && git push origin main"),
+            Decision::Ask
+        );
+        // A second push elsewhere in the same command still asks.
+        assert_eq!(
+            decide_at(
+                &p,
+                &format!("git -C {mm} push origin main && git push origin main")
+            ),
+            Decision::Ask
+        );
+        // Other classes in the excepted repository still ask.
+        assert_eq!(
+            decide_at(&p, &format!("cd {mm} && git push --force origin x")),
+            Decision::Ask
+        );
+        // Without a known repository nothing is lifted.
+        let cmd = format!("cd {mm} && git push origin main");
+        assert_eq!(
+            p.decide_in(Action::Command(&cmd), &no_branch).decision,
+            Decision::Ask
+        );
+        // The fail-safe ignores exceptions.
+        assert!(p
+            .approval_class(Action::Command(&cmd), &no_branch)
+            .is_some());
+    }
+
+    #[test]
+    fn an_exception_never_lowers_a_deny() {
+        let mut p = with_exception();
+        p.exceptions.push(Exception {
+            class: "delete".into(),
+            repo: "*".into(),
+            reason: "test".into(),
+        });
+        assert_eq!(decide_at(&p, "gh repo delete x/y"), Decision::Deny);
+    }
+
+    #[test]
+    fn segment_dirs_follow_cd_and_git_dash_c() {
+        let segs = segments("cd /a && git -C /b push && git status && ls");
+        assert_eq!(
+            segment_dirs(&segs),
+            vec![
+                Some("/a".into()),
+                Some("/b".into()),
+                Some("/a".into()),
+                Some("/a".into())
+            ]
+        );
     }
 
     #[test]

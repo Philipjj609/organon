@@ -15,6 +15,14 @@ pub fn branch_in(dir: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The root folder of the repository (or worktree) `dir` is in, with forward slashes.
+/// Used to apply the policy's exceptions.
+pub fn repo_root(dir: &Path) -> Option<String> {
+    dir.ancestors()
+        .find(|a| a.join(".git").exists())
+        .map(|a| a.to_string_lossy().replace('\\', "/"))
+}
+
 fn git_dir(dir: &Path) -> Option<PathBuf> {
     for a in dir.ancestors() {
         let dot = a.join(".git");
@@ -39,14 +47,61 @@ pub fn folder(cwd: &str, hint: Option<&str>) -> PathBuf {
         PathBuf::from(cwd)
     };
     match hint {
-        Some(h) => base.join(h),
+        Some(h) => base.join(drive_path(h)),
         None => base,
+    }
+}
+
+/// A Git Bash path (`/c/Users/x`) as the Windows path it names (`C:/Users/x`); any other
+/// path unchanged. Elsewhere than Windows, every path is unchanged.
+fn drive_path(p: &str) -> String {
+    let b = p.as_bytes();
+    if cfg!(windows)
+        && b.len() >= 2
+        && b[0] == b'/'
+        && b[1].is_ascii_alphabetic()
+        && (b.len() == 2 || b[2] == b'/')
+    {
+        format!(
+            "{}:/{}",
+            char::from(b[1]).to_ascii_uppercase(),
+            p.get(3..).unwrap_or("")
+        )
+    } else {
+        p.to_owned()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_bash_paths_name_windows_drives() {
+        if cfg!(windows) {
+            assert_eq!(drive_path("/c/Users/x"), "C:/Users/x");
+            assert_eq!(drive_path("/d"), "D:/");
+        } else {
+            assert_eq!(drive_path("/c/Users/x"), "/c/Users/x");
+        }
+        assert_eq!(drive_path("/usr/bin"), "/usr/bin");
+        assert_eq!(drive_path("relative/x"), "relative/x");
+    }
+
+    #[test]
+    fn finds_the_root_of_a_repository() {
+        let root = std::env::temp_dir().join(format!("organon-root-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("repo").join(".git")).unwrap();
+        fs::create_dir_all(root.join("repo").join("a").join("b")).unwrap();
+        let want = root.join("repo").to_string_lossy().replace('\\', "/");
+        assert_eq!(
+            repo_root(&root.join("repo").join("a").join("b")),
+            Some(want)
+        );
+        assert_eq!(repo_root(&root.join("elsewhere")), None);
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn reads_the_branch_of_a_repo_and_of_a_worktree() {
