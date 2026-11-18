@@ -1,6 +1,7 @@
 //! The one git fact the policy needs: which branch a folder has checked out, so a bare
 //! `git push` on `main` is seen as a push to `main`. Read from `.git/HEAD` (no git process).
 
+use organon_core::policy::Inherited;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -86,32 +87,110 @@ fn drive_path(p: &str) -> String {
     }
 }
 
-/// Whether the environment a command will run in could point `gh` at another repository or
-/// host than its folder's: `GH_REPO` or `GH_HOST` is set in this process (a session inherits
-/// it), or the file named by `CLAUDE_ENV_FILE` (Claude Code sources it before each command)
-/// mentions either. A file that is set but cannot be read for another reason than not
-/// existing yet counts as yes: nothing can be said about it, so nothing is lifted.
-pub fn gh_target_in_environment() -> bool {
-    gh_target_in(&|k| std::env::var_os(k), &|p| fs::read(p))
+/// What the shell a command will run in inherits, as far as it decides whether an exception
+/// may lift a `gh` command: `GH_REPO` or `GH_HOST` in this process's environment, and the
+/// files Claude Code sources before each command (the one `CLAUDE_ENV_FILE` names, and every
+/// `*.sh` in `<claude config dir>/session-env/<session id>/`). `session_id` is the hook
+/// event's; `None` (the `check` command) reads no session folder, and an empty or odd one
+/// (anything but letters, digits, `-`, `_`) counts as unreadable.
+pub fn inherited(session_id: Option<&str>) -> Inherited {
+    let config = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| crate::home::user_home().map(|h| h.join(".claude")));
+    inherited_in(
+        session_id,
+        config.as_deref(),
+        &|k| std::env::var_os(k),
+        &|p| fs::read(p),
+        &|d| {
+            let mut out = Vec::new();
+            for e in fs::read_dir(d)? {
+                let p = e?.path();
+                if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("sh")) {
+                    out.push(p);
+                }
+            }
+            Ok(out)
+        },
+    )
 }
 
-fn gh_target_in(
-    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
-    read: &dyn Fn(&Path) -> std::io::Result<Vec<u8>>,
-) -> bool {
-    if ["GH_REPO", "GH_HOST"].iter().any(|k| var(k).is_some()) {
-        return true;
-    }
-    let Some(file) = var("CLAUDE_ENV_FILE").filter(|f| !f.is_empty()) else {
-        return false;
+type VarOf<'a> = &'a dyn Fn(&str) -> Option<std::ffi::OsString>;
+type ReadFile<'a> = &'a dyn Fn(&Path) -> std::io::Result<Vec<u8>>;
+type ListShell<'a> = &'a dyn Fn(&Path) -> std::io::Result<Vec<PathBuf>>;
+
+fn inherited_in(
+    session_id: Option<&str>,
+    config_dir: Option<&Path>,
+    var: VarOf<'_>,
+    read: ReadFile<'_>,
+    list: ListShell<'_>,
+) -> Inherited {
+    let mut out = Inherited {
+        gh_target: ["GH_REPO", "GH_HOST"].iter().any(|k| var(k).is_some()),
+        init_unsafe: false,
     };
-    match read(Path::new(&file)) {
-        Ok(bytes) => {
-            let text = String::from_utf8_lossy(&bytes).to_lowercase();
-            text.contains("gh_repo") || text.contains("gh_host")
-        }
-        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    let mut files: Vec<PathBuf> = Vec::new();
+    // Not created yet is fine for the one file; any other failure says nothing can be judged.
+    let mut missing_ok: Vec<PathBuf> = Vec::new();
+    if let Some(f) = var("CLAUDE_ENV_FILE").filter(|f| !f.is_empty()) {
+        missing_ok.push(PathBuf::from(f));
     }
+    if let Some(id) = session_id {
+        let plain = !id.is_empty()
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        match (plain, config_dir) {
+            (true, Some(c)) => match list(&c.join("session-env").join(id)) {
+                Ok(v) => files.extend(v),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => out.init_unsafe = true,
+            },
+            _ => out.init_unsafe = true,
+        }
+    }
+    for (path, missing_is_fine) in files
+        .iter()
+        .map(|p| (p, false))
+        .chain(missing_ok.iter().map(|p| (p, true)))
+    {
+        match read(path) {
+            Ok(bytes) => {
+                let (gh, unsafe_) = judge_shell_file(&String::from_utf8_lossy(&bytes));
+                out.gh_target |= gh;
+                out.init_unsafe |= unsafe_;
+            }
+            Err(e) if missing_is_fine && e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                // Unreadable: nothing can be said, so nothing is lifted.
+                out.gh_target = true;
+                out.init_unsafe = true;
+            }
+        }
+    }
+    out
+}
+
+/// What a file the shell sources says, read after deleting quotes, backslash, backtick and
+/// caret (which the shell removes, so `GH_RE""PO` is `GH_REPO`) and lower-casing it: whether it
+/// names `GH_REPO` or `GH_HOST`, and whether it does something its text cannot show
+/// (`eval`, `source`, `.` sourcing, `${`, `$(`).
+fn judge_shell_file(text: &str) -> (bool, bool) {
+    let t: String = text
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\' | '`' | '^'))
+        .flat_map(char::to_lowercase)
+        .collect();
+    let gh = t.contains("gh_repo") || t.contains("gh_host");
+    let cs: Vec<char> = t.chars().collect();
+    let dot_command = cs.iter().enumerate().any(|(i, &c)| {
+        c == '.'
+            && cs.get(i + 1).is_some_and(|n| n.is_whitespace())
+            && (i == 0 || cs[i - 1].is_whitespace() || ";&|(".contains(cs[i - 1]))
+    });
+    let unsafe_ = ["eval", "source", "${", "$("].iter().any(|w| t.contains(w)) || dot_command;
+    (gh, unsafe_)
 }
 
 #[cfg(test)]
@@ -119,9 +198,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_environment_can_name_the_target_of_gh() {
+    fn what_the_shell_inherits_is_read_from_the_environment_and_its_files() {
+        use std::collections::HashMap;
         use std::ffi::OsString;
         use std::io::{Error, ErrorKind};
+        let cfg = Path::new("/cfg");
         let vars = |set: &[(&'static str, &'static str)]| {
             let set = set.to_vec();
             move |k: &str| {
@@ -130,37 +211,91 @@ mod tests {
                     .map(|(_, v)| OsString::from(v))
             }
         };
-        let file = |text: &'static str| move |_: &Path| Ok(text.as_bytes().to_vec());
-        let never = |_: &Path| Err(Error::new(ErrorKind::NotFound, "no"));
-        assert!(!gh_target_in(&vars(&[]), &never));
-        assert!(gh_target_in(&vars(&[("GH_REPO", "x/y")]), &never));
-        assert!(gh_target_in(&vars(&[("GH_HOST", "h")]), &never));
-        let f = vars(&[("CLAUDE_ENV_FILE", "/tmp/env.sh")]);
-        assert!(!gh_target_in(
-            &f,
-            &file(
-                "export PATH=/x
-"
+        // A fake disk: file path -> text; a session-env folder lists its files.
+        let disk = |files: &[(&'static str, &'static str)]| {
+            let files: HashMap<PathBuf, &'static str> =
+                files.iter().map(|(p, t)| (PathBuf::from(p), *t)).collect();
+            let f2 = files.clone();
+            (
+                move |p: &Path| match files.get(p) {
+                    Some(t) if *t == "DENIED" => Err(Error::new(ErrorKind::PermissionDenied, "no")),
+                    Some(t) => Ok(t.as_bytes().to_vec()),
+                    None => Err(Error::new(ErrorKind::NotFound, "no")),
+                },
+                move |d: &Path| {
+                    let mut v: Vec<PathBuf> = f2
+                        .keys()
+                        .filter(|p| p.parent() == Some(d))
+                        .cloned()
+                        .collect();
+                    v.sort();
+                    Ok(v)
+                },
             )
-        ));
-        assert!(gh_target_in(
-            &f,
-            &file(
-                "export Gh_Repo=x/y
-"
-            )
-        ));
-        assert!(gh_target_in(
-            &f,
-            &file(
-                "export GH_HOST=h
-"
-            )
-        ));
-        assert!(!gh_target_in(&f, &never), "not created yet");
-        let denied = |_: &Path| Err(Error::new(ErrorKind::PermissionDenied, "no"));
-        assert!(gh_target_in(&f, &denied), "unreadable: nothing lifted");
-        assert!(!gh_target_in(&vars(&[("CLAUDE_ENV_FILE", "")]), &denied));
+        };
+        let run = |sid: Option<&str>,
+                   env: &[(&'static str, &'static str)],
+                   files: &[(&'static str, &'static str)]| {
+            let (r, l) = disk(files);
+            inherited_in(sid, Some(cfg), &vars(env), &r, &l)
+        };
+        let clean = Inherited::default();
+        assert_eq!(run(Some("s"), &[], &[]), clean, "no folder, nothing set");
+        assert_eq!(run(None, &[], &[]), clean);
+        // The process environment.
+        for v in ["GH_REPO", "GH_HOST"] {
+            assert!(run(Some("s"), &[(v, "x")], &[]).gh_target, "{v}");
+        }
+        // The file CLAUDE_ENV_FILE names.
+        let e = [("CLAUDE_ENV_FILE", "/tmp/env.sh")];
+        let r = run(Some("s"), &e, &[("/tmp/env.sh", "export PATH=/x\n")]);
+        assert_eq!(r, clean);
+        let r = run(Some("s"), &e, &[("/tmp/env.sh", "export Gh_Repo=x/y\n")]);
+        assert!(r.gh_target);
+        let r = run(Some("s"), &e, &[("/tmp/env.sh", "export GH_RE\"\"PO=x\n")]);
+        assert!(r.gh_target, "quotes are removed before reading");
+        let r = run(Some("s"), &e, &[("/tmp/env.sh", "export GH_RE\\PO=x\n")]);
+        assert!(r.gh_target, "backslash too");
+        assert_eq!(run(Some("s"), &e, &[]), clean, "not created yet");
+        let r = run(Some("s"), &e, &[("/tmp/env.sh", "DENIED")]);
+        assert!(r.gh_target && r.init_unsafe, "unreadable: nothing lifted");
+        assert_eq!(
+            run(Some("s"), &[("CLAUDE_ENV_FILE", "")], &[("", "DENIED")]),
+            clean
+        );
+        // The files in the session's folder.
+        let sh = |text: &'static str| [("/cfg/session-env/s/hook-1.sh", text)];
+        assert_eq!(run(Some("s"), &[], &sh("export PATH=/x\n")), clean);
+        assert!(run(Some("s"), &[], &sh("export GH_REPO=x\n")).gh_target);
+        assert!(run(Some("s"), &[], &sh("export GH_RE\"\"PO=x\n")).gh_target);
+        assert!(run(Some("s"), &[], &sh("export GH_HOST=h\n")).gh_target);
+        for text in [
+            "eval \"$X\"\n",
+            "ev\"\"al x\n",
+            "source ./x.sh\n",
+            "export A=${B}\n",
+            "export A=$(date)\n",
+            ". ./x.sh\n",
+            "export A=1; . ./x.sh\n",
+        ] {
+            assert!(run(Some("s"), &[], &sh(text)).init_unsafe, "{text}");
+        }
+        for text in ["export A=1.5 B=x. y\n", "# a. note\n"] {
+            assert_eq!(run(Some("s"), &[], &sh(text)), clean, "{text}");
+        }
+        // Another session's files are not read; an unreadable one, or a session id that cannot
+        // name a folder, lifts nothing.
+        let other = [("/cfg/session-env/other/hook-1.sh", "export GH_REPO=x\n")];
+        assert_eq!(run(Some("s"), &[], &other), clean);
+        let r = run(Some("s"), &[], &sh("DENIED"));
+        assert!(r.gh_target && r.init_unsafe);
+        for id in ["", "../x", "a/b", "a b"] {
+            assert!(run(Some(id), &[], &[]).init_unsafe, "{id:?}");
+        }
+        assert!(!run(Some("s"), &[], &[]).init_unsafe);
+        // No config folder known: a session's files cannot be found.
+        let (r, l) = disk(&[]);
+        assert!(inherited_in(Some("s"), None, &vars(&[]), &r, &l).init_unsafe);
     }
 
     #[test]

@@ -116,9 +116,21 @@ pub fn no_repo(_: Option<&str>) -> Option<String> {
     None
 }
 
-/// The class of the rule that guards `gh pr merge`. An exception for it is narrower than one
-/// for any other class: see [`merge_exception_applies`].
+/// The class of the rule that guards `gh pr merge`. An exception for it lifts a command only
+/// when the whole command is one of two fixed forms: see [`lone_merge`].
 const MERGE_CLASS: &str = "merge";
+
+/// What the process a command will run in inherited, read by the caller: this crate reads no
+/// environment and no file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Inherited {
+    /// `GH_REPO` or `GH_HOST` is set in the environment, or in a file the shell sources before
+    /// each command. Either points `gh` at another repository or host than its folder's.
+    pub gh_target: bool,
+    /// A file the shell sources before each command cannot be read, or does something that
+    /// cannot be judged from its text (`eval`, `source`, `${`, `$(`, `. file`).
+    pub init_unsafe: bool,
+}
 
 /// The command in lower case, with the characters a shell or PowerShell removes (quotes,
 /// backslash, backtick, caret) taken out, so `GH_RE""PO` and `GH_RE\PO` read as `gh_repo`.
@@ -136,104 +148,98 @@ fn names_a_gh_target(cmd: &str, raw: &[Vec<String>]) -> bool {
     named(&squashed(cmd)) || raw.iter().any(|ws| named(&squashed(&ws.join(" "))))
 }
 
-/// Programs that set variables, read or run text as shell, or otherwise steer a later `gh`
-/// where the command's own words do not show it.
-const STEERING_PROGRAMS: &[&str] = &[
-    "export",
-    "set",
-    "setx",
-    "env",
-    "declare",
-    "typeset",
-    "local",
-    "readonly",
-    "set-item",
-    "si",
-    "set-variable",
-    "sv",
-    "eval",
-    "source",
-    ".",
-    "invoke-expression",
-    "iex",
-];
-
-/// Text that changes which repository `gh` and `git` resolve (the remote, the default
-/// repository, `url.*.insteadOf`, any `GIT_CONFIG_*` variable) or sets an environment variable
-/// in PowerShell.
-const STEERING_TEXT: &[&str] = &[
-    "gh_repo",
-    "gh_host",
-    "git_config",
-    "insteadof",
-    "env:",
-    "setenvironmentvariable",
-    "git remote",
-    "git config",
-    "repo set-default",
-];
-
-/// Whether something in the command could change which repository a later `gh pr merge` in
-/// it works on, apart from the folder: a variable, a remote, the default repository.
-fn steers_gh(cmd: &str, split: &Split) -> bool {
-    let mentions = |t: &str| STEERING_TEXT.iter().any(|s| t.contains(s));
-    if mentions(&squashed(cmd))
-        || split
-            .raw
-            .iter()
-            .any(|ws| mentions(&squashed(&ws.join(" "))))
+/// Whether `cmd` is only a plain merge, and where it runs. `None`: it is not (anything else
+/// asks). `Some(None)`: `gh pr merge ...` alone, in the agent's folder. `Some(Some(dir))`:
+/// `cd <dir> && gh pr merge ...`, in `dir`.
+///
+/// This is an allow-list over the whole command, not a search for bad words:
+/// - every character is a letter, a digit, a space or one of `- _ . / : = + @ ,`, and `&` only
+///   as the `&&` between the two parts. So no `$`, quote, backslash, backtick, `%`, glob or
+///   history character, redirection, subshell, `;`, `|`, `||`, lone `&` or newline: nothing a
+///   shell expands, rewrites or chains;
+/// - the first part, if there is a second, is `cd`, `Set-Location` or `sl` and one absolute
+///   path with forward slashes (`C:/...` or `/...`, letters, digits and `. _ / - +` only, no
+///   `..` component);
+/// - the merge is exactly [`plain_merge`].
+fn lone_merge(cmd: &str) -> Option<Option<&str>> {
+    if !cmd
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || " -_./:=+@,&".contains(c))
     {
-        return true;
+        return None;
     }
-    split.segs.iter().any(|seg| {
-        let word = |w: &str| seg[1..].iter().any(|x| x == w);
-        STEERING_PROGRAMS.contains(&seg[0].as_str())
-            || (seg[0] == "git" && (word("remote") || word("config")))
-            || (seg[0] == "gh" && word("set-default"))
-    })
+    let parts: Vec<&str> = cmd.split("&&").collect();
+    if parts.iter().any(|p| p.contains('&')) {
+        return None;
+    }
+    fn words(p: &str) -> Vec<&str> {
+        p.split(' ').filter(|w| !w.is_empty()).collect()
+    }
+    match parts.as_slice() {
+        [merge] => plain_merge(&words(merge)).then_some(None),
+        [cd, merge] => match words(cd).as_slice() {
+            [prog, path]
+                if ["cd", "set-location", "sl"]
+                    .iter()
+                    .any(|p| prog.eq_ignore_ascii_case(p))
+                    && is_plain_absolute_path(path)
+                    && plain_merge(&words(merge)) =>
+            {
+                Some(Some(*path))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
-/// Whether `seg` is exactly `gh pr merge` with nothing that names a repository or changes what
-/// is merged: at most one positional (a number or branch, never a URL), and only the flags
-/// `--squash`/`-s`, `--merge`/`-m`, `--rebase`, `--delete-branch`/`-d` and
-/// `--match-head-commit <sha>` (or `=<sha>`). Anything else, a bundle like `-sd` included, is
-/// not plain: it asks.
-fn is_plain_merge(seg: &[String]) -> bool {
-    if seg.len() < 3 || seg[0] != "gh" || seg[1] != "pr" || seg[2] != "merge" {
+/// One absolute path with forward slashes: `C:/a/b` or `/a/b`, made of letters, digits and
+/// `. _ / - +`, with no `..` component.
+fn is_plain_absolute_path(p: &str) -> bool {
+    let rest = match p.as_bytes() {
+        [b'/', ..] => p,
+        [d, b':', b'/', ..] if d.is_ascii_alphabetic() => &p[2..],
+        _ => return false,
+    };
+    rest.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._/-+".contains(c))
+        && !rest.split('/').any(|c| c == "..")
+}
+
+/// Whether `w` is exactly `gh pr merge` with at most one positional (`^[0-9]+$` or
+/// `^[A-Za-z0-9._/-]+$`, not starting with `-`) and only the flags `--squash`/`-s`,
+/// `--merge`/`-m`, `--rebase`, `--delete-branch`/`-d` and `--match-head-commit <sha>` (or
+/// `=<sha>`, 7 to 40 hex digits). Anything else, a bundle like `-sd` included, is not plain.
+fn plain_merge(w: &[&str]) -> bool {
+    if w.len() < 3 || w[0] != "gh" || w[1] != "pr" || w[2] != "merge" {
         return false;
     }
+    let sha = |v: &str| (7..=40).contains(&v.len()) && v.chars().all(|c| c.is_ascii_hexdigit());
     let mut positional = false;
     let mut i = 3;
-    while i < seg.len() {
-        let w = seg[i].as_str();
-        match w {
+    while i < w.len() {
+        let a = w[i];
+        match a {
             "--squash" | "-s" | "--merge" | "-m" | "--rebase" | "--delete-branch" | "-d" => {}
             "--match-head-commit" => {
                 i += 1;
-                if !seg
-                    .get(i)
-                    .is_some_and(|v| !v.is_empty() && !v.starts_with('-'))
-                {
+                if !w.get(i).is_some_and(|v| sha(v)) {
                     return false;
                 }
             }
-            _ if w
-                .strip_prefix("--match-head-commit=")
-                .is_some_and(|v| !v.is_empty()) => {}
-            _ if !w.starts_with('-') && !w.contains("://") && !positional => positional = true,
+            _ if a.strip_prefix("--match-head-commit=").is_some_and(sha) => {}
+            _ if !positional
+                && !a.starts_with('-')
+                && a.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c)) =>
+            {
+                positional = true;
+            }
             _ => return false,
         }
         i += 1;
     }
     true
-}
-
-/// Whether an exception for [`MERGE_CLASS`] lifts this simple command: only a plain
-/// `gh pr merge` ([`is_plain_merge`]) with no leading `VAR=value`, in a command that has
-/// nothing that could steer `gh` to another repository ([`steers_gh`]), while `GH_REPO` and
-/// `GH_HOST` are not set in the environment the command inherits (`gh_env`, read by the caller).
-fn merge_exception_applies(seg: &[String], assigned: bool, steered: bool, gh_env: bool) -> bool {
-    !assigned && !steered && !gh_env && is_plain_merge(seg)
 }
 
 /// Whether a simple command runs `gh` (also through `npx`).
@@ -292,9 +298,8 @@ impl Policy {
     }
 
     /// [`Policy::decide_in`], also knowing which repository each part of a command works in,
-    /// so the policy's [`Exception`]s can apply. It assumes the process environment has no
-    /// `GH_REPO` or `GH_HOST`; a caller that reads the environment uses
-    /// [`Policy::decide_with_env`].
+    /// so the policy's [`Exception`]s can apply. It assumes the process inherited nothing that
+    /// steers `gh`; a caller that reads the environment uses [`Policy::decide_with_env`].
     #[must_use]
     pub fn decide_at(
         &self,
@@ -302,29 +307,28 @@ impl Policy {
         branch_of: BranchOf<'_>,
         repo_of: RepoOf<'_>,
     ) -> Verdict {
-        self.decide_with_env(action, branch_of, repo_of, false)
+        self.decide_with_env(action, branch_of, repo_of, Inherited::default())
     }
 
-    /// [`Policy::decide_at`] told whether the environment the command will run in sets
-    /// `GH_REPO` or `GH_HOST` (`gh_env`). This crate reads no environment, so the caller does.
-    /// Both variables point `gh` at another repository or host than its folder's: while either
-    /// is set, no [`Exception`] lifts a `gh` command. The exception for the `merge` class is
-    /// narrower still: it lifts only a plain `gh pr merge` (see the policy docs), and nothing
-    /// in a command that names `GH_REPO`, `GH_HOST`, `GIT_CONFIG_*`, `insteadOf`, a remote or
-    /// the default repository, or sets a variable.
+    /// [`Policy::decide_at`] told what the process the command will run in inherited
+    /// (`env`). This crate reads no environment and no file, so the caller does.
+    /// `GH_REPO` and `GH_HOST` point `gh` at another repository or host than its folder's:
+    /// while either is set (`env.gh_target`), or the command names either, no [`Exception`]
+    /// lifts a `gh` command. An exception for the `merge` class lifts only a command that is
+    /// nothing but a plain merge ([`lone_merge`]), and only while `env` is clean.
     #[must_use]
     pub fn decide_with_env(
         &self,
         action: Action<'_>,
         branch_of: BranchOf<'_>,
         repo_of: RepoOf<'_>,
-        gh_env: bool,
+        env: Inherited,
     ) -> Verdict {
         let mut best = Verdict {
             decision: Decision::Allow,
             reason: None,
         };
-        for r in self.matching(action, branch_of, repo_of, gh_env) {
+        for r in self.matching(action, branch_of, repo_of, env) {
             if r.decision > best.decision {
                 best = Verdict {
                     decision: r.decision,
@@ -340,7 +344,7 @@ impl Policy {
     /// rather than let through unchecked.
     #[must_use]
     pub fn approval_class(&self, action: Action<'_>, branch_of: BranchOf<'_>) -> Option<&Rule> {
-        self.matching(action, branch_of, &no_repo, false)
+        self.matching(action, branch_of, &no_repo, Inherited::default())
             .into_iter()
             .find(|r| r.class.is_some())
     }
@@ -350,7 +354,7 @@ impl Policy {
         action: Action<'_>,
         branch_of: BranchOf<'_>,
         repo_of: RepoOf<'_>,
-        gh_env: bool,
+        env: Inherited,
     ) -> Vec<&Rule> {
         let mut out = Vec::new();
         match action {
@@ -360,11 +364,15 @@ impl Policy {
                 let certain = folders_are_certain(cmd, &segs);
                 let dirs = segment_dirs(&segs);
                 // Computed once per command; used only when an exception could apply.
-                let steered = !self.exceptions.is_empty() && steers_gh(cmd, &parsed);
-                let gh_target =
-                    gh_env || (!self.exceptions.is_empty() && names_a_gh_target(cmd, &parsed.raw));
+                let gh_target = env.gh_target
+                    || (!self.exceptions.is_empty() && names_a_gh_target(cmd, &parsed.raw));
+                let lone = if self.exceptions.is_empty() {
+                    None
+                } else {
+                    lone_merge(cmd)
+                };
                 resolve_pushes(&mut segs, branch_of);
-                for ((seg, dir), assigned) in segs.iter().zip(&dirs).zip(&parsed.assigned) {
+                for (seg, dir) in segs.iter().zip(&dirs) {
                     // Some(None): looked up, no repository; looked up at most once per part.
                     let mut repo: Option<Option<String>> = None;
                     for r in &self.rules {
@@ -373,18 +381,21 @@ impl Policy {
                         {
                             continue;
                         }
-                        if certain && r.decision == Decision::Ask && !self.exceptions.is_empty() {
+                        if r.decision == Decision::Ask && !self.exceptions.is_empty() {
                             if let Some(class) = r.class.as_deref() {
-                                let allowed = if class == MERGE_CLASS {
-                                    merge_exception_applies(seg, *assigned, steered, gh_env)
+                                // Where to look for the repository, if an exception may apply.
+                                let hint: Option<Option<&str>> = if class == MERGE_CLASS {
+                                    lone.filter(|_| !env.gh_target && !env.init_unsafe)
+                                } else if certain && !(gh_target && runs_gh(seg)) {
+                                    Some(dir.as_deref())
                                 } else {
-                                    !(gh_target && runs_gh(seg))
+                                    None
                                 };
-                                let here = repo.get_or_insert_with(|| repo_of(dir.as_deref()));
-                                if allowed
-                                    && here.as_deref().is_some_and(|f| self.excepted(class, f))
-                                {
-                                    continue;
+                                if let Some(hint) = hint {
+                                    let here = repo.get_or_insert_with(|| repo_of(hint));
+                                    if here.as_deref().is_some_and(|f| self.excepted(class, f)) {
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -448,8 +459,6 @@ pub fn segments(cmd: &str) -> Vec<Vec<String>> {
 struct Split {
     /// The words of each simple command, as [`segments`] returns them.
     segs: Vec<Vec<String>>,
-    /// Whether the command in `segs` had leading `VAR=value` words (dropped from it).
-    assigned: Vec<bool>,
     /// Every unquoted word of every simple command, assignments and commands made only of
     /// assignments included, with the program as written.
     raw: Vec<Vec<String>>,
@@ -458,7 +467,6 @@ struct Split {
 fn split(cmd: &str) -> Split {
     let mut out = Split {
         segs: Vec::new(),
-        assigned: Vec::new(),
         raw: Vec::new(),
     };
     let mut words: Vec<String> = Vec::new();
@@ -480,14 +488,12 @@ fn split(cmd: &str) -> Split {
             .skip_while(|w| is_assignment(w))
             .cloned()
             .collect();
-        let assigned = ws.len() != all.len();
         out.raw.push(all);
         if let Some(p) = ws.first_mut() {
             *p = program_name(p);
         }
         if !ws.is_empty() {
             out.segs.push(ws);
-            out.assigned.push(assigned);
         }
     };
     while let Some(c) = chars.next() {
@@ -905,13 +911,36 @@ mod tests {
     }
 
     fn decide_at(p: &Policy, cmd: &str) -> Decision {
-        p.decide_with_env(Action::Command(cmd), &no_branch, &repo_at, false)
-            .decision
+        p.decide_with_env(
+            Action::Command(cmd),
+            &no_branch,
+            &repo_at,
+            Inherited::default(),
+        )
+        .decision
     }
 
     /// The decision when the environment the command inherits sets `GH_REPO` or `GH_HOST`.
     fn decide_with_gh_env(p: &Policy, cmd: &str) -> Decision {
-        p.decide_with_env(Action::Command(cmd), &no_branch, &repo_at, true)
+        p.decide_with_env(
+            Action::Command(cmd),
+            &no_branch,
+            &repo_at,
+            Inherited {
+                gh_target: true,
+                init_unsafe: false,
+            },
+        )
+        .decision
+    }
+
+    /// The decision when a file the shell sources cannot be judged (it has `eval`, say).
+    fn decide_with_init_unsafe(p: &Policy, cmd: &str) -> Decision {
+        let env = Inherited {
+            gh_target: false,
+            init_unsafe: true,
+        };
+        p.decide_with_env(Action::Command(cmd), &no_branch, &repo_at, env)
             .decision
     }
 
@@ -1003,8 +1032,13 @@ mod tests {
     }
 
     fn decide_from_mm(p: &Policy, cmd: &str) -> Decision {
-        p.decide_with_env(Action::Command(cmd), &no_branch, &repo_from_mm, false)
-            .decision
+        p.decide_with_env(
+            Action::Command(cmd),
+            &no_branch,
+            &repo_from_mm,
+            Inherited::default(),
+        )
+        .decision
     }
 
     #[test]
@@ -1405,22 +1439,25 @@ mod tests {
     }
 
     #[test]
-    fn a_merge_exception_lifts_only_the_plain_merge_allow_list() {
+    fn a_merge_exception_lifts_only_a_whole_command_that_is_a_plain_merge() {
         let p = with_merge_exception();
         for cmd in [
             "gh pr merge 12 --squash",
-            "gh pr merge 12 --squash --delete-branch --match-head-commit abc123",
-            "gh pr merge 12 --match-head-commit=abc123 -d",
+            "gh pr merge 12 --squash --delete-branch --match-head-commit abc1234",
+            "gh pr merge 12 --match-head-commit=abc1234 -d",
             "gh pr merge 12 --rebase",
+            "gh pr merge feat/x --merge",
             "gh pr merge --merge",
             "gh pr merge -s",
             "gh pr merge -m 12",
             "gh pr merge --squash 12 -d",
-            "gh pr merge feature/x --squash",
             "gh pr merge",
-            "gh.exe pr merge 12 --squash",
-            "cd C:/Users/x/Projects/ergon && gh pr merge 3 --squash",
-            "git status && gh pr merge 3 --squash && git pull",
+            "gh pr merge 12 --squash ",
+            "cd C:/Users/x/Projects/ergon && gh pr merge 3 --squash --match-head-commit 0123456789abcdef0123456789abcdef01234567",
+            "cd C:/Users/x/Projects/ergon && gh pr merge 3",
+            "Set-Location C:/Users/x/Projects/ergon && gh pr merge 3 --squash",
+            "sl C:/Users/x/Projects/ergon && gh pr merge 3 --squash",
+            "cd C:/Users/x/Projects/ergon&&gh pr merge 3",
         ] {
             assert_eq!(decide_at(&p, cmd), Decision::Allow, "{cmd}");
         }
@@ -1452,16 +1489,62 @@ mod tests {
             "gh pr merge 7 -b body",
             "gh pr merge 7 -F body.md",
             "gh pr merge 7 --squash=true",
-            // a second positional, a value-less or flag-like commit
+            // a second positional; a positional or commit that is not literal
             "gh pr merge 7 8",
+            "gh pr merge 7,8",
+            "gh pr merge 7=x",
             "gh pr merge 7 --match-head-commit",
             "gh pr merge 7 --match-head-commit -R",
             "gh pr merge 7 --match-head-commit=",
+            "gh pr merge 7 --match-head-commit abc123",
+            "gh pr merge 7 --match-head-commit=abc123",
+            "gh pr merge 7 --match-head-commit 0123456789abcdef0123456789abcdef012345678",
+            "gh pr merge 7 --match-head-commit ghijklm",
             "gh pr merge 7 --",
-            // through a runner: not `gh` itself
+            // not literally `gh`
             "npx gh pr merge 7",
-            // a redirect is a word that is not on the list
+            "gh.exe pr merge 7",
+            "/usr/bin/gh pr merge 7",
+            "GH pr merge 7",
+            // characters outside the literal-safe set
             "gh pr merge 7 --squash 2>&1",
+            "gh pr merge 7 --squash > out",
+            "gh pr merge 7 --squash; true",
+            "gh pr merge 7 --squash || true",
+            "gh pr merge 7 --squash | cat",
+            "gh pr merge 7 --squash &",
+            "gh pr merge 7 --squash\n",
+            "gh pr merge 7\tgh --squash",
+            "(gh pr merge 7 --squash)",
+            "gh pr merge '7' --squash",
+            "gh pr merge \"7\" --squash",
+            "gh pr merge 7 --squash # x",
+            "gh pr merge ~ --squash",
+            "gh pr merge * --squash",
+            "gh pr merge 7 --squash $X",
+            "gh pr merge $PR --squash",
+            "gh pr merge `echo 7` --squash",
+            "gh pr merge %PR% --squash",
+            // other forms of two parts
+            "echo x && gh pr merge 7",
+            "git status && gh pr merge 3 --squash",
+            "gh pr merge 3 --squash && git pull",
+            "gh pr merge 3 && gh pr merge 4",
+            "cd C:/Users/x/Projects/ergon && cd C:/Users/x/Projects/ergon && gh pr merge 3",
+            "cd C:/Users/x/Projects/ergon; gh pr merge 12 --squash",
+            "cd C:/Users/x/Projects/ergon || gh pr merge 12 --squash",
+            "cd C:/Users/x/Projects/ergon\ngh pr merge 12 --squash",
+            "cd && gh pr merge 3",
+            "cd C:/Users/x/Projects/ergon extra && gh pr merge 3",
+            "cd ergon && gh pr merge 3",
+            "cd ./ergon && gh pr merge 3",
+            "cd C:\\Users\\x\\Projects\\ergon && gh pr merge 3",
+            "cd C:/Users/x/Projects/ergon/../Koda && gh pr merge 3",
+            "cd C:/Users/x/Projects/ergon/.. && gh pr merge 3",
+            "cd ~/Projects/ergon && gh pr merge 3",
+            "cd $PWD && gh pr merge 3",
+            "cd \"C:/Users/x/Projects/ergon\" && gh pr merge 3",
+            "cd /c/Users/x/Projects/ergon && gh pr merge 3 --repo=x",
             "echo x | mail a@b.c",
             "npm publish",
         ] {
@@ -1472,15 +1555,11 @@ mod tests {
             decide_at(&p, "cd C:/Users/x/Projects/Koda && gh pr merge 12 --squash"),
             Decision::Ask
         );
-        // So does one whose folder cannot be known, or whose repository is unknown.
-        for cmd in [
-            "cd $OTHER && gh pr merge 12 --squash",
-            "cd C:/Users/x/Projects/ergon; gh pr merge 12 --squash",
-            "gh pr merge 12 --squash | cat",
-            "cd C:/Users/x/Projects && cd ergon && gh pr merge 12 --squash",
-        ] {
-            assert_eq!(decide_at(&p, cmd), Decision::Ask, "{cmd}");
-        }
+        assert_eq!(
+            decide_at(&p, "cd /c/Users/x/Projects/Koda && gh pr merge 12 --squash"),
+            Decision::Ask
+        );
+        // So does one whose repository is unknown.
         assert_eq!(
             p.decide_in(Action::Command("gh pr merge 12 --squash"), &no_branch)
                 .decision,
@@ -1495,69 +1574,67 @@ mod tests {
     }
 
     #[test]
-    fn a_merge_exception_does_not_lift_a_merge_after_anything_that_could_steer_gh() {
+    fn a_merge_exception_is_not_fooled_by_steering_the_target_in_the_same_command() {
         let p = with_merge_exception();
         assert_eq!(decide_at(&p, "gh pr merge 3"), Decision::Allow);
+        // Each of these makes `gh pr merge` act on another repository than the folder's, or
+        // hides what it does; none is a plain merge as a whole, so each asks.
         for cmd in [
-            // GH_REPO / GH_HOST: a leading assignment, export, PowerShell, cmd, any case
+            // an expansion that carries a URL
+            "PR=https://github.com/o/r/pull/7 && gh pr merge $PR --squash",
+            // the remote or git config edited by a file write
+            r#"printf '[remote "upstream"]' >> .git/config && gh pr merge 7"#,
+            "cp x .git/config && gh pr merge 7",
+            // a different `gh`
+            "hash -p /tmp/g gh && gh pr merge 7",
+            "New-Item function:gh -Value {x} && gh pr merge 7",
+            "alias gh=/tmp/g && gh pr merge 7",
+            // an untracked change of folder
+            "builtin cd C:/Users/x/Projects/Koda && gh pr merge 7",
+            "Push-Location C:/Users/x/Projects/Koda && gh pr merge 7",
+            "chdir C:/Users/x/Projects/Koda && gh pr merge 7",
+            "pushd C:/Users/x/Projects/Koda && gh pr merge 7",
+            "cd C:/Users/x/Projects/Koda && cd C:/Users/x/Projects/ergon && gh pr merge 7",
+            // GH_REPO / GH_HOST, any way of writing them
             "GH_REPO=Philipjj609/Koda gh pr merge 3",
             "gh_repo=x gh pr merge 3",
             "GH_HOST=github.example.com gh pr merge 3",
             "export GH_REPO=x && gh pr merge 3",
             "export GH_REPO=x; gh pr merge 3",
-            "export GH_HOST=h && gh pr merge 3",
             "$env:GH_REPO='x'; gh pr merge 3",
-            "$env:gh_repo = 'x'; gh pr merge 3",
-            "${env:GH_REPO}='x' && gh pr merge 3",
             "set GH_REPO=x&& gh pr merge 3",
-            "cd C:/Users/x/Projects/ergon && GH_REPO=x gh pr merge 3",
-            // the shell removes quotes and backslashes: `GH_RE""PO` is `GH_REPO`
             r#"export GH_RE""PO=X && gh pr merge 7"#,
             r"export GH_RE\PO=X && gh pr merge 7",
-            r#"export 'GH_REPO'=X && gh pr merge 7"#,
-            r#"GH_RE""PO=X gh pr merge 7"#,
-            r#"GH_RE""PO=X && gh pr merge 7"#,
             "$env:GH_RE`PO='x' && gh pr merge 7",
+            "FOO=1 gh pr merge 7",
             // the remote, the default repository, git config
             "git remote set-url origin https://github.com/Philipjj609/Koda && gh pr merge 7",
-            "git remote add up https://github.com/Philipjj609/Koda && gh pr merge 7",
-            "git -C . remote set-url origin x && gh pr merge 7",
-            r#"git rem""ote set-url origin x && gh pr merge 7"#,
             "git config remote.origin.url x && gh pr merge 7",
             "git -c url.x.insteadOf=y fetch && gh pr merge 7",
             "gh repo set-default Philipjj609/Koda && gh pr merge 7",
-            "gh repo set-default && gh pr merge 7",
-            "gh -R x repo set-default && gh pr merge 7",
             "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=url.https://github.com/Philipjj609/Koda.insteadOf GIT_CONFIG_VALUE_0=https://github.com/Philipjj609/ergon gh pr merge 7",
-            "GIT_CONFIG_GLOBAL=/x/gitconfig && gh pr merge 7",
-            // programs that set variables or run text
-            "env GH_REPO=x && gh pr merge 7",
-            "setx GH_REPO x && gh pr merge 7",
-            "declare -x FOO=1 && gh pr merge 7",
-            "typeset -x FOO=1 && gh pr merge 7",
-            "set -e && gh pr merge 7",
-            "Set-Item env:FOO 1 && gh pr merge 7",
-            "Set-Variable FOO 1 && gh pr merge 7",
+            // text run as shell
             "eval \"$X\" && gh pr merge 7",
             "source ./env.sh && gh pr merge 7",
-            // any leading assignment
-            "FOO=1 gh pr merge 7",
+            "git fetch origin && gh pr merge 3 --squash",
+            "gh pr checks 3 && gh pr merge 3 --squash",
         ] {
             assert_eq!(decide_at(&p, cmd), Decision::Ask, "{cmd}");
         }
-        // GH_REPO / GH_HOST set in the environment the command inherits.
+        // GH_REPO / GH_HOST in what the process inherited, or an init file that cannot be
+        // judged.
         assert_eq!(
             decide_with_gh_env(&p, "gh pr merge 3 --squash"),
             Decision::Ask
         );
-        // Unrelated commands before the merge do not matter.
-        for cmd in [
-            "git fetch origin && gh pr merge 3 --squash",
-            "gh pr checks 3 && gh pr merge 3 --squash",
-            "gh pr view 3 --json state && gh pr merge 3",
-        ] {
-            assert_eq!(decide_at(&p, cmd), Decision::Allow, "{cmd}");
-        }
+        assert_eq!(
+            decide_with_init_unsafe(&p, "gh pr merge 3 --squash"),
+            Decision::Ask
+        );
+        assert_eq!(
+            decide_with_init_unsafe(&p, "cd C:/Users/x/Projects/ergon && gh pr merge 3"),
+            Decision::Ask
+        );
     }
 
     #[test]

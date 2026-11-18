@@ -516,38 +516,110 @@ const MERGE_EXCEPTION: &str = r#"{"efforts":{"lookup":{"usd":1.0,"minutes":15}},
     "exceptions":[{"class":"merge","repo":"*/repo","reason":"my own repository"}]}"#;
 
 #[test]
-fn a_merge_exception_only_lifts_the_plain_merge_allow_list_end_to_end() {
+fn a_merge_exception_only_lifts_a_whole_command_that_is_a_plain_merge_end_to_end() {
     let (e, cwd) = merge_exception_env("merge-allow-list", MERGE_EXCEPTION);
     let run = |cmd: &str| e.hook_raw(&event("s", &e.transcript, &cwd, "Bash", &command(cmd)), &[]);
+    // The folders as `cd` takes them: absolute, forward slashes, plain characters.
+    let slash = |p: &str| p.replace('\\', "/");
+    let repo = slash(&cwd);
+    let other = slash(&cwd.replace("repo", "other"));
+    let other_cwd = cwd.replace("repo", "other");
+    fs::create_dir_all(Path::new(&other_cwd).join(".git")).unwrap();
+    fs::write(
+        Path::new(&other_cwd).join(".git").join("HEAD"),
+        "ref: refs/heads/feature\n",
+    )
+    .unwrap();
+    assert!(
+        repo.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._/-:+".contains(c)),
+        "the test folder must be literal-safe: {repo}"
+    );
     for cmd in [
-        "gh pr merge 12 --squash",
-        "gh pr merge 12 --squash --delete-branch --match-head-commit abc123",
-        "gh pr merge 12 --rebase",
-        "gh pr merge 12 --merge",
-        "gh pr merge 12 -s",
-        "gh pr merge 3 --squash && git pull",
+        "gh pr merge 12 --squash".to_owned(),
+        "gh pr merge 12 --squash --delete-branch --match-head-commit abc1234".to_owned(),
+        "gh pr merge 12 --rebase".to_owned(),
+        "gh pr merge feat/x --merge".to_owned(),
+        "gh pr merge 12 -s".to_owned(),
+        format!("cd {repo} && gh pr merge 3 --squash --match-head-commit 0123456789abcdef0123456789abcdef01234567"),
     ] {
-        assert_eq!(run(cmd), "", "{cmd}");
+        assert_eq!(run(&cmd), "", "{cmd}");
     }
     for cmd in [
-        "gh pr merge 7 -sR Philipjj609/Koda",
-        "gh pr merge 7 -dR Philipjj609/Koda",
-        "gh pr merge 7 -sdRPhilipjj609/Koda",
-        "gh pr merge 7 -sd",
-        "gh -R Philipjj609/Koda pr merge 7",
-        "gh --repo Philipjj609/Koda pr merge 7",
-        "gh --repo=Philipjj609/Koda pr merge 7",
-        "gh pr merge 7 --auto",
-        "gh pr merge 7 --admin",
-        r#"export GH_RE""PO=X && gh pr merge 7"#,
-        r"export GH_RE\PO=X && gh pr merge 7",
-        "git remote set-url origin https://github.com/Philipjj609/Koda && gh pr merge 7",
-        "gh repo set-default Philipjj609/Koda && gh pr merge 7",
-        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=url.https://github.com/Philipjj609/Koda.insteadOf GIT_CONFIG_VALUE_0=https://github.com/Philipjj609/repo gh pr merge 7",
+        format!("cd {other} && gh pr merge 3"),
+        "gh pr merge 7 -sR Philipjj609/Koda".to_owned(),
+        "gh pr merge 7 -dR Philipjj609/Koda".to_owned(),
+        "gh pr merge 7 -sdRPhilipjj609/Koda".to_owned(),
+        "gh pr merge 7 -sd".to_owned(),
+        "gh -R Philipjj609/Koda pr merge 7".to_owned(),
+        "gh --repo Philipjj609/Koda pr merge 7".to_owned(),
+        "gh --repo=Philipjj609/Koda pr merge 7".to_owned(),
+        "gh pr merge 7 --auto".to_owned(),
+        "gh pr merge 7 --admin".to_owned(),
+        "gh pr merge 7 --match-head-commit abc123".to_owned(),
+        "gh pr merge 3 --squash && git pull".to_owned(),
+        // one-command bypasses
+        "PR=https://github.com/o/r/pull/7 && gh pr merge $PR --squash".to_owned(),
+        r#"printf '[remote "upstream"]' >> .git/config && gh pr merge 7"#.to_owned(),
+        "cp x .git/config && gh pr merge 7".to_owned(),
+        "hash -p /tmp/g gh && gh pr merge 7".to_owned(),
+        "New-Item function:gh -Value {x} && gh pr merge 7".to_owned(),
+        format!("builtin cd {other} && gh pr merge 7"),
+        format!("Push-Location {other} && gh pr merge 7"),
+        format!("chdir {other} && gh pr merge 7"),
+        format!("cd {other} && cd {repo} && gh pr merge 7"),
+        r#"export GH_RE""PO=X && gh pr merge 7"#.to_owned(),
+        r"export GH_RE\PO=X && gh pr merge 7".to_owned(),
+        "git remote set-url origin https://github.com/Philipjj609/Koda && gh pr merge 7".to_owned(),
+        "gh repo set-default Philipjj609/Koda && gh pr merge 7".to_owned(),
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=url.https://github.com/Philipjj609/Koda.insteadOf GIT_CONFIG_VALUE_0=https://github.com/Philipjj609/repo gh pr merge 7".to_owned(),
     ] {
-        let out = run(cmd);
+        let out = run(&cmd);
         assert!(is_ask(&out), "{cmd}: {out}");
     }
+}
+
+#[test]
+fn a_session_env_file_that_sets_gh_repo_or_runs_text_stops_the_merge_exception() {
+    let (e, cwd) = merge_exception_env("merge-session-env", MERGE_EXCEPTION);
+    let ev = event(
+        "s",
+        &e.transcript,
+        &cwd,
+        "Bash",
+        &command("gh pr merge 7 --squash"),
+    );
+    // Where Claude Code keeps a session's env files: <config dir>/session-env/<session id>/.
+    let dir = e.claude_dir().join("session-env").join("s");
+    assert_eq!(e.hook_raw(&ev, &[]), "", "no folder: nothing to read");
+    fs::create_dir_all(&dir).unwrap();
+    let with = |name: &str, content: &str| {
+        let file = dir.join(name);
+        fs::write(&file, content).unwrap();
+        let out = e.hook_raw(&ev, &[]);
+        fs::remove_file(file).unwrap();
+        out
+    };
+    assert_eq!(with("hook-0.sh", "export FOO=1\n"), "", "a harmless file");
+    for text in [
+        "export GH_REPO=x\n",
+        "export gh_host=h\n",
+        "export GH_RE\"\"PO=x\n",
+        "export GH_RE\\PO=x\n",
+        "eval \"$(foo)\"\n",
+        "source ./x.sh\n",
+        ". ./x.sh\n",
+        "export A=${B}\n",
+    ] {
+        let out = with("hook-1.sh", text);
+        assert!(is_ask(&out), "{text}: {out}");
+    }
+    // A file of another kind is not read; another session's folder is not either.
+    assert_eq!(with("notes.txt", "export GH_REPO=x\n"), "");
+    let other = e.claude_dir().join("session-env").join("t");
+    fs::create_dir_all(&other).unwrap();
+    fs::write(other.join("hook-1.sh"), "export GH_REPO=x\n").unwrap();
+    assert_eq!(e.hook_raw(&ev, &[]), "");
 }
 
 #[test]
