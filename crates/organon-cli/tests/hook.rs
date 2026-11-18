@@ -598,8 +598,43 @@ fn a_merge_exception_only_lifts_a_whole_command_that_is_a_plain_merge_end_to_end
     }
 }
 
+/// Env files that are only blank lines, comments and plain assignments: the real ones Claude
+/// Code's Vercel plugin writes, an empty file and one with CRLF line ends.
+const SAFE_ENV_FILES: [&str; 5] = [
+    "",
+    "export VERCEL_PLUGIN_BOOTSTRAP_HINTS=\"greenfield\"\nexport VERCEL_PLUGIN_SETUP_MODE=\"1\"\n",
+    "export VERCEL_PLUGIN_SETUP_MODE=\"1\"\r\nFOO=bar\r\n",
+    "\n# a note\n\nexport FOO=1\n",
+    "A=b\nexport C='d e'\n",
+];
+
+/// Env files that can steer `gh` to another repository (or cannot be shown not to).
+const UNSAFE_ENV_FILES: [&str; 20] = [
+    // a name split by a line continuation
+    "export GH_\\\nREPO=Philipjj609/Koda\n",
+    "export GH_\\\nHOST=h\n",
+    "export GH_REPO=x\n",
+    "export gh_host=h\n",
+    "export GH_RE\"\"PO=x\n",
+    "export GIT_DIR=C:/x/other/.git\n",
+    "export GIT_CONFIG_COUNT=1\n",
+    "export PATH=/tmp/evil:/usr/bin\n",
+    "export HOME=/x\n",
+    "export BASH_ENV=/x\n",
+    "gh() { command gh -R o/other pr merge 7 --squash; }\n",
+    "alias gh=x\n",
+    "export A=1; export GH_REPO=x\n",
+    "export A=\"x\" B=y\n",
+    "export A=$B\n",
+    "export A=`date`\n",
+    "X=H_REPO\nexport G$X=o/other\n",
+    "eval \"$(foo)\"\n",
+    "source ./x.sh\n",
+    ". ./x.sh\n",
+];
+
 #[test]
-fn a_session_env_file_that_sets_gh_repo_or_runs_text_stops_the_merge_exception() {
+fn a_session_env_file_that_is_not_plain_assignments_stops_the_merge_exception() {
     let (e, cwd) = merge_exception_env("merge-session-env", MERGE_EXCEPTION);
     let ev = event(
         "s",
@@ -619,23 +654,12 @@ fn a_session_env_file_that_sets_gh_repo_or_runs_text_stops_the_merge_exception()
         fs::remove_file(file).unwrap();
         out
     };
-    assert_eq!(with("hook-0.sh", "export FOO=1\n"), "", "a harmless file");
-    for text in [
-        "export GH_REPO=x\n",
-        "export gh_host=h\n",
-        "export GH_RE\"\"PO=x\n",
-        "export GH_RE\\PO=x\n",
-        "eval \"$(foo)\"\n",
-        "source ./x.sh\n",
-        ". ./x.sh\n",
-        "export A=${B}\n",
-        // a name built from a variable: no `gh_repo` appears in the text
-        "X=H_REPO\nexport G$X=o/other\n",
-        "export A=$B\n",
-        "export A=`date`\n",
-    ] {
+    for text in SAFE_ENV_FILES {
+        assert_eq!(with("hook-0.sh", text), "", "{text:?}");
+    }
+    for text in UNSAFE_ENV_FILES {
         let out = with("hook-1.sh", text);
-        assert!(is_ask(&out), "{text}: {out}");
+        assert!(is_ask(&out), "{text:?}: {out}");
     }
     // A file of another kind is not read; another session's folder is not either.
     assert_eq!(with("notes.txt", "export GH_REPO=x\n"), "");
@@ -646,7 +670,7 @@ fn a_session_env_file_that_sets_gh_repo_or_runs_text_stops_the_merge_exception()
 }
 
 #[test]
-fn a_claude_env_file_that_sets_gh_repo_stops_the_merge_exception() {
+fn a_claude_env_file_that_is_not_plain_assignments_stops_the_merge_exception() {
     let (e, cwd) = merge_exception_env("merge-env-file", MERGE_EXCEPTION);
     let dir = e.home.parent().unwrap().to_owned();
     let ev = event(
@@ -661,17 +685,14 @@ fn a_claude_env_file_that_sets_gh_repo_stops_the_merge_exception() {
         fs::write(&file, content).unwrap();
         e.hook_raw(&ev, &[("CLAUDE_ENV_FILE", &file.to_string_lossy())])
     };
-    let out = with("export GH_REPO=x\n", "env-repo.sh");
-    assert!(is_ask(&out), "{out}");
-    let out = with("export gh_host=h\n", "env-host.sh");
-    assert!(is_ask(&out), "{out}");
-    // A `$` or a backtick can build the name, so any file with one asks.
-    let out = with("X=H_REPO\nexport G$X=o/other\n", "env-built.sh");
-    assert!(is_ask(&out), "{out}");
-    let out = with("export A=`date`\n", "env-tick.sh");
-    assert!(is_ask(&out), "{out}");
-    // A file that names neither lets the merge through.
-    assert_eq!(with("export FOO=1\n", "env-foo.sh"), "");
+    for text in UNSAFE_ENV_FILES {
+        let out = with(text, "env-unsafe.sh");
+        assert!(is_ask(&out), "{text:?}: {out}");
+    }
+    // A file made only of comments and plain assignments lets the merge through.
+    for text in SAFE_ENV_FILES {
+        assert_eq!(with(text, "env-safe.sh"), "", "{text:?}");
+    }
     // So does a file that does not exist (nothing was set), or no file at all.
     let missing = dir.join("no-such-file.sh");
     assert_eq!(

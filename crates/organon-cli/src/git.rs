@@ -157,9 +157,11 @@ fn inherited_in(
     {
         match read(path) {
             Ok(bytes) => {
-                let (gh, unsafe_) = judge_shell_file(&String::from_utf8_lossy(&bytes));
-                out.gh_target |= gh;
-                out.init_unsafe |= unsafe_;
+                // Anything not provably harmless may steer `gh`: nothing is lifted.
+                if judge_shell_file(&String::from_utf8_lossy(&bytes)) {
+                    out.gh_target = true;
+                    out.init_unsafe = true;
+                }
             }
             Err(e) if missing_is_fine && e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => {
@@ -172,29 +174,78 @@ fn inherited_in(
     out
 }
 
-/// What a file the shell sources says, read after deleting quotes, backslash, backtick and
-/// caret (which the shell removes, so `GH_RE""PO` is `GH_REPO`) and lower-casing it: whether it
-/// names `GH_REPO` or `GH_HOST`, and whether it does something its text cannot show
-/// (`eval`, `source`, `.` sourcing) or has a `$` or a backtick anywhere, which can build a name
-/// the text does not show.
-fn judge_shell_file(text: &str) -> (bool, bool) {
-    let t: String = text
-        .chars()
-        .filter(|c| !matches!(c, '\'' | '"' | '\\' | '`' | '^'))
-        .flat_map(char::to_lowercase)
-        .collect();
-    let gh = t.contains("gh_repo") || t.contains("gh_host");
-    let cs: Vec<char> = t.chars().collect();
-    let dot_command = cs.iter().enumerate().any(|(i, &c)| {
-        c == '.'
-            && cs.get(i + 1).is_some_and(|n| n.is_whitespace())
-            && (i == 0 || cs[i - 1].is_whitespace() || ";&|(".contains(cs[i - 1]))
-    });
-    // Any `$` or backtick in the raw text may build a name the text does not show
-    // (`X=H_REPO` then `export G$X=o/other`): restrict, do not enumerate.
-    let expands = text.contains('$') || text.contains('`');
-    let unsafe_ = expands || ["eval", "source"].iter().any(|w| t.contains(w)) || dot_command;
-    (gh, unsafe_)
+/// Whether a file the shell sources before each command is NOT provably harmless.
+///
+/// This is an allow-list over the raw text, not a search for bad words: a shell has more ways
+/// to steer `gh` (a split name, a variable, a function, an alias, `PATH`, `GIT_DIR`, git config)
+/// than any list of them can hold, so a file is safe only if every line is one of these and
+/// anything else, anywhere, makes the whole file unsafe:
+/// - the line (minus one trailing `\r`) is blank, or a comment (spaces, `#`, any text);
+/// - or it is `NAME=VALUE` or `export NAME=VALUE` and nothing else, where `NAME` is
+///   `[A-Za-z_][A-Za-z0-9_]*` and is not, in any case, one that starts with `GH_`, `GIT_` or
+///   `XDG_` or is one of `PATH`, `HOME`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `BASH_ENV`,
+///   `ENV`, `PROMPT_COMMAND`, `SHELLOPTS`, `BASHOPTS`, `IFS`, `PS4`, `CDPATH`;
+/// - and `VALUE` is plain (`[A-Za-z0-9_./:@,+=-]*`), or one pair of double quotes, or one pair
+///   of single quotes, around those characters and spaces: no `$`, backtick, `;`, `&`, `|`, `(`,
+///   `{`, `<` or `>`;
+/// - and the file has no backslash and no control character other than the line ends.
+///
+/// An empty file is safe.
+fn judge_shell_file(text: &str) -> bool {
+    const PLAIN: &str = "_./:@,+=-";
+    const BARRED: [&str; 13] = [
+        "path",
+        "home",
+        "userprofile",
+        "appdata",
+        "localappdata",
+        "bash_env",
+        "env",
+        "prompt_command",
+        "shellopts",
+        "bashopts",
+        "ifs",
+        "ps4",
+        "cdpath",
+    ];
+    let plain = |c: char| c.is_ascii_alphanumeric() || PLAIN.contains(c);
+    let value_ok = |v: &str| {
+        if let Some(q) = v.chars().next().filter(|c| matches!(c, '"' | '\'')) {
+            v.len() >= 2
+                && v.ends_with(q)
+                && v[1..v.len() - 1].chars().all(|c| plain(c) || c == ' ')
+        } else {
+            v.chars().all(plain)
+        }
+    };
+    let name_ok = |n: &str| {
+        let lower = n.to_ascii_lowercase();
+        let mut cs = n.chars();
+        cs.next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !["gh_", "git_", "xdg_"].iter().any(|p| lower.starts_with(p))
+            && !BARRED.contains(&lower.as_str())
+    };
+    if text.contains('\\') {
+        return true;
+    }
+    let line_ok = |line: &str| {
+        if line.chars().any(char::is_control) {
+            return false;
+        }
+        if line.trim_start_matches(' ').is_empty() || line.trim_start_matches(' ').starts_with('#')
+        {
+            return true;
+        }
+        let assignment = line.strip_prefix("export ").unwrap_or(line);
+        assignment
+            .split_once('=')
+            .is_some_and(|(n, v)| name_ok(n) && value_ok(v))
+    };
+    !text
+        .split('\n')
+        .all(|line| line_ok(line.strip_suffix('\r').unwrap_or(line)))
 }
 
 #[cfg(test)]
@@ -250,58 +301,111 @@ mod tests {
         for v in ["GH_REPO", "GH_HOST"] {
             assert!(run(Some("s"), &[(v, "x")], &[]).gh_target, "{v}");
         }
-        // The file CLAUDE_ENV_FILE names.
-        let e = [("CLAUDE_ENV_FILE", "/tmp/env.sh")];
-        let r = run(Some("s"), &e, &[("/tmp/env.sh", "export PATH=/x\n")]);
-        assert_eq!(r, clean);
-        let r = run(Some("s"), &e, &[("/tmp/env.sh", "export Gh_Repo=x/y\n")]);
-        assert!(r.gh_target);
-        let r = run(Some("s"), &e, &[("/tmp/env.sh", "export GH_RE\"\"PO=x\n")]);
-        assert!(r.gh_target, "quotes are removed before reading");
-        let r = run(Some("s"), &e, &[("/tmp/env.sh", "export GH_RE\\PO=x\n")]);
-        assert!(r.gh_target, "backslash too");
-        assert_eq!(run(Some("s"), &e, &[]), clean, "not created yet");
-        for text in [
-            "X=H_REPO\nexport G$X=o/other\n",
-            "export A=`date`\n",
+        // What makes a file unsafe, and what does not: the same text in the file CLAUDE_ENV_FILE
+        // names and in a session-env `*.sh`.
+        let harmless = [
+            "",
+            "\n\n",
+            "export VERCEL_PLUGIN_BOOTSTRAP_HINTS=\"greenfield\"\nexport VERCEL_PLUGIN_SETUP_MODE=\"1\"\n",
+            "export VERCEL_PLUGIN_SETUP_MODE=\"1\"\r\nFOO=bar\r\n",
+            "# a note: gh_repo $x `y` (z); a.\n   # indented\n\nA=1.5\nexport B=x/y:z@w,v+u=t-s\nC=\nD='a b'\nE=\"a b\"\n",
+            "export A=1",
+            "export PATHX=1\nexport GHX=1\nexport GITX=1\nexport MYHOME=1\n",
+        ];
+        let unsafe_files = [
+            // a name split across lines, and the rest of the steering
+            "export GH_\\\nREPO=Philipjj609/Koda\n",
+            "export GH_\\\nHOST=h\n",
+            "export GH_\\\r\nREPO=x\r\n",
+            "export GH_REPO=x\n",
+            "export Gh_Repo=x/y\n",
+            "export gh_host=h\n",
+            "export GH_RE\"\"PO=x\n",
+            "export GH_RE\\PO=x\n",
+            "export GIT_DIR=C:/x/other/.git\n",
+            "export GIT_CONFIG_COUNT=1\n",
+            "export XDG_CONFIG_HOME=/x\n",
+            "export PATH=/tmp/evil:/usr/bin\n",
+            "PATH=/x\n",
+            "export path=/x\n",
+            "export HOME=/x\n",
+            "export USERPROFILE=/x\n",
+            "export APPDATA=/x\n",
+            "export LOCALAPPDATA=/x\n",
+            "export BASH_ENV=/x\n",
+            "export ENV=/x\n",
+            "export PROMPT_COMMAND=x\n",
+            "export SHELLOPTS=x\n",
+            "export BASHOPTS=x\n",
+            "export IFS=x\n",
+            "export PS4=x\n",
+            "export CDPATH=x\n",
+            "gh() { command gh -R o/other pr merge 7 --squash; }\n",
+            "alias gh=x\n",
+            "export A=1; export GH_REPO=x\n",
+            "export A=\"x\" B=y\n",
+            "export A=x B=y\n",
+            "export A=1.5 B=x. y\n",
             "export A=$B\n",
-        ] {
-            let r = run(Some("s"), &e, &[("/tmp/env.sh", text)]);
-            assert!(
-                r.init_unsafe,
-                "a $ or a backtick in CLAUDE_ENV_FILE: {text}"
+            "export A=${B}\n",
+            "export A=$(date)\n",
+            "export A=`date`\n",
+            "export A='$B'\n",
+            "export A=\"$B\"\n",
+            "X=H_REPO\nexport G$X=o/other\n",
+            "eval \"$X\"\n",
+            "source ./x.sh\n",
+            ". ./x.sh\n",
+            "export A=1 && echo\n",
+            "export A=1|x\n",
+            "export A=(x)\n",
+            "export A={x}\n",
+            "export A=<x\n",
+            "export A=>x\n",
+            "export A=1 # trailing\n",
+            "export A=\"x\"y\n",
+            "export A=\"x\n",
+            "export A=\"\n",
+            "export A=\"a\"b\"\n",
+            "export A\n",
+            "export =1\n",
+            "export 1A=1\n",
+            "export  A=1\n",
+            " export A=1\n",
+            " A=1\n",
+            "A =1\n",
+            "export A=1 \n",
+            "# comment with a backslash \\\n",
+            "export A=1\r\r\n",
+            "export A=1\rexport B=2\n",
+            "export A=1\t\n",
+            "# tab\tin a comment\n",
+            "export A=\u{0}\n",
+            "export A=\u{1b}[0m\n",
+        ];
+        let e = [("CLAUDE_ENV_FILE", "/tmp/env.sh")];
+        let sh = |text: &'static str| [("/cfg/session-env/s/hook-1.sh", text)];
+        for text in harmless {
+            assert_eq!(
+                run(Some("s"), &e, &[("/tmp/env.sh", text)]),
+                clean,
+                "{text:?}"
             );
+            assert_eq!(run(Some("s"), &[], &sh(text)), clean, "{text:?}");
         }
+        for text in unsafe_files {
+            let r = run(Some("s"), &e, &[("/tmp/env.sh", text)]);
+            assert!(r.gh_target && r.init_unsafe, "CLAUDE_ENV_FILE: {text:?}");
+            let r = run(Some("s"), &[], &sh(text));
+            assert!(r.gh_target && r.init_unsafe, "session-env: {text:?}");
+        }
+        assert_eq!(run(Some("s"), &e, &[]), clean, "not created yet");
         let r = run(Some("s"), &e, &[("/tmp/env.sh", "DENIED")]);
         assert!(r.gh_target && r.init_unsafe, "unreadable: nothing lifted");
         assert_eq!(
             run(Some("s"), &[("CLAUDE_ENV_FILE", "")], &[("", "DENIED")]),
             clean
         );
-        // The files in the session's folder.
-        let sh = |text: &'static str| [("/cfg/session-env/s/hook-1.sh", text)];
-        assert_eq!(run(Some("s"), &[], &sh("export PATH=/x\n")), clean);
-        assert!(run(Some("s"), &[], &sh("export GH_REPO=x\n")).gh_target);
-        assert!(run(Some("s"), &[], &sh("export GH_RE\"\"PO=x\n")).gh_target);
-        assert!(run(Some("s"), &[], &sh("export GH_HOST=h\n")).gh_target);
-        for text in [
-            "eval \"$X\"\n",
-            "ev\"\"al x\n",
-            "source ./x.sh\n",
-            "export A=${B}\n",
-            "export A=$(date)\n",
-            ". ./x.sh\n",
-            "export A=1; . ./x.sh\n",
-            "X=H_REPO\nexport G$X=o/other\n",
-            "export A=$B\n",
-            "export A=`date`\n",
-            "export A='$B'\n",
-        ] {
-            assert!(run(Some("s"), &[], &sh(text)).init_unsafe, "{text}");
-        }
-        for text in ["export A=1.5 B=x. y\n", "# a. note\n"] {
-            assert_eq!(run(Some("s"), &[], &sh(text)), clean, "{text}");
-        }
         // Another session's files are not read; an unreadable one, or a session id that cannot
         // name a folder, lifts nothing.
         let other = [("/cfg/session-env/other/hook-1.sh", "export GH_REPO=x\n")];

@@ -124,11 +124,12 @@ const MERGE_CLASS: &str = "merge";
 /// environment and no file.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Inherited {
-    /// `GH_REPO` or `GH_HOST` is set in the environment, or in a file the shell sources before
-    /// each command. Either points `gh` at another repository or host than its folder's.
+    /// `GH_REPO` or `GH_HOST` is set in the environment, or a file the shell sources before
+    /// each command is not provably harmless (it may set them, or anything else that points
+    /// `gh` at another repository or host than its folder's).
     pub gh_target: bool,
-    /// A file the shell sources before each command cannot be read, or does something that
-    /// cannot be judged from its text (`eval`, `source`, `${`, `$(`, `. file`).
+    /// A file the shell sources before each command cannot be read, or is not provably
+    /// harmless: not only blank lines, comments and plain `NAME=value` assignments.
     pub init_unsafe: bool,
 }
 
