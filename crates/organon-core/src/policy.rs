@@ -479,7 +479,12 @@ pub fn folders_are_certain(cmd: &str, segs: &[Vec<String>]) -> bool {
         return false;
     }
     // A path the shell would expand (variables, home, globs) cannot be read from the text.
-    let literal = |w: &String| !w.contains(['$', '%', '~', '*', '?', '{', '[']);
+    // `..` is resolved by the shell logically (through the link it came by) but by the
+    // repository lookup physically, so a path with `..` cannot be judged either.
+    let literal = |w: &String| {
+        !w.contains(['$', '%', '~', '*', '?', '{', '['])
+            && !w.split(['/', '\\']).any(|part| part == "..")
+    };
     segs.iter()
         .all(|seg| match seg.first().map(String::as_str) {
             Some("pushd" | "popd") => false,
@@ -798,6 +803,10 @@ mod tests {
             "cd $OTHER && git push origin main",
             "cd ~/other && git push origin main",
             "git -C %OTHER% push origin main",
+            // `..` after a link: the shell goes back the way it came, the lookup does not.
+            "cd /unapproved/link/.. && git push origin main",
+            "git -C ../mneme-memory push origin main",
+            r"cd C:\x\link\..\y && git push origin main",
         ] {
             assert_eq!(decide_from_mm(&p, cmd), Decision::Ask, "{cmd}");
         }
