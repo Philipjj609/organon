@@ -269,8 +269,10 @@ impl Policy {
     }
 }
 
-/// Split a shell command into simple commands (at `&&`, `||`, `;`, `|`, newlines, outside
-/// quotes) and each into words. Leading `VAR=value` words are dropped and the program is
+/// Split a shell command into simple commands (at `&&`, `||`, `;`, `|`, a lone `&`, newlines,
+/// outside quotes) and each into words. A lone `&` ends a command in bash (background), cmd
+/// and PowerShell alike; the redirections `2>&1`, `>&2`, `>&-`, `&>f` and `&>>f` do not. A
+/// leading call operator (`& "C:/x/tool.exe"`) leaves an empty part, which is dropped. Leading `VAR=value` words are dropped and the program is
 /// reduced to its file name (`/usr/bin/git`, `git.exe` → `git`).
 #[must_use]
 pub fn segments(cmd: &str) -> Vec<Vec<String>> {
@@ -279,6 +281,7 @@ pub fn segments(cmd: &str) -> Vec<Vec<String>> {
     let mut word = String::new();
     let mut quote: Option<char> = None;
     let mut chars = cmd.chars().peekable();
+    let mut prev = ' ';
     let push_word = |word: &mut String, words: &mut Vec<String>| {
         if !word.is_empty() {
             words.push(std::mem::take(word));
@@ -297,6 +300,7 @@ pub fn segments(cmd: &str) -> Vec<Vec<String>> {
         }
     };
     while let Some(c) = chars.next() {
+        let before = std::mem::replace(&mut prev, c);
         match (quote, c) {
             (Some(q), c) if c == q => quote = None,
             (Some(_), c) => word.push(c),
@@ -311,8 +315,10 @@ pub fn segments(cmd: &str) -> Vec<Vec<String>> {
             (None, '&' | '|') => {
                 if chars.peek() == Some(&c) {
                     chars.next();
-                } else if c == '&' {
-                    // `2>&1`, `&>` and background `&` stay inside the command.
+                } else if c == '|' && chars.peek() == Some(&'&') {
+                    chars.next(); // `|&` is a pipe
+                } else if c == '&' && (before == '>' || chars.peek() == Some(&'>')) {
+                    // `2>&1`, `>&2`, `>&-`, `&>f` and `&>>f` stay inside the command.
                     word.push(c);
                     continue;
                 }
@@ -870,6 +876,72 @@ mod tests {
         assert_eq!(s.len(), 4, "{s:?}");
         assert_eq!(s[1], ["git", "commit", "-m", "a && b"]);
         assert_eq!(s[3], ["echo", "hi", ">>", "f", "2", ">", "&1"]);
+    }
+
+    #[test]
+    fn a_lone_ampersand_ends_a_command() {
+        assert_eq!(
+            segments("echo x & git push origin main"),
+            [vec!["echo", "x"], vec!["git", "push", "origin", "main"]]
+        );
+        assert_eq!(
+            segments("echo x &git push"),
+            [vec!["echo", "x"], vec!["git", "push"]]
+        );
+        // The PowerShell call operator leaves an empty part, which is dropped.
+        assert_eq!(
+            segments(r#"& "C:/x/Tool.exe" a b"#),
+            [vec!["tool", "a", "b"]]
+        );
+        assert_eq!(segments("a &; b"), [vec!["a"], vec!["b"]]);
+        assert_eq!(segments("a |& b"), [vec!["a"], vec!["b"]]);
+        assert_eq!(segments("a && b"), [vec!["a"], vec!["b"]]);
+        // Not separators: redirections, and `&` in quotes or after a backslash.
+        assert_eq!(segments("ls >&2"), [vec!["ls", ">", "&2"]]);
+        assert_eq!(segments("ls >&-"), [vec!["ls", ">", "&-"]]);
+        assert_eq!(segments("ls &>out.txt"), [vec!["ls", "&", ">", "out.txt"]]);
+        assert_eq!(
+            segments("ls &>>out.txt"),
+            [vec!["ls", "&", ">>", "out.txt"]]
+        );
+        assert_eq!(segments(r#"echo "a & b""#), [vec!["echo", "a & b"]]);
+        assert_eq!(segments("echo 'a & b'"), [vec!["echo", "a & b"]]);
+        assert_eq!(segments(r"echo a\&b"), [vec!["echo", "a&b"]]);
+    }
+
+    #[test]
+    fn a_command_after_a_lone_ampersand_is_still_judged() {
+        for cmd in [
+            "echo x & git push origin main",
+            "echo x &git push origin main",
+            "true & git push --force",
+            "& git push origin main",
+            "echo x & gh pr merge 1",
+            "echo x & rm -rf build",
+            "echo x & git push origin main & echo y",
+        ] {
+            assert_eq!(decide(cmd), Decision::Ask, "{cmd}");
+        }
+        assert_eq!(decide("echo x & gh repo delete a/b"), Decision::Deny);
+    }
+
+    #[test]
+    fn redirections_and_quotes_with_an_ampersand_keep_their_decision() {
+        for cmd in [
+            "cargo build 2>&1",
+            "ls >&2",
+            "ls >&-",
+            "ls &>out.txt",
+            "ls &>>out.txt",
+            r#"echo "a & b""#,
+            "echo 'a & b'",
+            "cmd1 && cmd2",
+            "cargo test 2>&1 | tail -3",
+        ] {
+            assert_eq!(decide(cmd), Decision::Allow, "{cmd}");
+        }
+        assert_eq!(decide("git push --force 2>&1"), Decision::Ask);
+        assert_eq!(decide("git push --force &>out.txt"), Decision::Ask);
     }
 
     #[test]
