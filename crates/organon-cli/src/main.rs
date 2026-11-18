@@ -581,7 +581,8 @@ fn check(home: &Home, write: Option<&str>, command: &str) -> Result<ExitCode> {
         None => bail!("give a command after -- or --write <path>"),
     };
     let branch_of = |hint: Option<&str>| git::branch_in(&git::folder("", hint));
-    let v = policy.decide_in(action, &branch_of);
+    let repo_of = |hint: Option<&str>| git::repo_root(&git::folder("", hint));
+    let v = policy.decide_at(action, &branch_of, &repo_of);
     let d = format!("{:?}", v.decision).to_lowercase();
     match v.reason {
         Some(r) => println!("{d}: {r}"),
@@ -854,7 +855,8 @@ fn hook(home: &Home, ev: &HookEvent) -> Result<Option<String>> {
     let action = ev.action();
     let (policy, _) = home.policy()?;
     let branch_of = |hint: Option<&str>| git::branch_in(&git::folder(&ev.cwd, hint));
-    let mut verdict = policy.decide_in(action, &branch_of);
+    let repo_of = |hint: Option<&str>| git::repo_root(&git::folder(&ev.cwd, hint));
+    let mut verdict = policy.decide_at(action, &branch_of, &repo_of);
     let mut context: Option<String> = None;
     let active = home.active_task_in(&ev.transcript);
 

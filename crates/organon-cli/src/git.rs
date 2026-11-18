@@ -15,6 +15,28 @@ pub fn branch_in(dir: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The root folder of the repository (or worktree) `dir` is in, with forward slashes.
+/// Used to apply the policy's exceptions.
+pub fn repo_root(dir: &Path) -> Option<String> {
+    // The physical folder: through symlinks and junctions, so a link into another
+    // repository is judged by where it leads. A folder that does not exist, or cannot be
+    // resolved, names no repository (never the one above it).
+    let real = fs::canonicalize(dir).ok().filter(|d| d.is_dir())?;
+    real.ancestors()
+        .find(|a| a.join(".git").exists())
+        .map(|a| plain_path(&a.to_string_lossy()))
+}
+
+/// A path without Windows' verbatim prefix (`\\?\C:\x` → `C:/x`), with forward slashes.
+fn plain_path(p: &str) -> String {
+    let p = if let Some(unc) = p.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        p.strip_prefix(r"\\?\").unwrap_or(p).to_owned()
+    };
+    p.replace('\\', "/")
+}
+
 fn git_dir(dir: &Path) -> Option<PathBuf> {
     for a in dir.ancestors() {
         let dot = a.join(".git");
@@ -39,14 +61,82 @@ pub fn folder(cwd: &str, hint: Option<&str>) -> PathBuf {
         PathBuf::from(cwd)
     };
     match hint {
-        Some(h) => base.join(h),
+        Some(h) => base.join(drive_path(h)),
         None => base,
+    }
+}
+
+/// A Git Bash path (`/c/Users/x`) as the Windows path it names (`C:/Users/x`); any other
+/// path unchanged. Elsewhere than Windows, every path is unchanged.
+fn drive_path(p: &str) -> String {
+    let b = p.as_bytes();
+    if cfg!(windows)
+        && b.len() >= 2
+        && b[0] == b'/'
+        && b[1].is_ascii_alphabetic()
+        && (b.len() == 2 || b[2] == b'/')
+    {
+        format!(
+            "{}:/{}",
+            char::from(b[1]).to_ascii_uppercase(),
+            p.get(3..).unwrap_or("")
+        )
+    } else {
+        p.to_owned()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_bash_paths_name_windows_drives() {
+        if cfg!(windows) {
+            assert_eq!(drive_path("/c/Users/x"), "C:/Users/x");
+            assert_eq!(drive_path("/d"), "D:/");
+        } else {
+            assert_eq!(drive_path("/c/Users/x"), "/c/Users/x");
+        }
+        assert_eq!(drive_path("/usr/bin"), "/usr/bin");
+        assert_eq!(drive_path("relative/x"), "relative/x");
+    }
+
+    #[test]
+    fn finds_the_root_of_a_repository() {
+        let root = std::env::temp_dir().join(format!("organon-root-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("repo").join(".git")).unwrap();
+        fs::create_dir_all(root.join("repo").join("a").join("b")).unwrap();
+        let real = |p: &Path| plain_path(&fs::canonicalize(p).unwrap().to_string_lossy());
+        let want = real(&root.join("repo"));
+        assert_eq!(
+            repo_root(&root.join("repo").join("a").join("b")),
+            Some(want.clone())
+        );
+        assert!(!want.starts_with(r"\\?") && !want.contains('\\'));
+        assert_eq!(repo_root(&root.join("elsewhere")), None);
+        assert_eq!(
+            repo_root(&root.join("repo").join("$OTHER")),
+            None,
+            "missing folder"
+        );
+
+        // A link inside one repository that leads into another is judged by its target.
+        fs::create_dir_all(root.join("other").join(".git")).unwrap();
+        fs::create_dir_all(root.join("other").join("src")).unwrap();
+        let link = root.join("repo").join("link");
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(root.join("other").join("src"), &link).is_ok();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(root.join("other").join("src"), &link).is_ok();
+        if made {
+            assert_eq!(repo_root(&link), Some(real(&root.join("other"))));
+        } else {
+            eprintln!("skipped the link case: this account cannot create symlinks");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn reads_the_branch_of_a_repo_and_of_a_worktree() {
