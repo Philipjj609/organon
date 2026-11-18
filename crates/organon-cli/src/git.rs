@@ -18,13 +18,23 @@ pub fn branch_in(dir: &Path) -> Option<String> {
 /// The root folder of the repository (or worktree) `dir` is in, with forward slashes.
 /// Used to apply the policy's exceptions.
 pub fn repo_root(dir: &Path) -> Option<String> {
-    // A folder that does not exist names no repository (never the one above it).
-    if !dir.is_dir() {
-        return None;
-    }
-    dir.ancestors()
+    // The physical folder: through symlinks and junctions, so a link into another
+    // repository is judged by where it leads. A folder that does not exist, or cannot be
+    // resolved, names no repository (never the one above it).
+    let real = fs::canonicalize(dir).ok().filter(|d| d.is_dir())?;
+    real.ancestors()
         .find(|a| a.join(".git").exists())
-        .map(|a| a.to_string_lossy().replace('\\', "/"))
+        .map(|a| plain_path(&a.to_string_lossy()))
+}
+
+/// A path without Windows' verbatim prefix (`\\?\C:\x` → `C:/x`), with forward slashes.
+fn plain_path(p: &str) -> String {
+    let p = if let Some(unc) = p.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        p.strip_prefix(r"\\?\").unwrap_or(p).to_owned()
+    };
+    p.replace('\\', "/")
 }
 
 fn git_dir(dir: &Path) -> Option<PathBuf> {
@@ -98,17 +108,33 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("repo").join(".git")).unwrap();
         fs::create_dir_all(root.join("repo").join("a").join("b")).unwrap();
-        let want = root.join("repo").to_string_lossy().replace('\\', "/");
+        let real = |p: &Path| plain_path(&fs::canonicalize(p).unwrap().to_string_lossy());
+        let want = real(&root.join("repo"));
         assert_eq!(
             repo_root(&root.join("repo").join("a").join("b")),
-            Some(want)
+            Some(want.clone())
         );
+        assert!(!want.starts_with(r"\\?") && !want.contains('\\'));
         assert_eq!(repo_root(&root.join("elsewhere")), None);
         assert_eq!(
             repo_root(&root.join("repo").join("$OTHER")),
             None,
             "missing folder"
         );
+
+        // A link inside one repository that leads into another is judged by its target.
+        fs::create_dir_all(root.join("other").join(".git")).unwrap();
+        fs::create_dir_all(root.join("other").join("src")).unwrap();
+        let link = root.join("repo").join("link");
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(root.join("other").join("src"), &link).is_ok();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(root.join("other").join("src"), &link).is_ok();
+        if made {
+            assert_eq!(repo_root(&link), Some(real(&root.join("other"))));
+        } else {
+            eprintln!("skipped the link case: this account cannot create symlinks");
+        }
         let _ = fs::remove_dir_all(&root);
     }
 
