@@ -904,41 +904,72 @@ struct PendingHeredoc {
 /// (`bash`, `sh`, `python`, `ssh`, `xargs`, `eval`...) has a body that may be run, so it stays
 /// read as commands.
 const DATA_READERS: &[&str] = &[
-    "cat", "tee", "git", "gh", "sed", "grep", "head", "tail", "wc", "sort", "jq", "tr", "cut",
+    "cat", "tee", "git", "gh", "grep", "head", "tail", "wc", "jq", "tr", "cut",
 ];
 
-/// Whether the heredoc operator at `b[at]` feeds a command that only reads data: the first
-/// word of its simple command (after `NAME=value` assignments) is in [`DATA_READERS`], and
-/// nothing on the rest of its line (from `rest`) pipes the input on (`cat <<'EOF' | sh`).
-fn feeds_only_data(b: &[u8], at: usize, rest: usize) -> bool {
+/// The text of the simple command that ends at `at`: from the last separator before it.
+fn command_before(b: &[u8], at: usize) -> String {
     let start = b[..at]
         .iter()
         .rposition(|x| matches!(x, b'\n' | b';' | b'&' | b'|' | b'(' | b'`'))
         .map_or(0, |k| k + 1);
-    let line_end = b[rest..]
-        .iter()
-        .position(|&x| x == b'\n')
-        .map_or(b.len(), |k| rest + k);
-    if b[rest..line_end].contains(&b'|') {
-        return false;
-    }
-    let prefix = String::from_utf8_lossy(&b[start..at]);
-    let Some(word) = prefix
+    String::from_utf8_lossy(&b[start..at]).into_owned()
+}
+
+/// The first word of a simple command that is not a `NAME=value` assignment.
+fn command_word(prefix: &str) -> Option<&str> {
+    prefix
         .split_ascii_whitespace()
         .find(|w| !(w.contains('=') && !w.starts_with('=')))
-    else {
+}
+
+/// Whether the simple command `prefix` is one of [`DATA_READERS`]. A `git` or `gh` that is
+/// given a configuration (`-c alias.x=!sh`) or has a `!` in it may run what it reads, so it is
+/// not.
+fn reads_data(prefix: &str) -> bool {
+    let Some(word) = command_word(prefix) else {
         return false;
     };
     let name = word.rsplit('/').next().unwrap_or(word).to_ascii_lowercase();
     let name = name.strip_suffix(".exe").unwrap_or(&name);
     DATA_READERS.contains(&name)
+        && !prefix.contains('!')
+        && !prefix.split_ascii_whitespace().any(|w| {
+            w == "-c" || w.starts_with("--config") || (w.starts_with("-c") && w.contains('='))
+        })
+}
+
+/// Whether the heredoc operator at `b[at]` feeds a command that only reads data: the first
+/// word of its simple command (after `NAME=value` assignments) is in [`DATA_READERS`], nothing
+/// on the rest of its line (from `rest`, a line continued with `\` included) pipes the input
+/// on (`cat <<'EOF' | sh`), and when it is inside `$(...)` (opened at `opens`) what the
+/// substitution is given to is a data reader too or only an assignment: `eval "$(cat <<'EOF'`
+/// runs the body.
+fn feeds_only_data(b: &[u8], at: usize, rest: usize, opens: &[usize]) -> bool {
+    let mut line_end = rest;
+    while let Some(k) = b[line_end..].iter().position(|&x| x == b'\n') {
+        line_end += k;
+        if b[line_end - 1] != b'\\' {
+            break;
+        }
+        line_end += 1;
+    }
+    let line_end = line_end.min(b.len());
+    if b[rest..line_end].contains(&b'|') {
+        return false;
+    }
+    reads_data(&command_before(b, at))
+        && opens.iter().all(|&open| {
+            let outer = command_before(b, open);
+            command_word(&outer).is_none() || reads_data(&outer)
+        })
 }
 
 /// What the scanner is inside.
 enum Scope {
     /// Commands: the top level, or a `$(...)`. `parens` counts the `(` opened inside it;
     /// `sub` says whether a `)` at zero ends it.
-    Commands { parens: u32, sub: bool },
+    Commands { parens: u32, sub: bool, open: usize },
     /// A double-quoted string.
     Quoted,
 }
@@ -953,6 +984,7 @@ fn heredoc_body_ranges(cmd: &str) -> Option<Vec<(usize, usize)>> {
     let mut scopes = vec![Scope::Commands {
         parens: 0,
         sub: false,
+        open: 0,
     }];
     let mut pending: Vec<PendingHeredoc> = Vec::new();
     let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -975,6 +1007,7 @@ fn heredoc_body_ranges(cmd: &str) -> Option<Vec<(usize, usize)>> {
                     scopes.push(Scope::Commands {
                         parens: 0,
                         sub: true,
+                        open: i,
                     });
                     i += 2;
                 }
@@ -982,7 +1015,7 @@ fn heredoc_body_ranges(cmd: &str) -> Option<Vec<(usize, usize)>> {
                 b'`' => i = skip_backticks(b, i)?,
                 _ => i += 1,
             },
-            Scope::Commands { parens, sub } => match c {
+            Scope::Commands { parens, sub, .. } => match c {
                 b'\\' => i += 2,
                 b'\'' => i = i + 2 + b[i + 1..].iter().position(|&x| x == b'\'')?,
                 b'"' => {
@@ -999,6 +1032,7 @@ fn heredoc_body_ranges(cmd: &str) -> Option<Vec<(usize, usize)>> {
                         scopes.push(Scope::Commands {
                             parens: 0,
                             sub: true,
+                            open: i,
                         });
                         i += 2;
                     }
@@ -1084,7 +1118,18 @@ fn heredoc_body_ranges(cmd: &str) -> Option<Vec<(usize, usize)>> {
                         return None;
                     }
                     let (mut heredoc, next) = heredoc_operator(b, i + 2, depth)?;
-                    heredoc.drop = heredoc.quoted && feeds_only_data(b, i, next);
+                    heredoc.drop = heredoc.quoted && {
+                        let opens: Vec<usize> = scopes
+                            .iter()
+                            .filter_map(|s| match s {
+                                Scope::Commands {
+                                    sub: true, open, ..
+                                } => Some(*open),
+                                _ => None,
+                            })
+                            .collect();
+                        feeds_only_data(b, i, next, &opens)
+                    };
                     pending.push(heredoc);
                     i = next;
                 }
@@ -3430,6 +3475,15 @@ mod tests {
             // a continued terminator in an unquoted body (found by Codex)
             "cat <<true <<':'\ntrue\\\n\n:\ntrue\ngit branch -D foo\n:\n",
             "cat <<EOF <<'EOF2'\nEOF\\\nEOF\ngit branch -D foo\nEOF2\n",
+            // round 2: sed e runs its input; a pipe on a continued line; a substitution
+            // handed to eval or to a shell; git with a configured alias
+            "sed e <<'EOF'\ngit branch -D foo\nEOF\n",
+            "cat <<'EOF' \\\n| bash\ngit branch -D foo\nEOF\n",
+            "eval $(cat <<'EOF'\ngit branch -D foo\nEOF\n)",
+            "bash -c $(cat <<'EOF'\ngit branch -D foo\nEOF\n)",
+            "echo $(cat <<'EOF'\ngit branch -D foo\nEOF\n) | bash",
+            "git -c alias.x=!bash x <<'EOF'\ngit branch -D foo\nEOF\n",
+            "git -c core.pager=bash log <<'EOF'\ngit branch -D foo\nEOF\n",
         ] {
             assert_eq!(decide(cmd), run, "{cmd:?}");
         }
@@ -3440,6 +3494,9 @@ mod tests {
             "GIT_X=1 git commit -F - <<'EOF'\ngit branch -D foo\nEOF\n",
             "gh pr create --body-file - <<'EOF'\ngit branch -D foo\nEOF\n",
             "tee f <<'EOF'\ngit branch -D foo\nEOF\n",
+            "gh pr create --title t --body \"$(cat <<'EOF'\ngit branch -D foo\nEOF\n)\"",
+            "git commit -m \"$(cat <<'EOF'\ngit branch -D foo\nEOF\n)\"",
+            "x=$(cat <<'EOF'\ngit branch -D foo\nEOF\n)",
         ] {
             assert_eq!(decide(cmd), Decision::Allow, "{cmd:?}");
         }
