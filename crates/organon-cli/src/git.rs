@@ -28,6 +28,37 @@ pub fn repo_root(dir: &Path) -> Option<String> {
         .map(|a| plain_path(&a.to_string_lossy()))
 }
 
+/// The URL of the `origin` remote of the repository (or worktree) whose root folder is `root`,
+/// read from its git config (no git process). A worktree shares the config of the repository
+/// it belongs to (`commondir`). `None` when there is no `origin` or the config cannot be read.
+pub fn origin_url(root: &str) -> Option<String> {
+    let dir = git_dir(Path::new(root))?;
+    let common = match fs::read_to_string(dir.join("commondir")) {
+        Ok(c) => dir.join(c.trim()),
+        Err(_) => dir,
+    };
+    let config = fs::read_to_string(common.join("config")).ok()?;
+    origin_in_config(&config)
+}
+
+/// The `url` of `[remote "origin"]` in the text of a git config file.
+fn origin_in_config(config: &str) -> Option<String> {
+    let mut in_origin = false;
+    for line in config.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_origin = line.eq_ignore_ascii_case("[remote \"origin\"]");
+        } else if in_origin {
+            if let Some((key, value)) = line.split_once('=') {
+                if key.trim().eq_ignore_ascii_case("url") {
+                    return Some(value.trim().trim_matches('"').to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// A path without Windows' verbatim prefix (`\\?\C:\x` → `C:/x`), with forward slashes.
 fn plain_path(p: &str) -> String {
     let p = if let Some(unc) = p.strip_prefix(r"\\?\UNC\") {
@@ -241,6 +272,38 @@ fn judge_shell_file(text: &str, allowed: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_origin_url_is_read_from_the_git_config() {
+        let config = "[core]\n\turl = nope\n[remote \"upstream\"]\n\turl = https://x/up.git\n\
+                      [remote \"origin\"]\n\t# comment\n\n\tfetch = +refs/*\n\turl = git@github.com:O/R.git\n";
+        assert_eq!(
+            origin_in_config(config).as_deref(),
+            Some("git@github.com:O/R.git")
+        );
+        assert_eq!(origin_in_config("[remote \"upstream\"]\n\turl = x\n"), None);
+        assert_eq!(origin_in_config(""), None);
+
+        // From a folder: a repository, a worktree (config of the main repository), none.
+        let root = std::env::temp_dir().join(format!("organon-origin-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("main/.git/worktrees/w")).unwrap();
+        fs::create_dir_all(root.join("wt")).unwrap();
+        fs::create_dir_all(root.join("bare")).unwrap();
+        fs::write(root.join("main/.git/config"), config).unwrap();
+        fs::write(root.join("main/.git/worktrees/w/commondir"), "../..\n").unwrap();
+        let main_git = root.join("main/.git/worktrees/w");
+        fs::write(
+            root.join("wt/.git"),
+            format!("gitdir: {}\n", main_git.to_string_lossy()),
+        )
+        .unwrap();
+        let want = Some("git@github.com:O/R.git".to_owned());
+        assert_eq!(origin_url(&root.join("main").to_string_lossy()), want);
+        assert_eq!(origin_url(&root.join("wt").to_string_lossy()), want);
+        assert_eq!(origin_url(&root.join("bare").to_string_lossy()), None);
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn what_the_shell_inherits_is_read_from_the_environment_and_its_files() {
