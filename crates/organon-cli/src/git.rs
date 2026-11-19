@@ -47,7 +47,11 @@ fn origin_in_config(config: &str) -> Option<String> {
     for line in config.lines() {
         let line = line.trim();
         if line.starts_with('[') {
-            in_origin = line.eq_ignore_ascii_case("[remote \"origin\"]");
+            // Section names ignore case, a subsection (`"origin"`) does not.
+            in_origin = line
+                .get(..8)
+                .is_some_and(|s| s.eq_ignore_ascii_case("[remote "))
+                && line[8..] == *"\"origin\"]";
         } else if in_origin {
             if let Some((key, value)) = line.split_once('=') {
                 if key.trim().eq_ignore_ascii_case("url") {
@@ -283,6 +287,15 @@ mod tests {
         );
         assert_eq!(origin_in_config("[remote \"upstream\"]\n\turl = x\n"), None);
         assert_eq!(origin_in_config(""), None);
+        // `"Origin"` is another remote than `"origin"`; a section name ignores case.
+        assert_eq!(
+            origin_in_config("[remote \"Origin\"]\n\turl = https://github.com/a/b\n"),
+            None
+        );
+        assert_eq!(
+            origin_in_config("[REMOTE \"origin\"]\n\turl = https://github.com/a/b\n").as_deref(),
+            Some("https://github.com/a/b")
+        );
 
         // From a folder: a repository, a worktree (config of the main repository), none.
         let root = std::env::temp_dir().join(format!("organon-origin-{}", std::process::id()));

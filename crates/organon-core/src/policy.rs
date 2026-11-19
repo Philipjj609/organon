@@ -287,12 +287,16 @@ fn flag_slug(v: &str) -> Option<String> {
 #[must_use]
 pub fn github_slug(url: &str) -> Option<String> {
     let url = url.trim();
-    let rest = ["https://", "http://", "ssh://", "git://"]
+    // Only the part before the first `/` (or, in the `git@host:path` form, before the `:`) is
+    // the authority that may hold `user@`; an `@` in the path is not one.
+    let (authority, path) = match ["https://", "http://", "ssh://", "git://"]
         .iter()
         .find_map(|s| url.strip_prefix(s))
-        .unwrap_or(url);
-    let rest = rest.rsplit_once('@').map_or(rest, |(_, r)| r);
-    let (host, path) = rest.split_once([':', '/'])?;
+    {
+        Some(rest) => rest.split_once('/')?,
+        None => url.split_once(':').filter(|(a, _)| !a.contains('/'))?,
+    };
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     if !host.eq_ignore_ascii_case("github.com") {
         return None;
     }
@@ -2799,6 +2803,11 @@ mod tests {
             "https://example.com/a/b.git",
             "git@example.com:a/b.git",
             "/srv/git/a/b.git",
+            // an `@github.com` in the path or a port is not the host
+            "https://example.org/mirror@github.com/a/b.git",
+            "https://example.org:443/x@github.com/a/b.git",
+            "https://github.com:443/a/b.git",
+            "example.org:x@github.com/a/b.git",
         ] {
             assert_eq!(github_slug(bad), None, "{bad}");
         }
