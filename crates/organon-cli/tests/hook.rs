@@ -470,17 +470,26 @@ fn a_merge_exception_lets_a_plain_merge_through_in_its_repository_only() {
     let run = |cwd: &str, cmd: &str| {
         e.hook_raw(&event("s", &e.transcript, cwd, "Bash", &command(cmd)), &[])
     };
-    // In the excepted repository a plain merge goes through, anything else about it asks.
-    assert_eq!(run(&cwds[0], "gh pr merge 7 --squash --delete-branch"), "");
+    // In the excepted repository a merge goes through with any flags that only change how it
+    // merges; `--admin` and another repository (the folder has no origin here) are denied.
+    for cmd in [
+        "gh pr merge 7 --squash --delete-branch",
+        "gh pr merge 7 --auto --body notes",
+        "gh pr merge 7 -sd",
+    ] {
+        assert_eq!(run(&cwds[0], cmd), "", "{cmd}");
+    }
     for cmd in [
         "gh pr merge 7 --admin",
         "gh pr merge 7 --repo Philipjj609/Koda",
         "gh pr merge 7 -R Philipjj609/Koda",
-        "echo x | mail a@b.c",
+        "gh pr merge 7 -sR Philipjj609/Koda",
     ] {
         let out = run(&cwds[0], cmd);
-        assert!(is_ask(&out), "{cmd}: {out}");
+        assert!(is_deny(&out), "{cmd}: {out}");
     }
+    let out = run(&cwds[0], "echo x | mail a@b.c");
+    assert!(is_ask(&out), "{out}");
     // In any other repository it still asks.
     let out = run(&cwds[1], "gh pr merge 7 --squash");
     assert!(is_ask(&out), "{out}");
@@ -543,22 +552,26 @@ fn a_merge_exception_only_lifts_a_whole_command_that_is_a_plain_merge_end_to_end
         "gh pr merge 12 --rebase".to_owned(),
         "gh pr merge feat/x --merge".to_owned(),
         "gh pr merge 12 -s".to_owned(),
+        "gh pr merge 12 --auto --body notes -sd".to_owned(),
+        "gh pr merge 7 --match-head-commit abc123".to_owned(),
         format!("cd {repo} && gh pr merge 3 --squash --match-head-commit 0123456789abcdef0123456789abcdef01234567"),
     ] {
         assert_eq!(run(&cmd), "", "{cmd}");
     }
     for cmd in [
+        "gh pr merge 7 --admin",
+        "gh pr merge 7 -sdRPhilipjj609/Koda",
+        "gh pr merge 7 -dR Philipjj609/Koda",
+        "gh pr merge https://github.com/o/r/pull/7",
+    ] {
+        let out = run(cmd);
+        assert!(is_deny(&out), "{cmd}: {out}");
+    }
+    for cmd in [
         format!("cd {other} && gh pr merge 3"),
-        "gh pr merge 7 -sR Philipjj609/Koda".to_owned(),
-        "gh pr merge 7 -dR Philipjj609/Koda".to_owned(),
-        "gh pr merge 7 -sdRPhilipjj609/Koda".to_owned(),
-        "gh pr merge 7 -sd".to_owned(),
         "gh -R Philipjj609/Koda pr merge 7".to_owned(),
         "gh --repo Philipjj609/Koda pr merge 7".to_owned(),
         "gh --repo=Philipjj609/Koda pr merge 7".to_owned(),
-        "gh pr merge 7 --auto".to_owned(),
-        "gh pr merge 7 --admin".to_owned(),
-        "gh pr merge 7 --match-head-commit abc123".to_owned(),
         "gh pr merge 3 --squash && git pull".to_owned(),
         // one-command bypasses
         "PR=https://github.com/o/r/pull/7 && gh pr merge $PR --squash".to_owned(),

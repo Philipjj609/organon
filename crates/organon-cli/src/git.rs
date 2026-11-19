@@ -28,39 +28,28 @@ pub fn repo_root(dir: &Path) -> Option<String> {
         .map(|a| plain_path(&a.to_string_lossy()))
 }
 
-/// The URL of the `origin` remote of the repository (or worktree) whose root folder is `root`,
-/// read from its git config (no git process). A worktree shares the config of the repository
-/// it belongs to (`commondir`). `None` when there is no `origin` or the config cannot be read.
+/// The URL git itself gives the `origin` remote of the repository (or worktree) whose root
+/// folder is `root` (`git remote get-url origin`: includes and `insteadOf` rewrites applied,
+/// which no reading of the config file by hand gets right). `None` when there is no `origin`,
+/// git is not there or fails. Variables that point git at another repository are removed.
 pub fn origin_url(root: &str) -> Option<String> {
-    let dir = git_dir(Path::new(root))?;
-    let common = match fs::read_to_string(dir.join("commondir")) {
-        Ok(c) => dir.join(c.trim()),
-        Err(_) => dir,
-    };
-    let config = fs::read_to_string(common.join("config")).ok()?;
-    origin_in_config(&config)
-}
-
-/// The `url` of `[remote "origin"]` in the text of a git config file.
-fn origin_in_config(config: &str) -> Option<String> {
-    let mut in_origin = false;
-    for line in config.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            // Section names ignore case, a subsection (`"origin"`) does not.
-            in_origin = line
-                .get(..8)
-                .is_some_and(|s| s.eq_ignore_ascii_case("[remote "))
-                && line[8..] == *"\"origin\"]";
-        } else if in_origin {
-            if let Some((key, value)) = line.split_once('=') {
-                if key.trim().eq_ignore_ascii_case("url") {
-                    return Some(value.trim().trim_matches('"').to_owned());
-                }
-            }
-        }
+    let mut git = std::process::Command::new("git");
+    git.args(["-C", root, "remote", "get-url", "origin"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+    ] {
+        git.env_remove(var);
     }
-    None
+    let out = git.output().ok().filter(|o| o.status.success())?;
+    let url = String::from_utf8(out.stdout).ok()?;
+    let url = url.trim();
+    (!url.is_empty() && !url.contains('\n')).then(|| url.to_owned())
 }
 
 /// A path without Windows' verbatim prefix (`\\?\C:\x` → `C:/x`), with forward slashes.
@@ -277,44 +266,47 @@ fn judge_shell_file(text: &str, allowed: &[String]) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_origin_url_is_read_from_the_git_config() {
-        let config = "[core]\n\turl = nope\n[remote \"upstream\"]\n\turl = https://x/up.git\n\
-                      [remote \"origin\"]\n\t# comment\n\n\tfetch = +refs/*\n\turl = git@github.com:O/R.git\n";
-        assert_eq!(
-            origin_in_config(config).as_deref(),
-            Some("git@github.com:O/R.git")
-        );
-        assert_eq!(origin_in_config("[remote \"upstream\"]\n\turl = x\n"), None);
-        assert_eq!(origin_in_config(""), None);
-        // `"Origin"` is another remote than `"origin"`; a section name ignores case.
-        assert_eq!(
-            origin_in_config("[remote \"Origin\"]\n\turl = https://github.com/a/b\n"),
-            None
-        );
-        assert_eq!(
-            origin_in_config("[REMOTE \"origin\"]\n\turl = https://github.com/a/b\n").as_deref(),
-            Some("https://github.com/a/b")
-        );
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
 
-        // From a folder: a repository, a worktree (config of the main repository), none.
+    #[test]
+    fn the_origin_url_is_what_git_says() {
         let root = std::env::temp_dir().join(format!("organon-origin-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("main/.git/worktrees/w")).unwrap();
-        fs::create_dir_all(root.join("wt")).unwrap();
-        fs::create_dir_all(root.join("bare")).unwrap();
-        fs::write(root.join("main/.git/config"), config).unwrap();
-        fs::write(root.join("main/.git/worktrees/w/commondir"), "../..\n").unwrap();
-        let main_git = root.join("main/.git/worktrees/w");
-        fs::write(
-            root.join("wt/.git"),
-            format!("gitdir: {}\n", main_git.to_string_lossy()),
-        )
-        .unwrap();
-        let want = Some("git@github.com:O/R.git".to_owned());
-        assert_eq!(origin_url(&root.join("main").to_string_lossy()), want);
-        assert_eq!(origin_url(&root.join("wt").to_string_lossy()), want);
-        assert_eq!(origin_url(&root.join("bare").to_string_lossy()), None);
+        let main = root.join("main");
+        fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        let path = |p: &Path| plain_path(&p.to_string_lossy());
+        assert_eq!(origin_url(&path(&main)), None, "no origin");
+        git(
+            &main,
+            &["remote", "add", "origin", "git@github.com:O/R.git"],
+        );
+        assert_eq!(
+            origin_url(&path(&main)).as_deref(),
+            Some("git@github.com:O/R.git")
+        );
+        // `insteadOf` rewrites are applied, as `gh` sees them.
+        git(
+            &main,
+            &[
+                "config",
+                "url.https://github.com/Other/Thing.git.insteadOf",
+                "git@github.com:O/R.git",
+            ],
+        );
+        assert_eq!(
+            origin_url(&path(&main)).as_deref(),
+            Some("https://github.com/Other/Thing.git")
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
