@@ -958,6 +958,18 @@ fn feeds_only_data(b: &[u8], at: usize, rest: usize, opens: &[usize]) -> bool {
     if b[rest..line_end].contains(&b'|') {
         return false;
     }
+    // A process substitution on the line (`bash <(cat <<'EOF'`, `cat <<'EOF' > >(bash)`) hands
+    // the body to whatever reads the substitution: it may be run.
+    let line_start = b[..at]
+        .iter()
+        .rposition(|&x| x == b'\n')
+        .map_or(0, |k| k + 1);
+    if b[line_start..line_end]
+        .windows(2)
+        .any(|w| w == b"<(" || w == b">(")
+    {
+        return false;
+    }
     reads_data(&command_before(b, at))
         && opens.iter().all(|&open| {
             let outer = command_before(b, open);
@@ -3500,6 +3512,38 @@ mod tests {
         ] {
             assert_eq!(decide(cmd), Decision::Allow, "{cmd:?}");
         }
+    }
+
+    /// Found by Codex (round 3): a heredoc inside a process substitution is handed to whatever
+    /// reads the substitution, so its body may be run.
+    #[test]
+    fn a_heredoc_inside_a_process_substitution_is_read_as_commands() {
+        let run = decide("git branch -D foo");
+        assert_ne!(run, Decision::Allow);
+        for cmd in [
+            "bash <(cat <<'EOF'\ngit branch -D foo\nEOF\n)",
+            "bash < <(cat <<'EOF'\ngit branch -D foo\nEOF\n)",
+            "bash <( cat <<'EOF'\ngit branch -D foo\nEOF\n)",
+            "sh <(cat <<'EOF'\ngit branch -D foo\nEOF\n)",
+            "zsh <(cat <<'EOF'\ngit branch -D foo\nEOF\n)",
+            "source <(cat <<'EOF'\ngit branch -D foo\nEOF\n)",
+            "eval $(cat <(cat <<'EOF'\ngit branch -D foo\nEOF\n))",
+            "source /dev/stdin < <(cat <<'EOF'\ngit branch -D foo\nEOF\n)",
+            "cat <<'EOF' > >(bash)\ngit branch -D foo\nEOF\n",
+            "cat <<'EOF' >(bash)\ngit branch -D foo\nEOF\n",
+            "cat <<'EOF' > >( sh )\ngit branch -D foo\nEOF\n",
+            "cat <<'EOF' > >(zsh)\ngit branch -D foo\nEOF\n",
+            "cat <<'EOF' > >(eval \"$(cat)\")\ngit branch -D foo\nEOF\n",
+            "cat <<'EOF' > >(source /dev/stdin)\ngit branch -D foo\nEOF\n",
+            "tee >(bash) <<'EOF'\ngit branch -D foo\nEOF\n",
+        ] {
+            assert_eq!(decide(cmd), run, "{cmd:?}");
+        }
+        // A process substitution on another line leaves the body data.
+        assert_eq!(
+            decide("diff <(ls) <(ls)\ncat > f <<'EOF'\ngit branch -D foo\nEOF\n"),
+            Decision::Allow
+        );
     }
 
     #[test]
