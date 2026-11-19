@@ -908,11 +908,24 @@ const DATA_READERS: &[&str] = &[
 ];
 
 /// The text of the simple command that ends at `at`: from the last separator before it.
+/// Where the logical line that holds `at` starts: after the last newline that is not
+/// continued with a `\`.
+fn line_start(b: &[u8], at: usize) -> usize {
+    let mut end = at;
+    loop {
+        let Some(k) = b[..end].iter().rposition(|&x| x == b'\n') else {
+            return 0;
+        };
+        if k > 0 && b[k - 1] == b'\\' {
+            end = k - 1;
+        } else {
+            return k + 1;
+        }
+    }
+}
+
 fn command_before(b: &[u8], at: usize) -> String {
-    let line = b[..at]
-        .iter()
-        .rposition(|&x| x == b'\n')
-        .map_or(0, |k| k + 1);
+    let line = line_start(b, at);
     let mut start = line;
     // The quotes and `$(...)` open at `i`: a separator inside a quote does not end a command.
     let mut stack = vec![b'c'];
@@ -1002,11 +1015,7 @@ fn feeds_only_data(b: &[u8], at: usize, rest: usize, opens: &[usize]) -> bool {
     }
     // A process substitution on the line (`bash <(cat <<'EOF'`, `cat <<'EOF' > >(bash)`) hands
     // the body to whatever reads the substitution: it may be run.
-    let line_start = b[..at]
-        .iter()
-        .rposition(|&x| x == b'\n')
-        .map_or(0, |k| k + 1);
-    if b[line_start..line_end]
+    if b[line_start(b, at)..line_end]
         .windows(2)
         .any(|w| w == b"<(" || w == b">(")
     {
@@ -1209,7 +1218,13 @@ fn heredoc_body_ranges(cmd: &str) -> Option<Vec<(usize, usize)>> {
                         let procsub = groups.clone().any(|&p| p);
                         // A plain subshell may be piped on after its `)`: any `|` later on
                         // keeps the body read as commands.
-                        let piped = groups.count() > 0 && b[next..].contains(&b'|');
+                        // A `{ ` group is treated the same way, wherever it was opened.
+                        let braced = (0..i).any(|k| {
+                            b[k] == b'{'
+                                && matches!(b.get(k + 1), Some(b' ' | b'\t' | b'\n'))
+                                && (k == 0 || b[k - 1] != b'$')
+                        });
+                        let piped = (braced || groups.count() > 0) && b[next..].contains(&b'|');
                         !procsub && !piped && feeds_only_data(b, i, next, &opens)
                     };
                     pending.push(heredoc);
@@ -3623,6 +3638,19 @@ mod tests {
         ] {
             assert_eq!(decide(cmd), run, "{cmd:?}");
         }
+        // Round 5: a brace group piped on; a command continued onto the operator's line.
+        for cmd in [
+            "{ cat <<'EOF'\ngit branch -D foo\nEOF\n} | bash",
+            "{\ncat <<'EOF'\ngit branch -D foo\nEOF\n} | bash",
+            "bash -s \\\ncat <<'EOF'\ngit branch -D foo\nEOF\n",
+            "bash \\\n  -s \\\n  <<'EOF'\ngit branch -D foo\nEOF\n",
+        ] {
+            assert_eq!(decide(cmd), run, "{cmd:?}");
+        }
+        assert_eq!(
+            decide("cat > f \\\n  <<'EOF'\ngit branch -D foo\nEOF\n"),
+            Decision::Allow
+        );
         // A process substitution on another line leaves the body data.
         assert_eq!(
             decide("diff <(ls) <(ls)\ncat > f <<'EOF'\ngit branch -D foo\nEOF\n"),
