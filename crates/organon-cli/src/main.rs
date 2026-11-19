@@ -582,10 +582,12 @@ fn check(home: &Home, write: Option<&str>, command: &str) -> Result<ExitCode> {
     };
     let branch_of = |hint: Option<&str>| git::branch_in(&git::folder("", hint));
     let repo_of = |hint: Option<&str>| git::repo_root(&git::folder("", hint));
-    let v = policy.decide_with_env(
+    let origin_of = |root: &str| git::origin_url(root);
+    let v = policy.decide_with_origin(
         action,
         &branch_of,
         &repo_of,
+        &origin_of,
         git::inherited(None, &policy.merge_env_names),
     );
     let d = format!("{:?}", v.decision).to_lowercase();
@@ -875,10 +877,12 @@ fn hook(home: &Home, ev: &HookEvent) -> Result<Option<String>> {
     let (policy, _) = home.policy()?;
     let branch_of = |hint: Option<&str>| git::branch_in(&git::folder(&ev.cwd, hint));
     let repo_of = |hint: Option<&str>| git::repo_root(&git::folder(&ev.cwd, hint));
-    let mut verdict = policy.decide_with_env(
+    let origin_of = |root: &str| git::origin_url(root);
+    let mut verdict = policy.decide_with_origin(
         action,
         &branch_of,
         &repo_of,
+        &origin_of,
         git::inherited(Some(&ev.session_id), &policy.merge_env_names),
     );
     let mut context: Option<String> = None;

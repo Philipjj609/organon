@@ -238,9 +238,95 @@ pub fn no_repo(_: Option<&str>) -> Option<String> {
     None
 }
 
+/// Finds the URL of the `origin` remote of the repository whose root folder is given (as
+/// [`RepoOf`] returned it). Used only to accept a `--repo` flag on a plain merge that names
+/// the folder's own repository.
+pub type OriginOf<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// An [`OriginOf`] that reads no remote: a merge that names a repository by flag asks.
+#[must_use]
+pub fn no_origin(_: &str) -> Option<String> {
+    None
+}
+
+/// The built-in `send` rules that ask because a merge names its repository by flag. A plain
+/// merge whose flag names the folder's own `origin` is not what they guard against.
+const REPO_FLAG_RULES: &[&str] = &[
+    "gh pr merge *--repo*",
+    "gh pr merge -R*",
+    "gh pr merge -r*",
+    "gh pr *--repo* merge",
+    "gh pr -R* merge",
+];
+
+/// One GitHub name part: letters, digits, `. _ -`, not empty, not starting with `-`, not `.`
+/// or `..`.
+fn slug_part(p: &str) -> bool {
+    !p.is_empty()
+        && !p.starts_with('-')
+        && p != "."
+        && p != ".."
+        && p.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+}
+
+/// `owner/name` in lower case from the value of a `--repo` flag: `OWNER/REPO`, or
+/// `github.com/OWNER/REPO` (another host asks). `None` for anything else.
+fn flag_slug(v: &str) -> Option<String> {
+    let v = v
+        .split_once('/')
+        .filter(|(h, _)| h.eq_ignore_ascii_case("github.com"))
+        .map_or(v, |(_, rest)| rest);
+    let (owner, name) = v.split_once('/')?;
+    (slug_part(owner) && slug_part(name)).then(|| format!("{owner}/{name}").to_lowercase())
+}
+
+/// `owner/name` in lower case from the URL of a git remote on github.com: `https://`,
+/// `http://`, `ssh://` or `git://` URLs (with or without `user@`), and the `git@github.com:o/r`
+/// form, with or without `.git` or a trailing slash. `None` for another host or shape.
+#[must_use]
+pub fn github_slug(url: &str) -> Option<String> {
+    let url = url.trim();
+    // Only the part before the first `/` (or, in the `git@host:path` form, before the `:`) is
+    // the authority that may hold `user@`; an `@` in the path is not one.
+    let (authority, path) = match ["https://", "http://", "ssh://", "git://"]
+        .iter()
+        .find_map(|s| url.strip_prefix(s))
+    {
+        Some(rest) => rest.split_once('/')?,
+        None => url.split_once(':').filter(|(a, _)| !a.contains('/'))?,
+    };
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if !host.eq_ignore_ascii_case("github.com") {
+        return None;
+    }
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let (owner, name) = path.split_once('/')?;
+    (slug_part(owner) && slug_part(name)).then(|| format!("{owner}/{name}").to_lowercase())
+}
+
+/// A plain merge as [`lone_merge`] reads it: where it runs and the repository it names by
+/// flag, if any.
+#[derive(Debug, Clone, Copy)]
+struct Lone<'a> {
+    /// `cd <dir> &&` before the merge, or `None` for the agent's folder.
+    dir: Option<&'a str>,
+    /// The value of `--repo`, `--repo=` or `-R`, already shaped like `OWNER/REPO`.
+    repo: Option<&'a str>,
+}
+
 /// The class of the rule that guards `gh pr merge`. An exception for it lifts a command only
 /// when the whole command is one of two fixed forms: see [`lone_merge`].
 const MERGE_CLASS: &str = "merge";
+
+/// Why `--admin` on a merge is denied where a `merge` exception applies.
+const MERGE_ADMIN_DENIED: &str =
+    "--admin bypasses branch protection; never needed. Merge normally once CI is green.";
+
+/// Why a merge that names another repository is denied where a `merge` exception applies.
+const MERGE_ELSEWHERE_DENIED: &str =
+    "Merge from that repo's own folder; outside Philip's own repos, tell him in the chat.";
 
 /// What the process a command will run in inherited, read by the caller: this crate reads no
 /// environment and no file.
@@ -271,9 +357,9 @@ fn names_a_gh_target(cmd: &str, raw: &[Vec<String>]) -> bool {
     named(&squashed(cmd)) || raw.iter().any(|ws| named(&squashed(&ws.join(" "))))
 }
 
-/// Whether `cmd` is only a plain merge, and where it runs. `None`: it is not (anything else
-/// asks). `Some(None)`: `gh pr merge ...` alone, in the agent's folder. `Some(Some(dir))`:
-/// `cd <dir> && gh pr merge ...`, in `dir`.
+/// The two forms of command a `merge` exception reads, and the words of the merge: `None` when
+/// the command is anything else. `Some((None, words))`: `gh pr merge ...` alone, in the agent's
+/// folder. `Some((Some(dir), words))`: `cd <dir> && gh pr merge ...`, in `dir`.
 ///
 /// This is an allow-list over the whole command, not a search for bad words:
 /// - every character is a letter, a digit, a space or one of `- _ . / : = + @ ,`, and `&` only
@@ -283,8 +369,8 @@ fn names_a_gh_target(cmd: &str, raw: &[Vec<String>]) -> bool {
 /// - the first part, if there is a second, is `cd`, `Set-Location` or `sl` and one absolute
 ///   path with forward slashes (`C:/...` on Windows, `/...` elsewhere; letters, digits and
 ///   `. _ / - +` only, no `..` component);
-/// - the merge is exactly [`plain_merge`].
-fn lone_merge(cmd: &str) -> Option<Option<&str>> {
+/// - the merge starts `gh pr merge`.
+fn merge_shape(cmd: &str) -> Option<(Option<&str>, Vec<&str>)> {
     if !cmd
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || " -_./:=+@,&".contains(c))
@@ -298,20 +384,30 @@ fn lone_merge(cmd: &str) -> Option<Option<&str>> {
     fn words(p: &str) -> Vec<&str> {
         p.split(' ').filter(|w| !w.is_empty()).collect()
     }
-    match parts.as_slice() {
-        [merge] => plain_merge(&words(merge)).then_some(None),
+    let (dir, merge) = match parts.as_slice() {
+        [merge] => (None, words(merge)),
         [cd, merge] => match words(cd).as_slice() {
             [prog, path]
                 if ["cd", "set-location", "sl"]
                     .iter()
                     .any(|p| prog.eq_ignore_ascii_case(p))
-                    && is_plain_absolute_path(path)
-                    && plain_merge(&words(merge)) =>
+                    && is_plain_absolute_path(path) =>
             {
-                Some(Some(*path))
+                (Some(*path), words(merge))
             }
-            _ => None,
+            _ => return None,
         },
+        _ => return None,
+    };
+    (merge.len() >= 3 && merge[..3] == ["gh", "pr", "merge"]).then_some((dir, merge))
+}
+
+/// Whether `cmd` is a merge a `merge` exception lifts, and where it runs: see [`merge_shape`]
+/// and [`read_merge`]. `None`: anything else asks.
+fn lone_merge(cmd: &str) -> Option<Lone<'_>> {
+    let (dir, words) = merge_shape(cmd)?;
+    match read_merge(&words) {
+        MergeFlags::Plain(repo) => Some(Lone { dir, repo }),
         _ => None,
     }
 }
@@ -331,40 +427,55 @@ fn is_plain_absolute_path(p: &str) -> bool {
         && !rest.split('/').any(|c| c == "..")
 }
 
-/// Whether `w` is exactly `gh pr merge` with at most one positional (`^[0-9]+$` or
-/// `^[A-Za-z0-9._/-]+$`, not starting with `-`) and only the flags `--squash`/`-s`,
-/// `--merge`/`-m`, `--rebase`, `--delete-branch`/`-d` and `--match-head-commit <sha>` (or
-/// `=<sha>`, 7 to 40 hex digits). Anything else, a bundle like `-sd` included, is not plain.
-fn plain_merge(w: &[&str]) -> bool {
-    if w.len() < 3 || w[0] != "gh" || w[1] != "pr" || w[2] != "merge" {
-        return false;
-    }
-    let sha = |v: &str| (7..=40).contains(&v.len()) && v.chars().all(|c| c.is_ascii_hexdigit());
-    let mut positional = false;
+/// What the words of a `gh pr merge` say about where it merges and how.
+#[derive(Debug, PartialEq, Eq)]
+enum MergeFlags<'a> {
+    /// Any flags but those below, and at most one `--repo <o/n>`, `--repo=<o/n>` or `-R <o/n>`
+    /// ([`flag_slug`] shape): the repository the flag names, if any. Whether it is the folder's
+    /// own repository is checked later.
+    Plain(Option<&'a str>),
+    /// `--admin`: it bypasses branch protection.
+    Admin,
+    /// A repository named in a way that is not read: a URL, a second `--repo`, a value that is
+    /// not `OWNER/REPO`, or `-R` inside a bundle (`-sR`, `-RO/R`).
+    Elsewhere,
+}
+
+/// Reads the words of a `gh pr merge` (see [`merge_shape`]) for the flags that decide where it
+/// merges. The other flags (`--squash`, `--auto`, `--body`, `--delete-branch`,
+/// `--match-head-commit`...) change how it merges, not where, and do not matter.
+fn read_merge<'a>(w: &[&'a str]) -> MergeFlags<'a> {
+    let mut repo: Option<&str> = None;
+    let mut elsewhere = false;
     let mut i = 3;
     while i < w.len() {
         let a = w[i];
-        match a {
-            "--squash" | "-s" | "--merge" | "-m" | "--rebase" | "--delete-branch" | "-d" => {}
-            "--match-head-commit" => {
-                i += 1;
-                if !w.get(i).is_some_and(|v| sha(v)) {
-                    return false;
-                }
+        if a.starts_with("--admin") {
+            return MergeFlags::Admin;
+        }
+        if a.contains("://") {
+            elsewhere = true;
+        } else if a == "--repo" || a == "-R" {
+            i += 1;
+            match w.get(i).copied().filter(|v| flag_slug(v).is_some()) {
+                Some(v) if repo.replace(v).is_none() => {}
+                _ => elsewhere = true,
             }
-            _ if a.strip_prefix("--match-head-commit=").is_some_and(sha) => {}
-            _ if !positional
-                && !a.starts_with('-')
-                && a.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c)) =>
-            {
-                positional = true;
+        } else if let Some(v) = a.strip_prefix("--repo=") {
+            if flag_slug(v).is_some() && repo.replace(v).is_none() {
+            } else {
+                elsewhere = true;
             }
-            _ => return false,
+        } else if a.starts_with('-') && !a.starts_with("--") && a[1..].contains('R') {
+            elsewhere = true;
         }
         i += 1;
     }
-    true
+    if elsewhere {
+        MergeFlags::Elsewhere
+    } else {
+        MergeFlags::Plain(repo)
+    }
 }
 
 /// Whether a simple command runs `gh` (also through `npx`).
@@ -460,6 +571,23 @@ impl Policy {
         repo_of: RepoOf<'_>,
         env: Inherited,
     ) -> Verdict {
+        self.decide_with_origin(action, branch_of, repo_of, &no_origin, env)
+    }
+
+    /// [`Policy::decide_with_env`] that can also read the `origin` remote of the folder's
+    /// repository (`origin_of`), so a plain merge that names that same repository by flag
+    /// (`--repo OWNER/REPO`, `--repo=OWNER/REPO`, `-R OWNER/REPO`) is lifted by a `merge`
+    /// exception like one without the flag. Another repository, an unreadable remote or no
+    /// `origin` keeps asking.
+    #[must_use]
+    pub fn decide_with_origin(
+        &self,
+        action: Action<'_>,
+        branch_of: BranchOf<'_>,
+        repo_of: RepoOf<'_>,
+        origin_of: OriginOf<'_>,
+        env: Inherited,
+    ) -> Verdict {
         // Over the cap only the first reading is made (see `matching`), and the answer is at
         // least an ask: what it cannot check, it does not allow.
         let mut best = if matches!(action, Action::Command(c) if c.len() > MAX_COMMAND_BYTES) {
@@ -473,7 +601,15 @@ impl Policy {
                 reason: None,
             }
         };
-        for (r, bash) in self.matching(action, branch_of, repo_of, env) {
+        if let Action::Command(cmd) = action {
+            if let Some(reason) = self.merge_denial(cmd, repo_of, origin_of, env) {
+                best = Verdict {
+                    decision: Decision::Deny,
+                    reason: Some(reason.into()),
+                };
+            }
+        }
+        for (r, bash) in self.matching(action, branch_of, repo_of, origin_of, env) {
             // Text that only cmd or PowerShell reads as a command (a bash quote that they do
             // not know) may be a commit message: a deny there is an ask.
             let decision = if r.decision == Decision::Deny && !bash {
@@ -496,10 +632,16 @@ impl Policy {
     /// rather than let through unchecked.
     #[must_use]
     pub fn approval_class(&self, action: Action<'_>, branch_of: BranchOf<'_>) -> Option<&Rule> {
-        self.matching(action, branch_of, &no_repo, Inherited::default())
-            .into_iter()
-            .map(|(r, _)| r)
-            .find(|r| r.class.is_some())
+        self.matching(
+            action,
+            branch_of,
+            &no_repo,
+            &no_origin,
+            Inherited::default(),
+        )
+        .into_iter()
+        .map(|(r, _)| r)
+        .find(|r| r.class.is_some())
     }
 
     fn matching(
@@ -507,6 +649,7 @@ impl Policy {
         action: Action<'_>,
         branch_of: BranchOf<'_>,
         repo_of: RepoOf<'_>,
+        origin_of: OriginOf<'_>,
         env: Inherited,
     ) -> Vec<(&Rule, bool)> {
         // Each rule with whether a bash reading of the command matched it.
@@ -567,13 +710,25 @@ impl Policy {
                                 continue;
                             }
                             if agree && r.decision == Decision::Ask && !self.exceptions.is_empty() {
-                                if let Some(class) = r.class.as_deref() {
+                                if let Some(mut class) = r.class.as_deref() {
+                                    // A rule that asks because the merge names its repository
+                                    // by flag is lifted like the merge rule, when the flag names
+                                    // the folder's own repository (checked below).
+                                    let by_flag = lone.is_some_and(|l| l.repo.is_some())
+                                        && class == "send"
+                                        && r.command
+                                            .as_deref()
+                                            .is_some_and(|c| REPO_FLAG_RULES.contains(&c));
+                                    if by_flag {
+                                        class = MERGE_CLASS;
+                                    }
                                     // Where to look for the repository, if an exception may
                                     // apply: a merge only as `lone_merge` reads it and with a
                                     // clean environment, any other class where the part runs
                                     // unless `GH_REPO` or `GH_HOST` steers a `gh` command.
                                     let hint: Option<Option<&str>> = if class == MERGE_CLASS {
                                         lone.filter(|_| !env.gh_target && !env.init_unsafe)
+                                            .map(|l| l.dir)
                                     } else if !(gh_target && runs_gh(seg)) {
                                         Some(dir.as_deref())
                                     } else {
@@ -584,7 +739,19 @@ impl Policy {
                                         continue;
                                     };
                                     let here = repo.get_or_insert_with(|| repo_of(hint));
-                                    if here.as_deref().is_some_and(|f| self.excepted(class, f)) {
+                                    // A repository named by flag must be the folder's own.
+                                    let named_ok = || {
+                                        let Some(flag) = lone.and_then(|l| l.repo) else {
+                                            return true;
+                                        };
+                                        here.as_deref()
+                                            .and_then(origin_of)
+                                            .and_then(|u| github_slug(&u))
+                                            .is_some_and(|o| Some(o) == flag_slug(flag))
+                                    };
+                                    if here.as_deref().is_some_and(|f| self.excepted(class, f))
+                                        && (class != MERGE_CLASS || named_ok())
+                                    {
                                         continue;
                                     }
                                 }
@@ -611,6 +778,43 @@ impl Policy {
             ),
         }
         out
+    }
+
+    /// Why a merge is denied (not asked) in a folder with a `merge` exception, if it is:
+    /// `--admin` bypasses branch protection, and a repository named by flag or URL other than
+    /// the folder's own `origin` is a merge somewhere else. Only the command forms of
+    /// [`merge_shape`], under the cap and with a clean environment: anything else, and every
+    /// folder without the exception, keeps what the rules say.
+    fn merge_denial(
+        &self,
+        cmd: &str,
+        repo_of: RepoOf<'_>,
+        origin_of: OriginOf<'_>,
+        env: Inherited,
+    ) -> Option<&'static str> {
+        if self.exceptions.is_empty()
+            || cmd.len() > MAX_COMMAND_BYTES
+            || env.gh_target
+            || env.init_unsafe
+        {
+            return None;
+        }
+        let (dir, words) = merge_shape(cmd)?;
+        let reason = match read_merge(&words) {
+            MergeFlags::Admin => MERGE_ADMIN_DENIED,
+            MergeFlags::Elsewhere => MERGE_ELSEWHERE_DENIED,
+            MergeFlags::Plain(None) => return None,
+            MergeFlags::Plain(Some(flag)) => {
+                let folder = repo_of(dir)?;
+                let own = origin_of(&folder).and_then(|u| github_slug(&u));
+                if own.is_some() && own == flag_slug(flag) {
+                    return None;
+                }
+                MERGE_ELSEWHERE_DENIED
+            }
+        };
+        let folder = repo_of(dir)?;
+        self.excepted(MERGE_CLASS, &folder).then_some(reason)
     }
 
     /// Whether a person lifted `class` for the repository in `folder`.
@@ -2375,6 +2579,24 @@ mod tests {
             "gh pr merge --squash 12 -d",
             "gh pr merge",
             "gh pr merge 12 --squash ",
+            "gh pr merge 7 -sd",
+            "gh pr merge 7 --auto",
+            "gh pr merge 7 --disable-auto",
+            "gh pr merge 7 -t title",
+            "gh pr merge 7 --subject title",
+            "gh pr merge 7 -b body",
+            "gh pr merge 7 -F body.md",
+            "gh pr merge 7 --squash=true",
+            "gh pr merge 7 8",
+            "gh pr merge 7,8",
+            "gh pr merge 7=x",
+            "gh pr merge 7 --match-head-commit",
+            "gh pr merge 7 --match-head-commit=",
+            "gh pr merge 7 --match-head-commit abc123",
+            "gh pr merge 7 --match-head-commit=abc123",
+            "gh pr merge 7 --match-head-commit 0123456789abcdef0123456789abcdef012345678",
+            "gh pr merge 7 --match-head-commit ghijklm",
+            "gh pr merge 7 --",
             "cd C:/Users/x/Projects/ergon && gh pr merge 3 --squash --match-head-commit 0123456789abcdef0123456789abcdef01234567",
             "cd C:/Users/x/Projects/ergon && gh pr merge 3",
             "Set-Location C:/Users/x/Projects/ergon && gh pr merge 3 --squash",
@@ -2385,44 +2607,15 @@ mod tests {
         }
         // Every other word asks: other repositories, skipping the checks, other changes.
         for cmd in [
-            "gh pr merge 12 --admin",
-            "gh pr merge 12 --squash --repo Philipjj609/Koda",
-            "gh pr merge 12 --repo=Philipjj609/Koda",
-            "gh pr merge 12 -R Philipjj609/Koda",
-            "gh pr merge 12 -RPhilipjj609/Koda",
-            "gh pr merge 12 -r",
-            "gh pr merge https://github.com/Philipjj609/Koda/pull/12 --squash",
             "gh pr --repo Philipjj609/Koda merge 12",
             "gh pr -R Philipjj609/Koda merge 12",
             // shorthand flags bundled with -R
-            "gh pr merge 7 -sR Philipjj609/Koda",
-            "gh pr merge 7 -dR Philipjj609/Koda",
-            "gh pr merge 7 -sdRPhilipjj609/Koda",
-            "gh pr merge 7 -sd",
             // a global flag before `pr`
             "gh -R Philipjj609/Koda pr merge 7",
             "gh --repo Philipjj609/Koda pr merge 7",
             "gh --repo=Philipjj609/Koda pr merge 7",
             // flags outside the list
-            "gh pr merge 7 --auto",
-            "gh pr merge 7 --disable-auto",
-            "gh pr merge 7 -t title",
-            "gh pr merge 7 --subject title",
-            "gh pr merge 7 -b body",
-            "gh pr merge 7 -F body.md",
-            "gh pr merge 7 --squash=true",
             // a second positional; a positional or commit that is not literal
-            "gh pr merge 7 8",
-            "gh pr merge 7,8",
-            "gh pr merge 7=x",
-            "gh pr merge 7 --match-head-commit",
-            "gh pr merge 7 --match-head-commit -R",
-            "gh pr merge 7 --match-head-commit=",
-            "gh pr merge 7 --match-head-commit abc123",
-            "gh pr merge 7 --match-head-commit=abc123",
-            "gh pr merge 7 --match-head-commit 0123456789abcdef0123456789abcdef012345678",
-            "gh pr merge 7 --match-head-commit ghijklm",
-            "gh pr merge 7 --",
             // not literally `gh`
             "npx gh pr merge 7",
             "gh.exe pr merge 7",
@@ -2466,11 +2659,26 @@ mod tests {
             "cd ~/Projects/ergon && gh pr merge 3",
             "cd $PWD && gh pr merge 3",
             "cd \"C:/Users/x/Projects/ergon\" && gh pr merge 3",
-            "cd /c/Users/x/Projects/ergon && gh pr merge 3 --repo=x",
             "echo x | mail a@b.c",
             "npm publish",
         ] {
             assert_eq!(decide_at(&p, &here(cmd)), Decision::Ask, "{cmd}");
+        }
+        // Where a merge exception applies, `--admin` and another repository are denied (the
+        // folder has no origin here), not asked.
+        for cmd in [
+            "gh pr merge 12 --admin",
+            "gh pr merge 12 --squash --repo Philipjj609/Koda",
+            "gh pr merge 12 --repo=Philipjj609/Koda",
+            "gh pr merge 12 -R Philipjj609/Koda",
+            "gh pr merge 12 -RPhilipjj609/Koda",
+            "gh pr merge https://github.com/Philipjj609/Koda/pull/12 --squash",
+            "gh pr merge 7 -sR Philipjj609/Koda",
+            "gh pr merge 7 -dR Philipjj609/Koda",
+            "gh pr merge 7 -sdRPhilipjj609/Koda",
+            "gh pr merge 7 --match-head-commit -R",
+        ] {
+            assert_eq!(decide_at(&p, &here(cmd)), Decision::Deny, "{cmd}");
         }
         // A plain merge in another folder asks.
         assert_eq!(
@@ -2496,6 +2704,192 @@ mod tests {
                 .and_then(|r| r.class.as_deref()),
             Some("merge")
         );
+    }
+
+    /// The decision for `cmd` in a repository whose `origin` is `origin` (`None`: no origin).
+    fn decide_with_origin_of(origin: Option<&str>, cmd: &str) -> Decision {
+        let o = |_: &str| origin.map(str::to_owned);
+        with_merge_exception()
+            .decide_with_origin(
+                Action::Command(&here(cmd)),
+                &no_branch,
+                &repo_at,
+                &o,
+                Inherited::default(),
+            )
+            .decision
+    }
+
+    #[test]
+    fn a_merge_may_name_the_folders_own_repository_by_flag() {
+        let sha = "--match-head-commit 0123456789abcdef0123456789abcdef01234567";
+        let own = Some("https://github.com/Philipjj609/ergon.git");
+        for flag in [
+            "--repo Philipjj609/ergon",
+            "--repo=Philipjj609/ergon",
+            "-R Philipjj609/ergon",
+            "--repo philipjj609/ERGON",
+            "--repo github.com/Philipjj609/ergon",
+        ] {
+            let cmd = format!("gh pr merge 47 {flag} --squash {sha}");
+            assert_eq!(decide_with_origin_of(own, &cmd), Decision::Allow, "{cmd}");
+            let cd = format!("cd C:/Users/x/Projects/ergon && {cmd}");
+            assert_eq!(decide_with_origin_of(own, &cd), Decision::Allow, "{cd}");
+        }
+        // Every common shape of the origin URL.
+        for url in [
+            "https://github.com/Philipjj609/ergon",
+            "https://github.com/Philipjj609/ergon/",
+            "https://tok@github.com/philipjj609/ergon.git",
+            "http://github.com/Philipjj609/ergon.git",
+            "git@github.com:Philipjj609/ergon.git",
+            "git@github.com:Philipjj609/ergon",
+            "ssh://git@github.com/Philipjj609/ergon.git",
+            "git://github.com/Philipjj609/ergon.git",
+            "https://GitHub.com/Philipjj609/ergon.git",
+        ] {
+            let cmd = "gh pr merge 47 --repo Philipjj609/ergon --squash";
+            assert_eq!(
+                decide_with_origin_of(Some(url), cmd),
+                Decision::Allow,
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_merge_naming_another_repository_or_skipping_checks_is_denied_where_it_is_excepted() {
+        let own = Some("git@github.com:Philipjj609/ergon.git");
+        for cmd in [
+            // another repository, another owner, a prefix or suffix of the name
+            "gh pr merge 47 --repo Philipjj609/koda --squash",
+            "gh pr merge 47 --repo OtherOwner/ergon --squash",
+            "gh pr merge 47 --repo Philipjj609/ergon2 --squash",
+            "gh pr merge 47 --repo Philipjj609/erg --squash",
+            "gh pr merge 47 -R Philipjj609/koda",
+            "gh pr merge 47 --repo=Philipjj609/koda",
+            // another host, a URL, a missing value, a malformed value, a second flag
+            "gh pr merge 47 --repo gitlab.com/Philipjj609/ergon",
+            "gh pr merge 47 --repo https://github.com/Philipjj609/ergon",
+            "gh pr merge 47 --repo",
+            "gh pr merge 47 --repo Philipjj609",
+            "gh pr merge 47 --repo Philipjj609/ergon/x",
+            "gh pr merge 47 --repo -x/ergon",
+            "gh pr merge 47 --repo Philipjj609/ergon --repo Philipjj609/ergon",
+            "gh pr merge 47 --repo Philipjj609/ergon -R Philipjj609/ergon",
+            "gh pr merge 47 -RPhilipjj609/ergon",
+            // the flag does not make other flags safe
+            "gh pr merge 47 --repo Philipjj609/ergon --admin",
+            "gh pr merge 47 --admin --repo Philipjj609/ergon",
+            "gh pr --repo Philipjj609/ergon merge 47",
+            "gh -R Philipjj609/ergon pr merge 47",
+            "gh pr merge 47 --admin",
+        ] {
+            let d = decide_with_origin_of(own, cmd);
+            assert!(matches!(d, Decision::Ask | Decision::Deny), "{cmd}: {d:?}");
+        }
+        // `--admin` and another repository are denied, not asked; the flags that only change how
+        // it merges are allowed, also next to the folder's own repository.
+        for cmd in [
+            "gh pr merge 47 --repo Philipjj609/koda --squash",
+            "gh pr merge 47 --repo OtherOwner/ergon",
+            "gh pr merge 47 --admin",
+            "gh pr merge 47 --repo Philipjj609/ergon --admin",
+            "gh pr merge 47 -sR Philipjj609/ergon",
+            "gh pr merge 47 --repo Philipjj609/ergon --repo Philipjj609/ergon",
+        ] {
+            assert_eq!(decide_with_origin_of(own, cmd), Decision::Deny, "{cmd}");
+        }
+        for cmd in [
+            "gh pr merge 47 --repo Philipjj609/ergon --auto",
+            "gh pr merge 47 --repo Philipjj609/ergon --body notes --subject title",
+        ] {
+            assert_eq!(decide_with_origin_of(own, cmd), Decision::Allow, "{cmd}");
+        }
+        // No origin, an origin on another host, an origin that is not a URL: the flag is denied.
+        for origin in [
+            None,
+            Some("https://gitlab.com/Philipjj609/ergon.git"),
+            Some("../ergon.git"),
+            Some(""),
+        ] {
+            let cmd = "gh pr merge 47 --repo Philipjj609/ergon --squash";
+            assert_eq!(
+                decide_with_origin_of(origin, cmd),
+                Decision::Deny,
+                "{origin:?}"
+            );
+        }
+        // Without an exception the folder is not trusted, whatever the flag says.
+        let o = |_: &str| own.map(str::to_owned);
+        assert_eq!(
+            policy()
+                .decide_with_origin(
+                    Action::Command("gh pr merge 47 --repo Philipjj609/ergon --squash"),
+                    &no_branch,
+                    &repo_at,
+                    &o,
+                    Inherited::default(),
+                )
+                .decision,
+            Decision::Ask
+        );
+        // `GH_REPO` or `GH_HOST` in the environment lifts nothing.
+        let env = Inherited {
+            gh_target: true,
+            init_unsafe: false,
+        };
+        assert_eq!(
+            with_merge_exception()
+                .decide_with_origin(
+                    Action::Command("gh pr merge 47 --repo Philipjj609/ergon --squash"),
+                    &no_branch,
+                    &repo_at,
+                    &o,
+                    env,
+                )
+                .decision,
+            Decision::Ask
+        );
+        // The same flag in a folder without the exception asks, even when the origin matches.
+        assert_eq!(
+            decide_with_origin_of(
+                own,
+                "cd C:/Users/x/Projects/Koda && gh pr merge 47 --repo Philipjj609/ergon"
+            ),
+            Decision::Ask
+        );
+    }
+
+    #[test]
+    fn a_github_slug_is_read_from_a_flag_and_from_a_remote_url() {
+        assert_eq!(flag_slug("Ab/c.d_e-f").as_deref(), Some("ab/c.d_e-f"));
+        assert_eq!(flag_slug("github.com/A/B").as_deref(), Some("a/b"));
+        for bad in [
+            "", "a", "a/", "/b", "a/b/c", "../b", "a/..", "-a/b", "a b/c",
+        ] {
+            assert_eq!(flag_slug(bad), None, "{bad}");
+        }
+        assert_eq!(
+            github_slug("git@github.com:A/B.git").as_deref(),
+            Some("a/b")
+        );
+        for bad in [
+            "",
+            "github.com",
+            "https://github.com/a",
+            "https://github.com/a/b/c",
+            "https://example.com/a/b.git",
+            "git@example.com:a/b.git",
+            "/srv/git/a/b.git",
+            // an `@github.com` in the path or a port is not the host
+            "https://example.org/mirror@github.com/a/b.git",
+            "https://example.org:443/x@github.com/a/b.git",
+            "https://github.com:443/a/b.git",
+            "example.org:x@github.com/a/b.git",
+        ] {
+            assert_eq!(github_slug(bad), None, "{bad}");
+        }
     }
 
     #[test]
@@ -2707,7 +3101,10 @@ mod tests {
             decide_at(&floored, "gh pr merge 12 --squash"),
             Decision::Ask
         );
-        assert_eq!(decide_at(&floored, "gh pr merge 12 --admin"), Decision::Ask);
+        assert_eq!(
+            decide_at(&floored, "gh pr merge 12 --admin"),
+            Decision::Deny
+        );
     }
 
     #[test]

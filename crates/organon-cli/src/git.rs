@@ -28,6 +28,30 @@ pub fn repo_root(dir: &Path) -> Option<String> {
         .map(|a| plain_path(&a.to_string_lossy()))
 }
 
+/// The URL git itself gives the `origin` remote of the repository (or worktree) whose root
+/// folder is `root` (`git remote get-url origin`: includes and `insteadOf` rewrites applied,
+/// which no reading of the config file by hand gets right). `None` when there is no `origin`,
+/// git is not there or fails. Variables that point git at another repository are removed.
+pub fn origin_url(root: &str) -> Option<String> {
+    let mut git = std::process::Command::new("git");
+    git.args(["-C", root, "remote", "get-url", "origin"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+    ] {
+        git.env_remove(var);
+    }
+    let out = git.output().ok().filter(|o| o.status.success())?;
+    let url = String::from_utf8(out.stdout).ok()?;
+    let url = url.trim();
+    (!url.is_empty() && !url.contains('\n')).then(|| url.to_owned())
+}
+
 /// A path without Windows' verbatim prefix (`\\?\C:\x` → `C:/x`), with forward slashes.
 fn plain_path(p: &str) -> String {
     let p = if let Some(unc) = p.strip_prefix(r"\\?\UNC\") {
@@ -241,6 +265,50 @@ fn judge_shell_file(text: &str, allowed: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    #[test]
+    fn the_origin_url_is_what_git_says() {
+        let root = std::env::temp_dir().join(format!("organon-origin-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let main = root.join("main");
+        fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        let path = |p: &Path| plain_path(&p.to_string_lossy());
+        assert_eq!(origin_url(&path(&main)), None, "no origin");
+        git(
+            &main,
+            &["remote", "add", "origin", "git@github.com:O/R.git"],
+        );
+        assert_eq!(
+            origin_url(&path(&main)).as_deref(),
+            Some("git@github.com:O/R.git")
+        );
+        // `insteadOf` rewrites are applied, as `gh` sees them.
+        git(
+            &main,
+            &[
+                "config",
+                "url.https://github.com/Other/Thing.git.insteadOf",
+                "git@github.com:O/R.git",
+            ],
+        );
+        assert_eq!(
+            origin_url(&path(&main)).as_deref(),
+            Some("https://github.com/Other/Thing.git")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn what_the_shell_inherits_is_read_from_the_environment_and_its_files() {
