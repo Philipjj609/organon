@@ -5,6 +5,7 @@
 //! agent is about to run and can be fooled by indirection (`bash -c`, scripts). The agent's own
 //! permission system stays the security boundary.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -791,7 +792,7 @@ enum Quote {
 /// The hook does not rely on this reading alone: see [`readings`].
 #[must_use]
 pub fn segments(cmd: &str) -> Vec<Vec<String>> {
-    split(cmd, BASH)
+    split(&without_heredoc_bodies(cmd), BASH)
 }
 
 /// The command split under every reading that a shell could give it: bash as the splitter
@@ -823,8 +824,10 @@ fn parse_all(cmd: &str) -> Vec<Parsed> {
 fn parse_with_raw(cmd: &str) -> (Vec<Parsed>, Vec<Vec<String>>) {
     let mut out: Vec<Parsed> = Vec::new();
     let mut raw: Vec<Vec<String>> = Vec::new();
+    // The body of a quoted heredoc is data, not commands: every reading leaves it out.
+    let text = without_heredoc_bodies(cmd);
     for syntax in [OLD, BASH, BASH_QUOTING, POWERSHELL, CMD] {
-        let s = split_full(cmd, syntax);
+        let s = split_full(&text, syntax);
         raw.extend(s.raw);
         match out.iter_mut().find(|p| p.segs == s.segs) {
             Some(p) => {
@@ -839,6 +842,285 @@ fn parse_with_raw(cmd: &str) -> (Vec<Parsed>, Vec<Vec<String>>) {
         }
     }
     (out, raw)
+}
+
+/// The most heredocs one command may have for their bodies to be left out.
+const MAX_HEREDOCS: usize = 32;
+
+/// `cmd` without the bodies of its quoted heredocs (`<<'EOF'`, `<<"EOF"`, `<<\EOF`, `<<-'EOF'`,
+/// `<<E"O"F`), up to and including their terminator line.
+///
+/// A shell never runs that text: it goes to the command's standard input as it stands, so a
+/// line in it that looks like `git branch -D foo` is data. The body of an unquoted heredoc
+/// (`<<EOF`) is expanded, so a `$(...)` or backtick in it does run: those bodies are left
+/// as they are and read as commands, as before.
+///
+/// The text is judged by a small scanner of bash's quoting, and it leaves the command as it
+/// is (so the body stays read as commands) whenever it cannot be sure: no terminator line
+/// for a heredoc, quoted or not, a `((`, a `$'...'`, an odd `${...}`, a `#` it cannot place,
+/// an unfinished quote, a heredoc whose line ends inside a nested `$(...)` or quote, or more
+/// than [`MAX_HEREDOCS`] of them. The commands before and after the heredoc, on its line and
+/// after its terminator, are read as before.
+///
+/// PowerShell and cmd have no heredoc (PowerShell refuses `<<` before running anything, and
+/// cmd runs one line of a command), so for them these bodies are not commands either.
+fn without_heredoc_bodies(cmd: &str) -> Cow<'_, str> {
+    if !cmd.contains("<<") {
+        return Cow::Borrowed(cmd);
+    }
+    match heredoc_body_ranges(cmd) {
+        Some(ranges) if !ranges.is_empty() => {
+            let mut out = String::with_capacity(cmd.len());
+            let mut at = 0;
+            for (from, to) in ranges {
+                out.push_str(&cmd[at..from]);
+                at = to;
+            }
+            out.push_str(&cmd[at..]);
+            Cow::Owned(out)
+        }
+        _ => Cow::Borrowed(cmd),
+    }
+}
+
+/// One heredoc operator waiting for the end of its line.
+struct PendingHeredoc {
+    delimiter: Vec<u8>,
+    /// `<<-`: leading tabs are dropped before a line is compared with the delimiter.
+    strip_tabs: bool,
+    /// Whether any part of the delimiter was quoted: the body is then not expanded.
+    quoted: bool,
+    /// How deep in quotes and `$(...)` the operator was (the number of open scopes).
+    level: usize,
+}
+
+/// What the scanner is inside.
+enum Scope {
+    /// Commands: the top level, or a `$(...)`. `parens` counts the `(` opened inside it;
+    /// `sub` says whether a `)` at zero ends it.
+    Commands { parens: u32, sub: bool },
+    /// A double-quoted string.
+    Quoted,
+}
+
+/// The byte ranges `[from, to)` of the quoted heredoc bodies of `cmd` (each from the start of
+/// its first line to the end of its terminator line, newline included), or `None` when the
+/// text is not one the scanner is sure of (see [`without_heredoc_bodies`]).
+fn heredoc_body_ranges(cmd: &str) -> Option<Vec<(usize, usize)>> {
+    let b = cmd.as_bytes();
+    let n = b.len();
+    let at = |k: usize| b.get(k).copied();
+    let mut scopes = vec![Scope::Commands {
+        parens: 0,
+        sub: false,
+    }];
+    let mut pending: Vec<PendingHeredoc> = Vec::new();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut seen = 0_usize;
+    let mut i = 0;
+    while i < n {
+        let c = b[i];
+        let depth = scopes.len();
+        match scopes.last_mut()? {
+            Scope::Quoted => match c {
+                b'\\' => i += 2,
+                b'"' => {
+                    scopes.pop();
+                    i += 1;
+                }
+                b'$' if at(i + 1) == Some(b'(') => {
+                    if at(i + 2) == Some(b'(') {
+                        return None;
+                    }
+                    scopes.push(Scope::Commands {
+                        parens: 0,
+                        sub: true,
+                    });
+                    i += 2;
+                }
+                b'$' if at(i + 1) == Some(b'{') => i = skip_braces(b, i)?,
+                b'`' => i = skip_backticks(b, i)?,
+                _ => i += 1,
+            },
+            Scope::Commands { parens, sub } => match c {
+                b'\\' => i += 2,
+                b'\'' => i = i + 2 + b[i + 1..].iter().position(|&x| x == b'\'')?,
+                b'"' => {
+                    scopes.push(Scope::Quoted);
+                    i += 1;
+                }
+                b'`' => i = skip_backticks(b, i)?,
+                b'$' => match at(i + 1) {
+                    Some(b'\'') => return None,
+                    Some(b'(') => {
+                        if at(i + 2) == Some(b'(') {
+                            return None;
+                        }
+                        scopes.push(Scope::Commands {
+                            parens: 0,
+                            sub: true,
+                        });
+                        i += 2;
+                    }
+                    Some(b'{') => i = skip_braces(b, i)?,
+                    Some(b'$') => i += 2,
+                    _ => i += 1,
+                },
+                b'(' => {
+                    if at(i + 1) == Some(b'(') {
+                        return None;
+                    }
+                    *parens += 1;
+                    i += 1;
+                }
+                b')' => {
+                    if *parens > 0 {
+                        *parens -= 1;
+                    } else if *sub {
+                        // A heredoc must not outlive the `$(...)` it was opened in.
+                        if pending.iter().any(|h| h.level == depth) {
+                            return None;
+                        }
+                        scopes.pop();
+                    }
+                    i += 1;
+                }
+                b'#' => {
+                    let prev = if i == 0 { b'\n' } else { b[i - 1] };
+                    match prev {
+                        b'<' | b'>' => return None,
+                        b' ' | b'\t' if i >= 2 && b[i - 2] == b'\\' => return None,
+                        b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' => {
+                            // A comment: to the end of the line.
+                            i += b[i..].iter().position(|&x| x == b'\n').unwrap_or(n - i);
+                        }
+                        _ => i += 1,
+                    }
+                }
+                b'\n' if !pending.is_empty() => {
+                    if pending.iter().any(|h| h.level != depth) {
+                        return None;
+                    }
+                    let mut pos = i + 1;
+                    for h in pending.drain(..) {
+                        let start = pos;
+                        loop {
+                            if pos >= n {
+                                return None; // no terminator: not a heredoc we can read
+                            }
+                            let end = b[pos..]
+                                .iter()
+                                .position(|&x| x == b'\n')
+                                .map_or(n, |k| pos + k);
+                            let mut line = &b[pos..end];
+                            if h.strip_tabs {
+                                while let [b'\t', rest @ ..] = line {
+                                    line = rest;
+                                }
+                            }
+                            pos = (end + 1).min(n);
+                            if line == h.delimiter.as_slice() {
+                                break;
+                            }
+                        }
+                        if h.quoted {
+                            ranges.push((start, pos));
+                        }
+                    }
+                    i = pos;
+                }
+                b'<' if at(i + 1) == Some(b'<') => {
+                    if at(i + 2) == Some(b'<') {
+                        i += 3; // `<<<`, a here-string
+                        continue;
+                    }
+                    seen += 1;
+                    if seen > MAX_HEREDOCS {
+                        return None;
+                    }
+                    let (heredoc, next) = heredoc_operator(b, i + 2, depth)?;
+                    pending.push(heredoc);
+                    i = next;
+                }
+                _ => i += 1,
+            },
+        }
+    }
+    Some(ranges)
+}
+
+/// The heredoc whose delimiter starts at `from` (after `<<`), and where the scan goes on.
+fn heredoc_operator(b: &[u8], from: usize, level: usize) -> Option<(PendingHeredoc, usize)> {
+    let mut j = from;
+    let strip_tabs = b.get(j) == Some(&b'-');
+    if strip_tabs {
+        j += 1;
+    }
+    while matches!(b.get(j), Some(b' ' | b'\t')) {
+        j += 1;
+    }
+    let mut delimiter = Vec::new();
+    let mut quoted = false;
+    while let Some(&c) = b.get(j) {
+        match c {
+            b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')' => break,
+            b'\'' | b'"' => {
+                let close = j + 1 + b[j + 1..].iter().position(|&x| x == c)?;
+                let inner = &b[j + 1..close];
+                if c == b'"' && inner.iter().any(|x| matches!(x, b'\\' | b'$' | b'`')) {
+                    return None;
+                }
+                quoted = true;
+                delimiter.extend_from_slice(inner);
+                j = close + 1;
+            }
+            b'\\' => {
+                let next = *b.get(j + 1).filter(|&&x| x != b'\n')?;
+                quoted = true;
+                delimiter.push(next);
+                j += 2;
+            }
+            b'$' | b'`' => return None,
+            _ => {
+                delimiter.push(c);
+                j += 1;
+            }
+        }
+    }
+    if delimiter.is_empty() {
+        return None;
+    }
+    Some((
+        PendingHeredoc {
+            delimiter,
+            strip_tabs,
+            quoted,
+            level,
+        },
+        j,
+    ))
+}
+
+/// After the `${` at `b[i]`: the index after its `}`; `None` for anything but plain text in it.
+fn skip_braces(b: &[u8], i: usize) -> Option<usize> {
+    let close = i + 2 + b[i + 2..].iter().position(|&x| x == b'}')?;
+    let plain = !b[i + 2..close]
+        .iter()
+        .any(|x| matches!(x, b'\'' | b'"' | b'`' | b'\\' | b'{' | b'(' | b'\n'));
+    plain.then_some(close + 1)
+}
+
+/// After the backtick at `b[i]`: the index after the one that closes it.
+fn skip_backticks(b: &[u8], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    while j < b.len() {
+        match b[j] {
+            b'\\' => j += 2,
+            b'`' => return Some(j + 1),
+            _ => j += 1,
+        }
+    }
+    None
 }
 
 fn split(cmd: &str, sh: Syntax) -> Vec<Vec<String>> {
@@ -2931,6 +3213,154 @@ mod tests {
         for n in ["VERCEL_PLUGIN_SETUP_MODE", "FOO", "MY_TOOL"] {
             assert!(!env_name_barred(n), "{n}");
         }
+    }
+
+    // ---- heredoc bodies
+
+    /// A quoted heredoc's body is data: a forced branch delete written in it is not run.
+    #[test]
+    fn the_body_of_a_quoted_heredoc_is_data_not_commands() {
+        // The original false positive: a note that mentions a forced branch delete.
+        let note = "cat > notes.md <<'EOF'\nTo clean up, run `git branch -D foo` by hand.\ngit branch -D foo\nEOF";
+        assert_eq!(decide(note), Decision::Allow, "{note}");
+        for cmd in [
+            "cat > f <<'EOF'\ngit branch -D foo\nEOF\n",
+            "cat > f <<\"EOF\"\ngit branch -D foo\nEOF\n",
+            "cat > f <<\\EOF\ngit branch -D foo\nEOF\n",
+            // Partly quoted: the delimiter is EOF and the body is not expanded.
+            "cat > f <<E\"O\"F\ngit branch -D foo\nEOF\n",
+            "cat > f <<'E'OF\ngit branch -D foo\nEOF\n",
+            "cat > f << 'EOF'\ngit branch -D foo\nEOF\n",
+            "cat > f 0<<'EOF'\ngit branch -D foo\nEOF\n",
+            // `<<-` drops leading tabs before it compares a line with the delimiter.
+            "cat > f <<-'EOF'\n\tgit branch -D foo\n\t\tEOF\n",
+            "cat > f <<-\"EOF\"\n\tgit branch -D foo\nEOF\n",
+            // Text that looks like a terminator but is not one.
+            "cat > f <<'EOF'\nEOF2\n EOF\ngit branch -D foo\nEOF\n",
+            // No newline after the terminator at the end of the text.
+            "cat > f <<'EOF'\ngit branch -D foo\nEOF",
+            // Two heredocs on one line, bodies in order.
+            "cat <<'A' <<'B'\ngit branch -D foo\nA\ngit branch -D bar\nB\n",
+            // The same, in a subshell and in a command substitution.
+            "x=$(cat <<'EOF'\ngit branch -D foo\nEOF\n)",
+            "(cat <<'EOF'\ngit branch -D foo\nEOF\n)",
+            // Comments and quotes before it do not confuse the scanner.
+            "# it's a note\ncat > f <<'EOF'\ngit branch -D foo\nEOF\n",
+            "echo \"it's $(date) ${HOME}\" && cat > f <<'EOF'\ngit branch -D foo\nEOF\n",
+        ] {
+            assert_eq!(decide(cmd), Decision::Allow, "{cmd:?}");
+        }
+        // Every reading, PowerShell's and cmd's included, leaves the body out.
+        let cmd = "cat > f <<'EOF'\ngit push origin main\nEOF\necho done";
+        for r in readings(cmd) {
+            assert_eq!(r.len(), 2, "{r:?}");
+            assert_eq!(r[1], ["echo", "done"], "{r:?}");
+        }
+        assert_eq!(segments(cmd).len(), 2);
+    }
+
+    /// What a heredoc does not hide: the commands around it, and anything a shell would run.
+    #[test]
+    fn the_commands_around_a_quoted_heredoc_are_still_judged() {
+        for cmd in [
+            // After the terminator.
+            "cat > f <<'EOF'\nhello\nEOF\ngit branch -D foo\n",
+            "cat > f <<'EOF'\nhello\nEOF\ngit branch -D foo",
+            "cat > f <<'EOF'\nEOF\ngit branch -D foo\n",
+            "cat <<'A' <<'B'\nx\nA\ny\nB\ngit branch -D foo",
+            // Before it, and on its own line.
+            "git branch -D foo && cat > f <<'EOF'\nhello\nEOF\n",
+            "cat > f <<'EOF' && git branch -D foo\nhello\nEOF\n",
+            "cat > f <<'EOF'; git branch -D foo\nhello\nEOF\n",
+            "cat <<'EOF' | git branch -D foo\nhello\nEOF\n",
+            "cat > f <<'EOF'\nhello\nEOF\necho ok; git branch -D foo",
+            "x=$(cat <<'EOF'\nhello\nEOF\n); git branch -D foo",
+            // A terminator that is not one (trailing space, wrong case, indented without `-`).
+            "cat <<'EOF'\nhello\nEOF \nEOF\ngit branch -D foo",
+            "cat <<'EOF'\nhello\neof\nEOF\ngit branch -D foo",
+            "cat <<'EOF'\nhello\n\tEOF\nEOF\ngit branch -D foo",
+            // The first heredoc ends at its own terminator, so what follows it is not its body.
+            "cat <<'A' <<'B'\nx\nA\ny\nB\ngit branch -D foo\n",
+        ] {
+            assert_eq!(decide(cmd), Decision::Ask, "{cmd:?}");
+        }
+    }
+
+    /// Unquoted: the body is expanded, so a substitution in it runs. Unquoted bodies are
+    /// read as commands, exactly as before.
+    #[test]
+    fn the_body_of_an_unquoted_heredoc_is_still_read_as_commands() {
+        for cmd in [
+            "cat > f <<EOF\n$(git branch -D foo)\nEOF\n",
+            "cat > f <<EOF\n`git branch -D foo`\nEOF\n",
+            "cat > f <<EOF\ngit branch -D foo\nEOF\n",
+            "cat > f <<-EOF\n\t$(git branch -D foo)\n\tEOF\n",
+            "cat > f <<EOF\nok\nEOF\ngit branch -D foo\n",
+            // A quoted-looking operator inside an unquoted body is body text, not an operator:
+            // the line after the terminator still runs.
+            "cat <<EOF\n$(git branch -D foo)\ncat <<'X'\nEOF\ngit branch -D bar\nX\n",
+            "cat <<EOF\nok\ncat <<'X'\nEOF\ngit branch -D bar\nX\n",
+        ] {
+            assert_eq!(decide(cmd), Decision::Ask, "{cmd:?}");
+        }
+        assert_eq!(decide("cat > f <<EOF\nhello $HOME\nEOF\n"), Decision::Allow);
+    }
+
+    /// A heredoc the scanner cannot read to its end, or doubts, hides nothing.
+    #[test]
+    fn a_heredoc_without_a_terminator_or_that_is_doubtful_fails_closed() {
+        for cmd in [
+            // No terminator at all.
+            "cat > f <<'EOF'\ngit branch -D foo\n",
+            "cat > f <<'EOF'\ngit branch -D foo",
+            "cat > f <<-'EOF'\n\tgit branch -D foo\n",
+            // The first has one, the second has none.
+            "cat <<'A' <<'B'\nx\nA\ngit branch -D foo\n",
+            // A terminator carrying a carriage return is not the delimiter.
+            "cat > f <<'EOF'\r\ngit branch -D foo\r\nEOF\r\n",
+            // Not heredocs: here-strings, shifts, comments, quotes, an empty delimiter.
+            "cat <<<'EOF'\ngit branch -D foo\nEOF\n",
+            "echo $((1 <<'EOF'))\ngit branch -D foo\nEOF\n",
+            "(( x = 1 <<'EOF' ))\ngit branch -D foo\nEOF\n",
+            "echo hi # <<'EOF'\ngit branch -D foo\nEOF\n",
+            "echo '<<'EOF\ngit branch -D foo\nEOF\n",
+            "echo \"<<'EOF'\"\ngit branch -D foo\nEOF\n",
+            "echo \\<<'EOF'\ngit branch -D foo\nEOF\n",
+            "cat <<''\ngit branch -D foo\n\n",
+            // A delimiter with an expansion in it, or $'...' anywhere.
+            "cat <<'E'$X\ngit branch -D foo\nE$X\n",
+            "echo $'a\\'b'; cat <<'EOF'\ngit branch -D foo\nEOF\n",
+            // The line ends inside a nested scope.
+            "cat <<'EOF' \"$(echo\nx)\"\ngit branch -D foo\nEOF\n",
+            "x=$(cat <<'EOF')\ngit branch -D foo\nEOF\n",
+        ] {
+            assert_eq!(decide(cmd), Decision::Ask, "{cmd:?}");
+        }
+        // Too many heredocs to track: none is hidden.
+        let mut cmd = "cat <<'E' ".repeat(MAX_HEREDOCS + 1);
+        cmd.push('\n');
+        cmd.push_str(&"E\n".repeat(MAX_HEREDOCS + 1));
+        cmd.push_str("git branch -D foo\n");
+        assert_eq!(decide(&cmd), Decision::Ask);
+        let mut inner = "cat <<'E' ".repeat(MAX_HEREDOCS + 1);
+        inner.push_str("\ngit branch -D foo\n");
+        inner.push_str(&"E\n".repeat(MAX_HEREDOCS + 1));
+        assert_eq!(decide(&inner), Decision::Ask);
+    }
+
+    /// A quoted heredoc's body is left out for every part of the policy, not only `ask`.
+    #[test]
+    fn a_quoted_heredoc_body_does_not_hide_a_deny_either() {
+        let body = "gh repo delete x";
+        assert_ne!(decide(body), Decision::Allow);
+        assert_eq!(
+            decide(&format!("cat > f <<'EOF'\n{body}\nEOF\n")),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(&format!("cat > f <<'EOF'\nhi\nEOF\n{body}\n")),
+            decide(body)
+        );
     }
 
     #[test]

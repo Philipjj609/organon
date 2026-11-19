@@ -429,6 +429,22 @@ fn a_slow_hook_denies_approval_class_actions_at_its_deadline() {
 
 // ------------------------------------------------------------ 2. ask rules
 
+/// The body of a quoted heredoc is text for the file it writes, not commands: a note that
+/// mentions a forced branch delete is not an ask. The commands around the heredoc still are.
+#[test]
+fn a_quoted_heredoc_body_is_not_judged_as_commands() {
+    let e = env("heredoc-body");
+    let quoted =
+        "cat > notes.md <<'EOF'\nTo clean up run `git branch -D foo`\ngit branch -D foo\nEOF\n";
+    assert_eq!(e.hook("Bash", &command(quoted)), "");
+    let after = format!("{quoted}git branch -D foo\n");
+    assert!(is_ask(&e.hook("Bash", &command(&after))));
+    let unquoted = "cat > notes.md <<EOF\n$(git branch -D foo)\nEOF\n";
+    assert!(is_ask(&e.hook("Bash", &command(unquoted))));
+    let unterminated = "cat > notes.md <<'EOF'\ngit branch -D foo\n";
+    assert!(is_ask(&e.hook("Bash", &command(unterminated))));
+}
+
 #[test]
 fn pushes_to_main_deploys_and_sends_ask() {
     let e = env("ask-rules");
