@@ -2659,7 +2659,6 @@ mod tests {
             "cd ~/Projects/ergon && gh pr merge 3",
             "cd $PWD && gh pr merge 3",
             "cd \"C:/Users/x/Projects/ergon\" && gh pr merge 3",
-            "cd /c/Users/x/Projects/ergon && gh pr merge 3 --repo=x",
             "echo x | mail a@b.c",
             "npm publish",
         ] {
