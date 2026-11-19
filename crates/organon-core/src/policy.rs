@@ -909,11 +909,53 @@ const DATA_READERS: &[&str] = &[
 
 /// The text of the simple command that ends at `at`: from the last separator before it.
 fn command_before(b: &[u8], at: usize) -> String {
-    let start = b[..at]
+    let line = b[..at]
         .iter()
-        .rposition(|x| matches!(x, b'\n' | b';' | b'&' | b'|' | b'(' | b'`'))
+        .rposition(|&x| x == b'\n')
         .map_or(0, |k| k + 1);
-    String::from_utf8_lossy(&b[start..at]).into_owned()
+    let mut start = line;
+    // The quotes and `$(...)` open at `i`: a separator inside a quote does not end a command.
+    let mut stack = vec![b'c'];
+    let mut i = line;
+    while i < at {
+        let c = b[i];
+        match stack.last().copied().unwrap_or(b'c') {
+            b'\'' => {
+                if c == b'\'' {
+                    stack.pop();
+                }
+            }
+            b'"' => match c {
+                b'\\' => i += 1,
+                b'"' => {
+                    stack.pop();
+                }
+                b'$' if b.get(i + 1) == Some(&b'(') => {
+                    stack.push(b'$');
+                    i += 1;
+                    start = i + 1;
+                }
+                _ => {}
+            },
+            mode => match c {
+                b'\\' => i += 1,
+                b'\'' | b'"' => stack.push(c),
+                b'$' if b.get(i + 1) == Some(&b'(') => {
+                    stack.push(b'$');
+                    i += 1;
+                    start = i + 1;
+                }
+                b')' if mode == b'$' => {
+                    stack.pop();
+                    start = i + 1;
+                }
+                b';' | b'&' | b'|' | b'(' | b'`' | b')' => start = i + 1,
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&b[start.min(at)..at]).into_owned()
 }
 
 /// The first word of a simple command that is not a `NAME=value` assignment.
@@ -970,7 +1012,21 @@ fn feeds_only_data(b: &[u8], at: usize, rest: usize, opens: &[usize]) -> bool {
     {
         return false;
     }
-    reads_data(&command_before(b, at))
+    // What follows the operator on its line is read with the command: `git <<'EOF' -c alias.x=!sh`.
+    let whole = format!(
+        "{} {}",
+        command_before(b, at),
+        String::from_utf8_lossy(&b[rest..line_end])
+    );
+    // A heredoc inside `$(...)` that is only assigned (`x=$(cat <<'EOF'`) may be run later
+    // through the variable, so no `$` may follow it.
+    let assigned = opens
+        .iter()
+        .any(|&open| command_word(&command_before(b, open)).is_none());
+    if assigned && b[rest..].contains(&b'$') {
+        return false;
+    }
+    reads_data(&whole)
         && opens.iter().all(|&open| {
             let outer = command_before(b, open);
             command_word(&outer).is_none() || reads_data(&outer)
@@ -979,9 +1035,13 @@ fn feeds_only_data(b: &[u8], at: usize, rest: usize, opens: &[usize]) -> bool {
 
 /// What the scanner is inside.
 enum Scope {
-    /// Commands: the top level, or a `$(...)`. `parens` counts the `(` opened inside it;
-    /// `sub` says whether a `)` at zero ends it.
-    Commands { parens: u32, sub: bool, open: usize },
+    /// Commands: the top level, or a `$(...)`. `parens` has one entry per `(` opened inside it
+    /// (`true` for a process substitution); `sub` says whether a `)` with none open ends it.
+    Commands {
+        parens: Vec<bool>,
+        sub: bool,
+        open: usize,
+    },
     /// A double-quoted string.
     Quoted,
 }
@@ -994,7 +1054,7 @@ fn heredoc_body_ranges(cmd: &str) -> Option<Vec<(usize, usize)>> {
     let n = b.len();
     let at = |k: usize| b.get(k).copied();
     let mut scopes = vec![Scope::Commands {
-        parens: 0,
+        parens: Vec::new(),
         sub: false,
         open: 0,
     }];
@@ -1017,7 +1077,7 @@ fn heredoc_body_ranges(cmd: &str) -> Option<Vec<(usize, usize)>> {
                         return None;
                     }
                     scopes.push(Scope::Commands {
-                        parens: 0,
+                        parens: Vec::new(),
                         sub: true,
                         open: i,
                     });
@@ -1042,7 +1102,7 @@ fn heredoc_body_ranges(cmd: &str) -> Option<Vec<(usize, usize)>> {
                             return None;
                         }
                         scopes.push(Scope::Commands {
-                            parens: 0,
+                            parens: Vec::new(),
                             sub: true,
                             open: i,
                         });
@@ -1056,13 +1116,12 @@ fn heredoc_body_ranges(cmd: &str) -> Option<Vec<(usize, usize)>> {
                     if at(i + 1) == Some(b'(') {
                         return None;
                     }
-                    *parens += 1;
+                    // A `(` right after `<` or `>` opens a process substitution.
+                    parens.push(i > 0 && matches!(b[i - 1], b'<' | b'>'));
                     i += 1;
                 }
                 b')' => {
-                    if *parens > 0 {
-                        *parens -= 1;
-                    } else if *sub {
+                    if parens.pop().is_none() && *sub {
                         // A heredoc must not outlive the `$(...)` it was opened in.
                         if pending.iter().any(|h| h.level == depth) {
                             return None;
@@ -1140,7 +1199,18 @@ fn heredoc_body_ranges(cmd: &str) -> Option<Vec<(usize, usize)>> {
                                 _ => None,
                             })
                             .collect();
-                        feeds_only_data(b, i, next, &opens)
+                        // Inside a subshell or a process substitution (`(cat <<'EOF'`,
+                        // `bash <(`, on this line or an earlier one) the body goes to whatever
+                        // reads the group.
+                        let groups = scopes.iter().flat_map(|s| match s {
+                            Scope::Commands { parens, .. } => parens.as_slice(),
+                            Scope::Quoted => &[],
+                        });
+                        let procsub = groups.clone().any(|&p| p);
+                        // A plain subshell may be piped on after its `)`: any `|` later on
+                        // keeps the body read as commands.
+                        let piped = groups.count() > 0 && b[next..].contains(&b'|');
+                        !procsub && !piped && feeds_only_data(b, i, next, &opens)
                     };
                     pending.push(heredoc);
                     i = next;
@@ -3536,6 +3606,20 @@ mod tests {
             "cat <<'EOF' > >(eval \"$(cat)\")\ngit branch -D foo\nEOF\n",
             "cat <<'EOF' > >(source /dev/stdin)\ngit branch -D foo\nEOF\n",
             "tee >(bash) <<'EOF'\ngit branch -D foo\nEOF\n",
+        ] {
+            assert_eq!(decide(cmd), run, "{cmd:?}");
+        }
+        // Round 4 (Codex): a subshell or substitution opened on an earlier line, a variable
+        // run later, a configuration after the operator, a quoted separator before it.
+        for cmd in [
+            "(cat <<'EOF'\ngit branch -D foo\nEOF\n) | bash",
+            "bash <(\ncat <<'EOF'\ngit branch -D foo\nEOF\n)",
+            "x=$(cat <<'EOF'\ngit branch -D foo\nEOF\n)\neval \"$x\"",
+            "x=$(cat <<'EOF'\ngit branch -D foo\nEOF\n); sh -c \"$x\"",
+            "git <<'EOF' -c alias.x='!bash' x\ngit branch -D foo\nEOF\n",
+            "git <<'EOF' -c core.pager=bash log\ngit branch -D foo\nEOF\n",
+            "bash -s 'ignored; cat ' <<'EOF'\ngit branch -D foo\nEOF\n",
+            "bash -s \"a | cat \" <<'EOF'\ngit branch -D foo\nEOF\n",
         ] {
             assert_eq!(decide(cmd), run, "{cmd:?}");
         }
