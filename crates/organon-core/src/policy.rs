@@ -855,6 +855,9 @@ const MAX_HEREDOCS: usize = 32;
 /// (`<<EOF`) is expanded, so a `$(...)` or backtick in it does run: those bodies are left
 /// as they are and read as commands, as before.
 ///
+/// Only a body that feeds a command that reads data (`cat`, `tee`, `git`, `gh`, `sed`, `grep`...)
+/// and is not piped on (`cat <<'EOF' | bash`) is left out: `bash <<'EOF'` runs its body.
+///
 /// The text is judged by a small scanner of bash's quoting, and it leaves the command as it
 /// is (so the body stays read as commands) whenever it cannot be sure: no terminator line
 /// for a heredoc, quoted or not, a `((`, a `$'...'`, an odd `${...}`, a `#` it cannot place,
@@ -892,6 +895,43 @@ struct PendingHeredoc {
     quoted: bool,
     /// How deep in quotes and `$(...)` the operator was (the number of open scopes).
     level: usize,
+    /// Whether the body may be left out: it is quoted and the command it feeds only reads
+    /// data (see [`feeds_only_data`]).
+    drop: bool,
+}
+
+/// Programs whose standard input is data, never commands. A heredoc that feeds anything else
+/// (`bash`, `sh`, `python`, `ssh`, `xargs`, `eval`...) has a body that may be run, so it stays
+/// read as commands.
+const DATA_READERS: &[&str] = &[
+    "cat", "tee", "git", "gh", "sed", "grep", "head", "tail", "wc", "sort", "jq", "tr", "cut",
+];
+
+/// Whether the heredoc operator at `b[at]` feeds a command that only reads data: the first
+/// word of its simple command (after `NAME=value` assignments) is in [`DATA_READERS`], and
+/// nothing on the rest of its line (from `rest`) pipes the input on (`cat <<'EOF' | sh`).
+fn feeds_only_data(b: &[u8], at: usize, rest: usize) -> bool {
+    let start = b[..at]
+        .iter()
+        .rposition(|x| matches!(x, b'\n' | b';' | b'&' | b'|' | b'(' | b'`'))
+        .map_or(0, |k| k + 1);
+    let line_end = b[rest..]
+        .iter()
+        .position(|&x| x == b'\n')
+        .map_or(b.len(), |k| rest + k);
+    if b[rest..line_end].contains(&b'|') {
+        return false;
+    }
+    let prefix = String::from_utf8_lossy(&b[start..at]);
+    let Some(word) = prefix
+        .split_ascii_whitespace()
+        .find(|w| !(w.contains('=') && !w.starts_with('=')))
+    else {
+        return false;
+    };
+    let name = word.rsplit('/').next().unwrap_or(word).to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    DATA_READERS.contains(&name)
 }
 
 /// What the scanner is inside.
@@ -1019,11 +1059,16 @@ fn heredoc_body_ranges(cmd: &str) -> Option<Vec<(usize, usize)>> {
                                 }
                             }
                             pos = (end + 1).min(n);
+                            // In an unquoted body bash joins a line ending in `\` with the
+                            // next one before it looks for the terminator: not read here.
+                            if !h.quoted && line.ends_with(b"\\") {
+                                return None;
+                            }
                             if line == h.delimiter.as_slice() {
                                 break;
                             }
                         }
-                        if h.quoted {
+                        if h.drop {
                             ranges.push((start, pos));
                         }
                     }
@@ -1038,7 +1083,8 @@ fn heredoc_body_ranges(cmd: &str) -> Option<Vec<(usize, usize)>> {
                     if seen > MAX_HEREDOCS {
                         return None;
                     }
-                    let (heredoc, next) = heredoc_operator(b, i + 2, depth)?;
+                    let (mut heredoc, next) = heredoc_operator(b, i + 2, depth)?;
+                    heredoc.drop = heredoc.quoted && feeds_only_data(b, i, next);
                     pending.push(heredoc);
                     i = next;
                 }
@@ -1096,6 +1142,7 @@ fn heredoc_operator(b: &[u8], from: usize, level: usize) -> Option<(PendingHered
             strip_tabs,
             quoted,
             level,
+            drop: false,
         },
         j,
     ))
@@ -3361,6 +3408,41 @@ mod tests {
             decide(&format!("cat > f <<'EOF'\nhi\nEOF\n{body}\n")),
             decide(body)
         );
+    }
+
+    /// Found by review: a heredoc body that a shell, an interpreter or a pipe may run is not
+    /// data, and a continued terminator line in an unquoted body shifts where bodies end.
+    #[test]
+    fn a_heredoc_body_that_may_be_run_is_still_read_as_commands() {
+        let run = decide("git branch -D foo");
+        assert_ne!(run, Decision::Allow);
+        for cmd in [
+            "bash <<'EOF'\ngit branch -D foo\nEOF\n",
+            "sh -s <<'EOF'\ngit branch -D foo\nEOF\n",
+            "python3 - <<'EOF'\ngit branch -D foo\nEOF\n",
+            "ssh host <<'EOF'\ngit branch -D foo\nEOF\n",
+            "xargs -0 <<'EOF'\ngit branch -D foo\nEOF\n",
+            "eval \"$(cat)\" <<'EOF'\ngit branch -D foo\nEOF\n",
+            "cat <<'EOF' | bash\ngit branch -D foo\nEOF\n",
+            "cat <<'EOF' | sh -s\ngit branch -D foo\nEOF\n",
+            "cat <<'EOF'|bash\ngit branch -D foo\nEOF\n",
+            "<<'EOF'\ngit branch -D foo\nEOF\n",
+            // a continued terminator in an unquoted body (found by Codex)
+            "cat <<true <<':'\ntrue\\\n\n:\ntrue\ngit branch -D foo\n:\n",
+            "cat <<EOF <<'EOF2'\nEOF\\\nEOF\ngit branch -D foo\nEOF2\n",
+        ] {
+            assert_eq!(decide(cmd), run, "{cmd:?}");
+        }
+        // Data readers still have their body left out.
+        for cmd in [
+            "cat > f <<'EOF'\ngit branch -D foo\nEOF\n",
+            "git commit -F - <<'EOF'\ngit branch -D foo\nEOF\n",
+            "GIT_X=1 git commit -F - <<'EOF'\ngit branch -D foo\nEOF\n",
+            "gh pr create --body-file - <<'EOF'\ngit branch -D foo\nEOF\n",
+            "tee f <<'EOF'\ngit branch -D foo\nEOF\n",
+        ] {
+            assert_eq!(decide(cmd), Decision::Allow, "{cmd:?}");
+        }
     }
 
     #[test]
