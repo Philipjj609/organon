@@ -1,0 +1,807 @@
+{
+  "efforts": {
+    "lookup": {
+      "usd": 1.0,
+      "minutes": 15
+    },
+    "compare": {
+      "usd": 5.0,
+      "minutes": 60
+    },
+    "deep": {
+      "usd": 15.0,
+      "minutes": 180
+    }
+  },
+  "routes": {
+    "check": {
+      "tier": "tool",
+      "why": "Deterministic checks first: quote verification, digest validation, conformance. They are the external feedback models lack."
+    },
+    "scan": {
+      "tier": "cheap",
+      "model": "claude-haiku-5-5",
+      "why": "Reading many things to keep what matters."
+    },
+    "extract": {
+      "tier": "cheap",
+      "model": "claude-haiku-5-5",
+      "why": "Pulling fields or passages out of text already found."
+    },
+    "verify": {
+      "tier": "cheap",
+      "model": "claude-haiku-5-5",
+      "why": "A different model than the producer: evaluators favour their own outputs."
+    },
+    "plan": {
+      "tier": "strong",
+      "model": "claude-opus-5-5",
+      "why": "Deciding what to do and what it is worth."
+    },
+    "judge": {
+      "tier": "strong",
+      "model": "claude-opus-5-5",
+      "why": "Weighing contested evidence; final calls."
+    },
+    "write": {
+      "tier": "strong",
+      "model": "claude-opus-5-5",
+      "why": "Synthesis that enters memory or reaches a person."
+    },
+    "code": {
+      "tier": "strong",
+      "model": "claude-opus-5-5",
+      "why": "Changing code that others will run."
+    }
+  },
+  "rules": [
+    {
+      "command": "* > *log.jsonl",
+      "decision": "deny",
+      "reason": "memory/log.jsonl is append-only and written only by the memory (mneme invariant 1). Fix mistakes with retract or a superseding claim."
+    },
+    {
+      "command": "* >> *log.jsonl",
+      "decision": "deny",
+      "reason": "memory/log.jsonl is written only by the memory: interpretation enters through digest (mneme invariants 1 and 3)."
+    },
+    {
+      "command": "sed -i* *log.jsonl",
+      "decision": "deny",
+      "reason": "memory/log.jsonl is append-only (mneme invariant 1)."
+    },
+    {
+      "path": "*memory/log.jsonl",
+      "decision": "deny",
+      "reason": "memory/log.jsonl is append-only and written only by the memory (mneme invariant 1). Fix mistakes with retract or a superseding claim."
+    },
+    {
+      "path": "*/projections/graph.json",
+      "decision": "deny",
+      "reason": "Projections are generated: change the memory and run `mneme build` (mneme invariant 2)."
+    },
+    {
+      "path": "*/projections/view.html",
+      "decision": "deny",
+      "reason": "Projections are generated: change the memory and run `mneme build` (mneme invariant 2)."
+    },
+    {
+      "path": "*/projections/wiki/*",
+      "decision": "deny",
+      "reason": "Projections are generated: change the memory and run `mneme build` (mneme invariant 2)."
+    },
+    {
+      "command": "git push",
+      "rewrites": [
+        "main",
+        "master",
+        "production"
+      ],
+      "decision": "ask",
+      "class": "destroy",
+      "reason": "Rewrites or deletes main, master or production on the remote: git cannot undo that for everyone. Philip's line: deletes that can't be undone."
+    },
+    {
+      "command": "gh api -X DELETE",
+      "decision": "ask",
+      "class": "destroy",
+      "reason": "Deletes a repository, project or cloud resource: nothing undoes it. Philip's line: deletes that can't be undone."
+    },
+    {
+      "command": "gh api -XDELETE",
+      "decision": "ask",
+      "class": "destroy",
+      "reason": "Deletes a repository, project or cloud resource: nothing undoes it. Philip's line: deletes that can't be undone."
+    },
+    {
+      "command": "gh api --method DELETE",
+      "decision": "ask",
+      "class": "destroy",
+      "reason": "Deletes a repository, project or cloud resource: nothing undoes it. Philip's line: deletes that can't be undone."
+    },
+    {
+      "command": "vercel remove",
+      "decision": "ask",
+      "class": "destroy",
+      "reason": "Deletes a repository, project or cloud resource: nothing undoes it. Philip's line: deletes that can't be undone."
+    },
+    {
+      "command": "vercel rm",
+      "decision": "ask",
+      "class": "destroy",
+      "reason": "Deletes a repository, project or cloud resource: nothing undoes it. Philip's line: deletes that can't be undone."
+    },
+    {
+      "command": "vercel project rm",
+      "decision": "ask",
+      "class": "destroy",
+      "reason": "Deletes a repository, project or cloud resource: nothing undoes it. Philip's line: deletes that can't be undone."
+    },
+    {
+      "command": "vercel projects rm",
+      "decision": "ask",
+      "class": "destroy",
+      "reason": "Deletes a repository, project or cloud resource: nothing undoes it. Philip's line: deletes that can't be undone."
+    },
+    {
+      "command": "wrangler delete",
+      "decision": "ask",
+      "class": "destroy",
+      "reason": "Deletes a repository, project or cloud resource: nothing undoes it. Philip's line: deletes that can't be undone."
+    },
+    {
+      "command": "wrangler pages project delete",
+      "decision": "ask",
+      "class": "destroy",
+      "reason": "Deletes a repository, project or cloud resource: nothing undoes it. Philip's line: deletes that can't be undone."
+    },
+    {
+      "command": "supabase projects delete",
+      "decision": "ask",
+      "class": "destroy",
+      "reason": "Deletes a repository, project or cloud resource: nothing undoes it. Philip's line: deletes that can't be undone."
+    },
+    {
+      "tool": "mcp__*__reset_branch",
+      "decision": "ask",
+      "class": "destroy",
+      "reason": "Resets a database branch: its data is gone. Philip's line: deletes that can't be undone."
+    },
+    {
+      "command": "rm -*R*",
+      "decision": "ask",
+      "class": "delete",
+      "reason": "Recursive delete."
+    },
+    {
+      "command": "git push production",
+      "decision": "ask",
+      "class": "deploy",
+      "reason": "The production branch is released only on Philip's word. Philip's line: deploys to production."
+    },
+    {
+      "command": "git push +production",
+      "decision": "ask",
+      "class": "deploy",
+      "reason": "The production branch is released only on Philip's word. Philip's line: deploys to production."
+    },
+    {
+      "command": "git push *:production",
+      "decision": "ask",
+      "class": "deploy",
+      "reason": "The production branch is released only on Philip's word. Philip's line: deploys to production."
+    },
+    {
+      "command": "git push *refs/heads/production",
+      "decision": "ask",
+      "class": "deploy",
+      "reason": "The production branch is released only on Philip's word. Philip's line: deploys to production."
+    },
+    {
+      "command": "gh pr create *--base production",
+      "decision": "ask",
+      "class": "deploy",
+      "reason": "The production branch is released only on Philip's word. Philip's line: deploys to production."
+    },
+    {
+      "command": "gh pr create -B production",
+      "decision": "ask",
+      "class": "deploy",
+      "reason": "The production branch is released only on Philip's word. Philip's line: deploys to production."
+    },
+    {
+      "command": "gh pr edit *--base production",
+      "decision": "ask",
+      "class": "deploy",
+      "reason": "The production branch is released only on Philip's word. Philip's line: deploys to production."
+    },
+    {
+      "command": "gh pr edit -B production",
+      "decision": "ask",
+      "class": "deploy",
+      "reason": "The production branch is released only on Philip's word. Philip's line: deploys to production."
+    },
+    {
+      "command": "npm publish",
+      "decision": "ask",
+      "class": "deploy",
+      "reason": "Publishes a release or package: a live, public production target. Philip's line: deploys to production."
+    },
+    {
+      "command": "pnpm publish",
+      "decision": "ask",
+      "class": "deploy",
+      "reason": "Publishes a release or package: a live, public production target. Philip's line: deploys to production."
+    },
+    {
+      "command": "yarn publish",
+      "decision": "ask",
+      "class": "deploy",
+      "reason": "Publishes a release or package: a live, public production target. Philip's line: deploys to production."
+    },
+    {
+      "command": "cargo publish",
+      "decision": "ask",
+      "class": "deploy",
+      "reason": "Publishes a release or package: a live, public production target. Philip's line: deploys to production."
+    },
+    {
+      "command": "gh release create",
+      "decision": "ask",
+      "class": "deploy",
+      "reason": "Publishes a release or package: a live, public production target. Philip's line: deploys to production."
+    },
+    {
+      "command": "gh release edit",
+      "decision": "ask",
+      "class": "deploy",
+      "reason": "Publishes a release or package: a live, public production target. Philip's line: deploys to production."
+    },
+    {
+      "command": "vercel ./*",
+      "decision": "ask",
+      "class": "deploy",
+      "reason": "A `vercel` with a folder deploys. Philip's line: deploys to production."
+    },
+    {
+      "command": "vercel --cwd*",
+      "decision": "ask",
+      "class": "deploy",
+      "reason": "A `vercel` with a folder deploys. Philip's line: deploys to production."
+    },
+    {
+      "tool": "mcp__*__apply_migration",
+      "decision": "ask",
+      "class": "deploy",
+      "reason": "Changes a live database. Philip's line: deploys to production."
+    },
+    {
+      "tool": "mcp__*__merge_branch",
+      "decision": "ask",
+      "class": "deploy",
+      "reason": "Changes a live database. Philip's line: deploys to production."
+    },
+    {
+      "command": "stripe",
+      "decision": "ask",
+      "class": "paid",
+      "reason": "Spends money or starts a paid service. Philip's line: payments."
+    },
+    {
+      "command": "vercel integration add",
+      "decision": "ask",
+      "class": "paid",
+      "reason": "Spends money or starts a paid service. Philip's line: payments."
+    },
+    {
+      "tool": "mcp__*__create_project",
+      "decision": "ask",
+      "class": "paid",
+      "reason": "Spends money or starts a paid service. Philip's line: payments."
+    },
+    {
+      "tool": "mcp__*buy*",
+      "decision": "ask",
+      "class": "paid",
+      "reason": "Spends money or starts a paid service. Philip's line: payments."
+    },
+    {
+      "tool": "mcp__*purchase*",
+      "decision": "ask",
+      "class": "paid",
+      "reason": "Spends money or starts a paid service. Philip's line: payments."
+    },
+    {
+      "command": "gh api --method=DELETE|--method=delete|-XDELETE|-Xdelete",
+      "decision": "ask",
+      "reason": "Deletes a repository, project or cloud resource: nothing undoes it. Philip's line: deletes that can't be undone.",
+      "class": "destroy"
+    },
+    {
+      "command": "gh api *git/refs/heads/main*|*git/refs/heads/master*|*git/refs/heads/production*",
+      "decision": "ask",
+      "reason": "Rewrites or deletes main, master or production on the remote: git cannot undo that for everyone. Philip's line: deletes that can't be undone.",
+      "class": "destroy",
+      "sends": true
+    },
+    {
+      "command": "rm|unlink|remove-item|ri|del|erase|rd|rmdir|rimraf",
+      "decision": "ask",
+      "reason": "Deletes a file: inside Philip's own folders it is decided alone, outside them it asks.",
+      "class": "delete",
+      "owned_only": true
+    },
+    {
+      "command": "cmd /c|/k rmdir|rd|del|erase",
+      "decision": "ask",
+      "reason": "Deletes a file: inside Philip's own folders it is decided alone, outside them it asks.",
+      "class": "delete",
+      "owned_only": true
+    },
+    {
+      "command": "find -delete",
+      "decision": "ask",
+      "reason": "Deletes a file: inside Philip's own folders it is decided alone, outside them it asks.",
+      "class": "delete",
+      "owned_only": true
+    },
+    {
+      "command": "find -exec|-execdir|-ok|-okdir rm|rmdir|unlink|shred|rimraf",
+      "decision": "ask",
+      "reason": "Deletes a file: inside Philip's own folders it is decided alone, outside them it asks.",
+      "class": "delete",
+      "owned_only": true
+    },
+    {
+      "command": "gh pr create|edit --base=production|-Bproduction",
+      "decision": "ask",
+      "reason": "The production branch is released only on Philip's word. Philip's line: deploys to production.",
+      "class": "deploy"
+    },
+    {
+      "command": "gh workflow run",
+      "decision": "ask",
+      "reason": "Runs a workflow, which may deploy. Philip's line: deploys to production.",
+      "class": "deploy"
+    },
+    {
+      "command": "bun publish",
+      "decision": "ask",
+      "reason": "Publishes a release or package: a live, public production target. Philip's line: deploys to production.",
+      "class": "deploy"
+    },
+    {
+      "command": "docker push",
+      "decision": "ask",
+      "reason": "Publishes a release or package: a live, public production target. Philip's line: deploys to production.",
+      "class": "deploy"
+    },
+    {
+      "command": "gh release upload",
+      "decision": "ask",
+      "reason": "Publishes a release or package: a live, public production target. Philip's line: deploys to production.",
+      "class": "deploy"
+    },
+    {
+      "tool": "mcp__*__request_rollback|mcp__*__assign_alias|mcp__*__start_rolling_release|mcp__*__complete_rolling_release|mcp__*__approve_rolling_release_stage|mcp__*__promote*|mcp__*__execute_sql|mcp__*__replace_domain_dns_records|mcp__*__update_record|mcp__*__add_project_domain|mcp__*__pause_project|mcp__*__put_firewall_config|mcp__*__create_record|mcp__*__update_firewall_config|mcp__*__update_drain|mcp__*__update_project|mcp__*__unpause_project|mcp__*__update_project_protection_bypass|mcp__*__patch_url_protection_bypass|mcp__*__stage_routes|mcp__*__restore_redirects|mcp__*__update_edge_config",
+      "decision": "ask",
+      "reason": "Changes what is live (an alias, a rollback, a rolling release, a domain or its DNS, the firewall, a paused project) or a live database. Philip's line: deploys to production.",
+      "class": "deploy"
+    },
+    {
+      "read": "*/.env|*/.env.*|*/.envrc|*/.dev.vars|*/.dev.vars.*|*/.ssh|*/.ssh/*|*/.git-credentials|*/gh/hosts.yml|*/github cli/hosts.yml|*/.claude/.credentials.json|*/.aws/credentials|~/.npmrc|~/.netrc|*/.docker/config.json",
+      "decision": "ask",
+      "reason": "Secret values must not enter an agent's context. Philip's line: secrets.",
+      "class": "secrets",
+      "unless": [
+        "*.example",
+        "*.sample",
+        "*.template",
+        "*.dist"
+      ]
+    },
+    {
+      "read": "~|~/|c:|c:/|c:/users|c:/users/|/",
+      "decision": "ask",
+      "class": "secrets",
+      "reason": "A search of the whole home folder reads its hidden folders too (keys, tokens). Search a project folder. Secret values must not enter an agent's context. Philip's line: secrets."
+    },
+    {
+      "path": "*/.env.*|*/.envrc|*/.dev.vars|*/.dev.vars.*|*/.aws/credentials|~/.npmrc|~/.netrc",
+      "decision": "ask",
+      "reason": "Changes a secret. Philip's line: secrets.",
+      "class": "secrets",
+      "unless": [
+        "*.example",
+        "*.sample",
+        "*.template",
+        "*.dist"
+      ]
+    },
+    {
+      "command": "* .env*|*/.env*|.dev.vars*|*/.dev.vars*|.ssh/*|*/.ssh/*|.git-credentials|*/.git-credentials|gh/hosts.yml|*/gh/hosts.yml|*/github*cli/hosts.yml|.claude/.credentials.json|*/.claude/.credentials.json|.aws/credentials|*/.aws/credentials|~/.npmrc|~/.netrc|.docker/config.json|*/.docker/config.json",
+      "decision": "ask",
+      "reason": "Names a file that holds secrets: any program but one that cannot show what is in it asks. Secret values must not enter an agent's context. Philip's line: secrets.",
+      "class": "secrets",
+      "unless": [
+        "*.example",
+        "*.sample",
+        "*.template",
+        "*.dist",
+        "--env-file*"
+      ],
+      "paths": true,
+      "quiet": [
+        "test",
+        "[",
+        "[[",
+        "ls",
+        "touch",
+        "echo",
+        "printf",
+        "test-path"
+      ]
+    },
+    {
+      "command": "rg -uu*|--no-ignore*",
+      "decision": "ask",
+      "reason": "Searches files that are not tracked, `.env` included. Secret values must not enter an agent's context. Philip's line: secrets.",
+      "class": "secrets"
+    },
+    {
+      "command": "printenv",
+      "decision": "ask",
+      "reason": "Secret values must not enter an agent's context. Philip's line: secrets.",
+      "class": "secrets"
+    },
+    {
+      "command": "env $",
+      "decision": "ask",
+      "reason": "Secret values must not enter an agent's context. Philip's line: secrets.",
+      "class": "secrets"
+    },
+    {
+      "command": "set|export $$",
+      "decision": "ask",
+      "reason": "Secret values must not enter an agent's context. Philip's line: secrets.",
+      "class": "secrets"
+    },
+    {
+      "command": "export -p",
+      "decision": "ask",
+      "reason": "Secret values must not enter an agent's context. Philip's line: secrets.",
+      "class": "secrets"
+    },
+    {
+      "command": "declare|typeset $",
+      "decision": "ask",
+      "reason": "Secret values must not enter an agent's context. Philip's line: secrets.",
+      "class": "secrets"
+    },
+    {
+      "command": "cmd /c|/k set $$",
+      "decision": "ask",
+      "reason": "Secret values must not enter an agent's context. Philip's line: secrets.",
+      "class": "secrets"
+    },
+    {
+      "command": "get-childitem|gci|dir|ls|get-item|gi|get-content|gc|cat|type env:*",
+      "decision": "ask",
+      "reason": "Secret values must not enter an agent's context. Philip's line: secrets.",
+      "class": "secrets"
+    },
+    {
+      "command": "*environment]::getenvironmentvariable*",
+      "decision": "ask",
+      "reason": "Secret values must not enter an agent's context. Philip's line: secrets.",
+      "class": "secrets"
+    },
+    {
+      "command": "$env:*token*|$env:*key*|$env:*secret*|$env:*passw*|$env:*credential*|${env:*token*|${env:*key*|${env:*secret*|${env:*passw*|${env:*credential*",
+      "decision": "ask",
+      "reason": "Secret values must not enter an agent's context. Philip's line: secrets.",
+      "class": "secrets"
+    },
+    {
+      "command": "node|bun|deno -p|--print|-pe|-e|--eval process.env|*(process.env)*|*(process.env,*",
+      "decision": "ask",
+      "reason": "Prints every environment variable. Secret values must not enter an agent's context. Philip's line: secrets.",
+      "class": "secrets"
+    },
+    {
+      "command": "echo|printf|print|write-output|write-host|out-host *$*token*|*$*key*|*$*secret*|*$*passw*|*$*credential*",
+      "decision": "ask",
+      "reason": "Secret values must not enter an agent's context. Philip's line: secrets.",
+      "class": "secrets"
+    },
+    {
+      "command": "gh auth token",
+      "decision": "ask",
+      "reason": "Secret values must not enter an agent's context. Philip's line: secrets.",
+      "class": "secrets"
+    },
+    {
+      "command": "gh auth status --show-token|-t",
+      "decision": "ask",
+      "reason": "Secret values must not enter an agent's context. Philip's line: secrets.",
+      "class": "secrets"
+    },
+    {
+      "command": "git credential fill|approve|reject",
+      "decision": "ask",
+      "reason": "Secret values must not enter an agent's context. Philip's line: secrets.",
+      "class": "secrets"
+    },
+    {
+      "command": "git credential-* get|store|erase",
+      "decision": "ask",
+      "reason": "Secret values must not enter an agent's context. Philip's line: secrets.",
+      "class": "secrets"
+    },
+    {
+      "command": "vercel env pull",
+      "decision": "ask",
+      "reason": "Secret values must not enter an agent's context. Philip's line: secrets.",
+      "class": "secrets"
+    },
+    {
+      "command": "wrangler secret",
+      "decision": "ask",
+      "reason": "Changes a secret. Philip's line: secrets.",
+      "class": "secrets"
+    },
+    {
+      "command": "wrangler pages secret",
+      "decision": "ask",
+      "reason": "Changes a secret. Philip's line: secrets.",
+      "class": "secrets"
+    },
+    {
+      "tool": "mcp__*__create_edge_function_secret|mcp__*__get_project_env|mcp__*__filter_project_envs|mcp__*__get_shared_env_var|mcp__*__create_ai_gateway_api_key|mcp__*__create_edge_config_token|mcp__*__get_edge_config_token*|mcp__*__create_sdk_key|mcp__*__list_feature_flag_sdk_keys|mcp__*__save_auth_tokens|mcp__*__get_publishable_keys",
+      "decision": "ask",
+      "reason": "Secret values must not enter an agent's context. Philip's line: secrets.",
+      "class": "secrets"
+    },
+    {
+      "command": "supabase projects|branches create",
+      "decision": "ask",
+      "reason": "Spends money or starts a paid service. Philip's line: payments.",
+      "class": "paid"
+    },
+    {
+      "command": "fly|flyctl scale",
+      "decision": "ask",
+      "reason": "Spends money or starts a paid service. Philip's line: payments.",
+      "class": "paid"
+    },
+    {
+      "command": "vercel install",
+      "decision": "ask",
+      "reason": "Spends money or starts a paid service. Philip's line: payments.",
+      "class": "paid"
+    },
+    {
+      "tool": "mcp__*__create_or_transfer_domain|mcp__*__create_branch|mcp__*__restore_project",
+      "decision": "ask",
+      "reason": "Spends money or starts a paid service. Philip's line: payments.",
+      "class": "paid"
+    },
+    {
+      "path": "*/.organon|*/.organon/*",
+      "decision": "ask",
+      "reason": "Changes organon's policy, its hook or the lines: those stay Philip's.",
+      "class": "policy"
+    },
+    {
+      "path": "*/.claude/settings*.json|~/.claude.json",
+      "decision": "ask",
+      "reason": "Changes organon's policy, its hook or the lines: those stay Philip's.",
+      "class": "policy"
+    },
+    {
+      "path": "*/.ergon/bin|*/.ergon/bin/*|*/.cargo/bin/*",
+      "decision": "ask",
+      "reason": "Changes organon's policy, its hook or the lines: those stay Philip's.",
+      "class": "policy"
+    },
+    {
+      "path": "*/.ergon/refusals.jsonl*",
+      "decision": "ask",
+      "reason": "Changes organon's policy, its hook or the lines: those stay Philip's.",
+      "class": "policy"
+    },
+    {
+      "command": "cp|mv|rm|ln|install|tee|touch|rsync|truncate|unlink|shred|chmod|copy|move|del|erase|rd|rmdir|ren|rename|xcopy|robocopy|copy-item|cpi|move-item|mi|remove-item|ri|rename-item|rni|set-content|sc|add-content|ac|out-file|new-item|ni|clear-content|clc|rimraf ~/.organon|~/.organon/*|.claude/settings*|*/.claude/settings*|~/.claude.json|*/.ergon/bin|*/.ergon/bin/*|*/.cargo/bin|*/.cargo/bin/*|*/.ergon/refusals.jsonl*|~/.ergon|~/.ergon/|~/.cargo|~/.cargo/|~/.claude|~/.claude/",
+      "decision": "ask",
+      "reason": "Changes organon's policy, its hook or the lines: those stay Philip's.",
+      "class": "policy",
+      "paths": true
+    },
+    {
+      "command": "sed -i* ~/.organon|~/.organon/*|.claude/settings*|*/.claude/settings*|~/.claude.json|*/.ergon/bin|*/.ergon/bin/*|*/.cargo/bin|*/.cargo/bin/*|*/.ergon/refusals.jsonl*|~/.ergon|~/.ergon/|~/.cargo|~/.cargo/|~/.claude|~/.claude/",
+      "decision": "ask",
+      "reason": "Changes organon's policy, its hook or the lines: those stay Philip's.",
+      "class": "policy",
+      "paths": true
+    },
+    {
+      "command": "* >|>> ~/.organon|~/.organon/*|.claude/settings*|*/.claude/settings*|~/.claude.json|*/.ergon/bin|*/.ergon/bin/*|*/.cargo/bin|*/.cargo/bin/*|*/.ergon/refusals.jsonl*|~/.ergon|~/.ergon/|~/.cargo|~/.cargo/|~/.claude|~/.claude/",
+      "decision": "ask",
+      "reason": "Changes organon's policy, its hook or the lines: those stay Philip's.",
+      "class": "policy",
+      "paths": true
+    },
+    {
+      "command": "cargo install *organon*",
+      "decision": "ask",
+      "reason": "Changes organon's policy, its hook or the lines: those stay Philip's.",
+      "class": "policy"
+    },
+    {
+      "command": "cargo install --path*|--root*|--git*",
+      "decision": "ask",
+      "reason": "Changes organon's policy, its hook or the lines: those stay Philip's.",
+      "class": "policy"
+    },
+    {
+      "command": "organon init",
+      "decision": "ask",
+      "reason": "Changes organon's policy, its hook or the lines: those stay Philip's.",
+      "class": "policy"
+    },
+    {
+      "command": "claude --settings*|--setting-sources*",
+      "decision": "ask",
+      "class": "policy",
+      "reason": "Starts a session with other settings, so without organon's hook. Changes organon's policy, its hook or the lines: those stay Philip's."
+    },
+    {
+      "decision": "ask",
+      "reason": "Points a session at another organon policy or binary, or at other Claude Code settings. Changes organon's policy, its hook or the lines: those stay Philip's.",
+      "class": "policy",
+      "assigns": [
+        "ORGANON_HOME",
+        "ORGANON_EXE",
+        "CLAUDE_CONFIG_DIR"
+      ]
+    },
+    {
+      "command": "curl|wget|invoke-restmethod|irm|invoke-webrequest|iwr",
+      "decision": "ask",
+      "reason": "Sends something outside (a post, a message, an upload). Philip's line (23 Nov); exceptions are agreed with him one at a time, in `agreed`.",
+      "class": "send",
+      "sends": true
+    },
+    {
+      "command": "gh api",
+      "decision": "ask",
+      "reason": "Sends something outside (a post, a message, an upload). Philip's line (23 Nov); exceptions are agreed with him one at a time, in `agreed`.",
+      "class": "send",
+      "sends": true,
+      "foreign": true
+    },
+    {
+      "command": "gh issue|pr|discussion create|comment|edit|review|close|reopen|lock",
+      "decision": "ask",
+      "reason": "Posts as Philip on a repository that is not his. Sends something outside (a post, a message, an upload). Philip's line (23 Nov); exceptions are agreed with him one at a time, in `agreed`.",
+      "class": "send",
+      "foreign": true
+    },
+    {
+      "command": "gh gist create|edit",
+      "decision": "ask",
+      "reason": "Sends something outside (a post, a message, an upload). Philip's line (23 Nov); exceptions are agreed with him one at a time, in `agreed`.",
+      "class": "send"
+    },
+    {
+      "command": "gh api graphql|/graphql|gists*|/gists*",
+      "decision": "ask",
+      "reason": "Sends something outside (a post, a message, an upload). Philip's line (23 Nov); exceptions are agreed with him one at a time, in `agreed`.",
+      "class": "send",
+      "sends": true
+    },
+    {
+      "command": "git push",
+      "decision": "ask",
+      "reason": "Pushes to a repository that is not his. Sends something outside (a post, a message, an upload). Philip's line (23 Nov); exceptions are agreed with him one at a time, in `agreed`.",
+      "class": "send",
+      "foreign": true
+    },
+    {
+      "command": "scp|sftp",
+      "decision": "ask",
+      "reason": "Sends something outside (a post, a message, an upload). Philip's line (23 Nov); exceptions are agreed with him one at a time, in `agreed`.",
+      "class": "send"
+    },
+    {
+      "command": "rsync",
+      "decision": "ask",
+      "reason": "Sends something outside (a post, a message, an upload). Philip's line (23 Nov); exceptions are agreed with him one at a time, in `agreed`.",
+      "class": "send",
+      "sends": true
+    },
+    {
+      "tool": "mcp__*__share_*|mcp__*__notebook_share_*|mcp__*calendar*__create_event|mcp__*calendar*__update_event|mcp__*__respond_to_event|mcp__*__reply_to_*|mcp__*__submit_feedback|mcp__*__start_board_thread|mcp__*__react*|mcp__*__add_toolbar_reaction|mcp__*__edit_toolbar_message|mcp__*__create_drain",
+      "decision": "ask",
+      "reason": "Sends something outside (a post, a message, an upload). Philip's line (23 Nov); exceptions are agreed with him one at a time, in `agreed`.",
+      "class": "send"
+    }
+  ],
+  "after_budget": [
+    "organon",
+    "mneme",
+    "git",
+    "cargo fmt",
+    "cargo test",
+    "cargo clippy",
+    "gh run",
+    "gh pr view",
+    "gh pr checks",
+    "gh pr create",
+    "gh pr edit",
+    "cd",
+    "pwd",
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "grep",
+    "rg",
+    "wc",
+    "diff",
+    "echo",
+    "set-location",
+    "get-content",
+    "get-childitem",
+    "select-string"
+  ],
+  "merge_env_names": [
+    "VERCEL_PLUGIN_*"
+  ],
+  "territory": [
+    "C:/Users/phili/Desktop/Projects/ergon",
+    "C:/Users/phili/Desktop/Projects/ergon-wt",
+    "C:/Users/phili/Desktop/Projects/ergon-main",
+    "C:/Users/phili/Desktop/Projects/ergon-wt-j28-deep",
+    "C:/Users/phili/Desktop/Projects/ergon-wt-j30-senses",
+    "C:/Users/phili/Desktop/Projects/ergon-wt-j31-craft",
+    "C:/Users/phili/Desktop/Projects/ergon-wt-j32-organism",
+    "C:/Users/phili/Desktop/Projects/ergon-wt-state-c17b",
+    "C:/Users/phili/Desktop/Projects/organon",
+    "C:/Users/phili/Desktop/Projects/organon-wt",
+    "C:/Users/phili/Desktop/Projects/organon-express",
+    "C:/Users/phili/Desktop/Projects/organon-learning",
+    "C:/Users/phili/Desktop/Projects/organon-protocol",
+    "C:/Users/phili/Desktop/Projects/organon-research",
+    "C:/Users/phili/Desktop/Projects/organon-sound",
+    "C:/Users/phili/Desktop/Projects/organon-text",
+    "C:/Users/phili/Desktop/Projects/organon-video",
+    "C:/Users/phili/Desktop/Projects/organon-vision",
+    "C:/Users/phili/Desktop/Projects/mneme",
+    "C:/Users/phili/Desktop/Projects/mneme-memory",
+    "C:/Users/phili/Desktop/Projects/philipciuca.com",
+    "C:/Users/phili/Desktop/Projects/philipciuca.com-wt",
+    "C:/Users/phili/.ergon",
+    "C:/Users/phili/.claude/jobs/*/tmp"
+  ],
+  "lines": [
+    "deploy",
+    "destroy",
+    "secrets",
+    "paid",
+    "policy",
+    "send"
+  ],
+  "agreed": [],
+  "refusal_log": "~/.ergon/refusals.jsonl",
+  "scratch": [
+    "/tmp",
+    "~/appdata/local/temp",
+    "~/.claude/jobs/*/tmp",
+    "~/.ergon/scratch"
+  ],
+  "own_repos": [
+    "philipjj609/*"
+  ],
+  "home": "C:/Users/phili"
+}

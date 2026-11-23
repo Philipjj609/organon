@@ -1023,3 +1023,202 @@ fn parallel_sessions_keep_separate_records_and_spend() {
     let task = fs::read_to_string(e.home.join("tasks").join("named").join("task.json")).unwrap();
     assert!(task.contains("sid-b.jsonl"), "{task}");
 }
+
+// ------------------------------------------------------------ territory and refusal log
+
+#[test]
+fn a_territory_lifts_all_but_its_lines_and_logs_every_refusal() {
+    let e = env("territory");
+    fs::create_dir_all(&e.home).unwrap();
+    let root = e.home.parent().unwrap().to_owned();
+    let own = root.join("own");
+    let scratch = root.join("scratch");
+    fs::create_dir_all(own.join(".git")).unwrap();
+    fs::write(own.join(".git").join("HEAD"), "ref: refs/heads/feature\n").unwrap();
+    fs::create_dir_all(&scratch).unwrap();
+    let client = root.join("client");
+    fs::create_dir_all(client.join(".git")).unwrap();
+    fs::write(
+        client.join(".git").join("HEAD"),
+        "ref: refs/heads/feature\n",
+    )
+    .unwrap();
+    let log = root.join("refusals.jsonl");
+    let slash = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    fs::write(
+        e.home.join("policy.json"),
+        serde_json::json!({
+            "efforts": {}, "routes": {},
+            "rules": [{"read": "*/.env", "decision": "ask", "class": "secrets", "reason": "secret"}],
+            "territory": [slash(&own), slash(&scratch)],
+            "lines": ["deploy", "destroy", "secrets", "paid", "policy", "send"],
+            "refusal_log": slash(&log),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let run = |cwd: &Path, tool: &str, input: &str| {
+        e.hook_raw(&event("s1", &e.transcript, &slash(cwd), tool, input), &[])
+    };
+    // Inside: the common work passes. (A folder outside any repository is judged as itself:
+    // not testable here, cargo's scratch folder is inside this repository.)
+    for cmd in [
+        "git push origin main",
+        "gh pr merge 7 --squash",
+        "rm -rf build",
+    ] {
+        assert_eq!(run(&own, "Bash", &command(cmd)), "", "{cmd}");
+    }
+    // The lines still ask, inside too, and the Read tool is seen.
+    assert!(is_ask(&run(&own, "Bash", &command("vercel --prod"))));
+    assert!(is_ask(&run(
+        &own,
+        "Bash",
+        &command("gh secret set T --body sekrit")
+    )));
+    let read = format!(
+        r#"{{"file_path":{}}}"#,
+        serde_json::to_string(&slash(&own.join(".env"))).unwrap()
+    );
+    assert!(is_ask(&run(&own, "Read", &read)));
+    // Outside: as before.
+    assert!(is_ask(&run(
+        &client,
+        "Bash",
+        &command("git push origin main")
+    )));
+    // Every ask is one line of the log, with what decided it; a secret is not written down.
+    let text = fs::read_to_string(&log).unwrap();
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 4, "{text}");
+    assert_eq!(lines[0]["class"], "deploy");
+    assert_eq!(lines[0]["decision"], "ask");
+    assert_eq!(lines[0]["session"], "s1");
+    assert_eq!(lines[1]["class"], "secrets");
+    assert!(!text.contains("sekrit"), "{text}");
+    assert_eq!(lines[2]["tool"], "Read");
+    assert_eq!(lines[3]["class"], "push-main");
+}
+
+#[test]
+fn the_refusal_log_writes_no_value_and_a_grep_glob_is_seen() {
+    let e = env("territory-log");
+    fs::create_dir_all(&e.home).unwrap();
+    let root = e.home.parent().unwrap().to_owned();
+    let own = root.join("own");
+    fs::create_dir_all(own.join(".git")).unwrap();
+    fs::write(own.join(".git").join("HEAD"), "ref: refs/heads/feature\n").unwrap();
+    let log = root.join("refusals.jsonl");
+    let slash = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    fs::write(
+        e.home.join("policy.json"),
+        serde_json::json!({
+            "efforts": {}, "routes": {},
+            "rules": [
+                {"read": "*/.env|*/.env.*", "decision": "ask", "class": "secrets", "reason": "secret"},
+                {"command": "curl", "sends": true, "decision": "ask", "class": "send", "reason": "send"},
+                {"command": "rm -*r*", "decision": "ask", "class": "delete", "reason": "delete"},
+            ],
+            "territory": [slash(&own)],
+            "lines": ["deploy", "destroy", "secrets", "paid", "policy", "send"],
+            "refusal_log": slash(&log),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let run = |tool: &str, input: &str| {
+        e.hook_raw(&event("s1", &e.transcript, &slash(&own), tool, input), &[])
+    };
+    for cmd in [
+        "curl -s https://example.com -H \"Authorization: Bearer LEAK1\" -d x=1",
+        "echo LEAK2 | vercel env add TOKEN production",
+        "TOKEN=LEAK3 gh secret set X --body \"$TOKEN\"",
+        "rm -rf C:/elsewhere/LEAK4 | tee out",
+    ] {
+        let _ = run("Bash", &command(cmd));
+    }
+    // A glob that names `.env` files reads them; one that does not, does not.
+    assert!(is_ask(&run(
+        "Grep",
+        r#"{"pattern":"API_KEY","glob":".env*"}"#
+    )));
+    assert_eq!(run("Grep", r#"{"pattern":"TODO","glob":"*.rs"}"#), "");
+    let text = fs::read_to_string(&log).unwrap();
+    for leak in ["LEAK1", "LEAK2", "LEAK3", "LEAK4"] {
+        assert!(!text.contains(leak), "{leak}: {text}");
+    }
+    assert!(text.contains("curl …"), "{text}");
+}
+
+/// The re-check's section 5 and 1.7: a deploy is logged by its programs only, a password in a
+/// URL, a one-time code and a token after a short flag are cut in any class, and each name
+/// of a brace list in a `Grep` glob is tried.
+#[test]
+fn the_refusal_log_cuts_deploys_urls_codes_and_tokens_and_a_brace_glob_is_seen() {
+    let e = env("territory-log-3");
+    fs::create_dir_all(&e.home).unwrap();
+    let root = e.home.parent().unwrap().to_owned();
+    let own = root.join("own");
+    fs::create_dir_all(own.join(".git")).unwrap();
+    fs::write(own.join(".git").join("HEAD"), "ref: refs/heads/feature\n").unwrap();
+    let log = root.join("refusals.jsonl");
+    let slash = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    fs::write(
+        e.home.join("policy.json"),
+        serde_json::json!({
+            "efforts": {}, "routes": {},
+            "rules": [
+                {"read": "*/.env|*/.env.*", "decision": "ask", "class": "secrets", "reason": "secret"},
+                {"command": "supabase db push", "decision": "ask", "class": "deploy", "reason": "deploy"},
+                {"command": "vercel --prod", "decision": "ask", "class": "deploy", "reason": "deploy"},
+                {"command": "npm publish", "decision": "ask", "class": "deploy", "reason": "deploy"},
+                {"command": "wipe", "decision": "ask", "class": "destroy", "reason": "destroy"},
+            ],
+            "territory": [slash(&own)],
+            "lines": ["deploy", "destroy", "secrets", "paid", "policy", "send"],
+            "refusal_log": slash(&log),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let run = |tool: &str, input: &str| {
+        e.hook_raw(&event("s1", &e.transcript, &slash(&own), tool, input), &[])
+    };
+    for cmd in [
+        "supabase db push --db-url postgres://postgres:LEAK1pw@db.example.co:5432/postgres",
+        "vercel --prod -t vcp_9f8e7dLEAK2",
+        "npm publish --otp 314159",
+        "wipe postgres://postgres:LEAK4pw@db.example.co:5432/postgres",
+        "wipe -t vcp_9f8e7dLEAK5",
+        "wipe --otp 271828",
+        "$env:GH_TOKEN='ghp_LEAK6'; vercel --prod",
+        "$env:VERCEL_TOKEN = 'vcp_LEAK7'; vercel --prod",
+        "$t = 'LEAK8'; vercel --prod --token $t",
+    ] {
+        assert!(is_ask(&run("Bash", &command(cmd))), "{cmd}");
+    }
+    // A command that carries no value is still written whole.
+    assert!(is_ask(&run("Bash", &command("wipe C:/elsewhere/plain"))));
+    assert!(is_ask(&run(
+        "Grep",
+        r#"{"pattern":"API_KEY","glob":"{.env,.env.local}"}"#
+    )));
+    assert!(is_ask(&run(
+        "Grep",
+        r#"{"pattern":"API_KEY","glob":"**/{README.md,.env.local}"}"#
+    )));
+    assert_eq!(
+        run("Grep", r#"{"pattern":"TODO","glob":"*.{rs,toml}"}"#),
+        ""
+    );
+    let text = fs::read_to_string(&log).unwrap().to_ascii_lowercase();
+    for leak in [
+        "leak1", "leak2", "314159", "leak4", "leak5", "271828", "leak6", "leak7", "leak8",
+    ] {
+        assert!(!text.contains(leak), "{leak}: {text}");
+    }
+    assert!(text.contains("wipe c:/elsewhere/plain"), "{text}");
+}

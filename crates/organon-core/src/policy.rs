@@ -16,6 +16,10 @@ use crate::route::Route;
 /// The policy shipped with organon.
 pub const DEFAULT: &str = include_str!("../../../policy/default.json");
 
+/// The territory policy: inside a person's own folders only their lines ask (see
+/// [`Policy::territory`]). Written by `organon init --territory`; never the default.
+pub const TERRITORY: &str = include_str!("../../../policy/territory.json");
+
 /// The kinds of action a person approves before an agent may take them. A rule tagged with
 /// one of these is part of the policy's floor: see [`Policy::with_floor`] and
 /// [`Policy::approval_class`].
@@ -47,11 +51,49 @@ pub struct Rule {
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
+    /// Matches files a tool would read (`Read`, `Grep`), as `path` does for writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<String>,
+    /// With `command`: the rule matches only a `git push` that rewrites or deletes one of
+    /// these branches (a force flag, a `+` or empty source, `--delete`, `--mirror`,
+    /// `--prune`). See [`rewrites_branch`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rewrites: Vec<String>,
     pub decision: Decision,
     pub reason: String,
     /// The approval class this rule guards (one of [`APPROVAL_CLASSES`]), if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<String>,
+    /// [`glob`]s of words (or paths) that do not count as a match of a pattern word: a
+    /// `.env.example` is not a secret.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unless: Vec<String>,
+    /// With `command`: the rule counts only where the part runs in the territory, so it adds
+    /// nothing elsewhere (a plain `rm`, which a territory lifts only inside its folders).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub owned_only: bool,
+    /// With `command`: the rule matches only a part that sends data (see [`sends_data`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sends: bool,
+    /// With `command`: the rule matches only a part that names a repository that is not one
+    /// of [`Policy::own_repos`] (see [`names_foreign`]), or a `gh` steered by `GH_REPO`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub foreign: bool,
+    /// Variable names (ignoring case): the rule matches a command that sets one of them in any
+    /// form (`NAME=x cmd`, `export NAME=x`, `env NAME=x`, `$env:NAME = x`, `setx NAME`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assigns: Vec<String>,
+    /// With `command`: the pattern's words name files. A word is then also tried as the path
+    /// it names from the folder the part runs in, with `.` and `..` resolved (`bin` in
+    /// `~/.ergon` is `~/.ergon/bin`), and a word with a wildcard or braces (`.e*`,
+    /// `{.env,x}`) as what it could expand to. A word that holds a space, the value of
+    /// `--env-file`, and the target of a copy whose sources all match `unless` do not count.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paths: bool,
+    /// With `command`: programs ([`glob`]s) that name a file without showing what is in it
+    /// (`test`, `ls`): the rule does not count for them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quiet: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,6 +113,36 @@ pub struct Policy {
     /// lines and comments never do. Checked when the policy is read: see [`env_name_allowed`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merge_env_names: Vec<String>,
+    /// A person's own folders ([`glob`]s, forward slashes, ignoring case; a folder inside one
+    /// counts too). There an `ask` rule is lifted unless its class is one of [`Policy::lines`],
+    /// with the same certainty an [`Exception`] needs. Elsewhere nothing changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub territory: Vec<String>,
+    /// The approval classes that keep asking everywhere, territory included. No exception
+    /// lifts them either: turning one off means removing it from this list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<String>,
+    /// Exceptions to a line that the person agreed one at a time (a channel or a target):
+    /// an `ask` rule of that class does not count for a part of a command, or a tool, that the
+    /// entry matches. Adding one is a change to the lines, so it is theirs to make.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agreed: Vec<Agreed>,
+    /// A file every ask and deny is appended to as one JSON line (`~/` is the user's home).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_log: Option<String>,
+    /// Folders for throwaway files ([`glob`]s, read like the territory): a delete inside one is
+    /// lifted like a delete inside the territory, from a folder of the territory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scratch: Vec<String>,
+    /// The person's own GitHub repositories (`owner/name` [`glob`]s, ignoring case), for the
+    /// rules marked `foreign`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub own_repos: Vec<String>,
+    /// The person's home folder as an absolute path (`C:/Users/name`). Only this folder is
+    /// read as `~`: another user's home, or the same name on another drive, is not. Without
+    /// it any user's home folder is (the hook fills it in from the environment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<String>,
 }
 
 /// Name prefixes (lower case) of variables a shell env file may never set to lift a `merge`:
@@ -201,11 +273,27 @@ pub struct Exception {
     pub reason: String,
 }
 
+/// One exception to a line, agreed by the person: `command` is a command pattern as in
+/// [`Rule`], `tool` a tool name [`glob`]. Keep it narrow: it matches like a rule does.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Agreed {
+    pub class: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    pub reason: String,
+}
+
 /// What an agent is about to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action<'a> {
     Command(&'a str),
     Write {
+        path: &'a str,
+    },
+    /// A tool that reads a file into the agent's context (`Read`, `Grep`).
+    Read {
         path: &'a str,
     },
     /// Any other tool, by name.
@@ -216,6 +304,8 @@ pub enum Action<'a> {
 pub struct Verdict {
     pub decision: Decision,
     pub reason: Option<String>,
+    /// The approval class of the rule that decided, if it has one.
+    pub class: Option<String>,
 }
 
 /// Finds the branch checked out in a folder: `None` for the folder the agent runs in, or the
@@ -248,6 +338,31 @@ pub type OriginOf<'a> = &'a dyn Fn(&str) -> Option<String>;
 #[must_use]
 pub fn no_origin(_: &str) -> Option<String> {
     None
+}
+
+/// Finds the remotes of the repository whose root folder is given (as [`RepoOf`] returned it):
+/// each name with the URL it pushes to. `None` when they cannot be read. Used by the rules
+/// marked `foreign`, to tell where a `git push <name>` goes.
+pub type RemotesOf<'a> = &'a dyn Fn(&str) -> Option<Vec<(String, String)>>;
+
+/// A [`RemotesOf`] that reads no remote: a push to a remote by name is then a push to a
+/// repository that cannot be known.
+#[must_use]
+pub fn no_remotes(_: &str) -> Option<Vec<(String, String)>> {
+    None
+}
+
+/// What a decision may look up beyond the text of the action. This crate reads no file and no
+/// environment, so the caller does.
+#[derive(Clone, Copy)]
+pub struct Lookups<'a> {
+    /// The folder the agent runs in, as an absolute path, if known: relative words of a
+    /// command are read from it for the rules marked `paths`.
+    pub cwd: Option<&'a str>,
+    pub branch_of: BranchOf<'a>,
+    pub repo_of: RepoOf<'a>,
+    pub origin_of: OriginOf<'a>,
+    pub remotes_of: RemotesOf<'a>,
 }
 
 /// The built-in `send` rules that ask because a merge names its repository by flag. A plain
@@ -320,6 +435,69 @@ struct Lone<'a> {
 /// The class of the rule that guards `gh pr merge`. An exception for it lifts a command only
 /// when the whole command is one of two fixed forms: see [`lone_merge`].
 const MERGE_CLASS: &str = "merge";
+
+/// The class of the rules that guard deletes. Where it is lifted, what is deleted must stay
+/// inside the person's own folders: see [`Policy::deletes_inside`].
+const DELETE_CLASS: &str = "delete";
+
+/// `gh pr merge ...` naming no other repository and no `--admin`: the merge a territory lifts
+/// even inside a longer command whose folders are certain.
+fn plain_merge(seg: &[String]) -> bool {
+    seg.len() >= 3
+        && seg[..3] == ["gh", "pr", "merge"]
+        && !seg[3..].iter().any(|w| {
+            w.starts_with("--repo")
+                || w.starts_with("-R")
+                || w.starts_with("--admin")
+                || w.contains("://")
+                || w.to_lowercase().contains("github.com")
+        })
+}
+
+/// Whether a `git push` part rewrites or deletes one of `branches` on the remote: a force
+/// flag (`-f`, `--force*`, a short-flag group with `f`) or a `+refspec` pushing to it, a
+/// delete (`--delete`, `-d`, a group with `d`, an empty source `:main`) of it, or `--mirror`
+/// or `--prune`, which can rewrite or delete any branch. A bare push is read after
+/// [`resolve_pushes`] added the current branch.
+#[must_use]
+pub fn rewrites_branch(seg: &[String], branches: &[String]) -> bool {
+    let Some(at) = seg.iter().position(|w| w == "push") else {
+        return false;
+    };
+    let words = &seg[at + 1..];
+    let args = push_arguments(words);
+    let group = |f: &str, c: char| {
+        f.len() > 1
+            && !f.starts_with("--")
+            && f[1..].chars().all(|x| x.is_ascii_alphanumeric())
+            && f[1..].contains(c)
+    };
+    let any_flag = |test: &dyn Fn(&str) -> bool| args.flags.iter().any(|f| test(f));
+    if any_flag(&|f| f == "--mirror" || f == "--prune") {
+        return true;
+    }
+    let force = any_flag(&|f| f.starts_with("--force") || group(f, 'f'));
+    let delete = any_flag(&|f| f == "--delete" || group(f, 'd'));
+    if force && any_flag(&|f| f == "--all" || f == "--branches") {
+        return true;
+    }
+    args.positional.iter().any(|&k| {
+        let w = words[k].as_str();
+        let plus = w.starts_with('+');
+        let w = w.trim_start_matches('+');
+        let (src, dst) = match w.split_once(':') {
+            Some((s, d)) => (Some(s), d),
+            None => (None, w),
+        };
+        let dst = dst.strip_prefix("refs/heads/").unwrap_or(dst);
+        // `:` alone pushes every matching branch; `refs/heads/*:refs/heads/*` every branch.
+        if dst.is_empty() && src.is_some_and(str::is_empty) {
+            return force || plus;
+        }
+        branches.iter().any(|b| glob(dst, b))
+            && (force || plus || delete || src.is_some_and(str::is_empty))
+    })
+}
 
 /// Why `--admin` on a merge is denied where a `merge` exception applies.
 const MERGE_ADMIN_DENIED: &str =
@@ -493,6 +671,11 @@ impl Policy {
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
         use serde::de::Error;
         let p: Self = serde_json::from_str(s)?;
+        if !p.territory.is_empty() && p.lines.is_empty() {
+            return Err(serde_json::Error::custom(
+                "territory: a territory needs its lines (the classes that still ask there)",
+            ));
+        }
         for n in &p.merge_env_names {
             if let Some(why) = bad_env_pattern(n) {
                 return Err(serde_json::Error::custom(format!(
@@ -589,28 +772,53 @@ impl Policy {
         origin_of: OriginOf<'_>,
         env: Inherited,
     ) -> Verdict {
+        let look = Lookups {
+            cwd: None,
+            branch_of,
+            repo_of,
+            origin_of,
+            remotes_of: &no_remotes,
+        };
+        self.decide_where(action, &look, env)
+    }
+
+    /// [`Policy::decide_with_origin`] with everything a caller can look up ([`Lookups`]): also
+    /// the agent's folder, so the rules marked `paths` read a relative word as the file it
+    /// names, and the remotes of a repository, so a `git push <name>` is judged by where that
+    /// remote leads.
+    #[must_use]
+    pub fn decide_where(&self, action: Action<'_>, look: &Lookups<'_>, env: Inherited) -> Verdict {
         // Over the cap only the first reading is made (see `matching`), and the answer is at
         // least an ask: what it cannot check, it does not allow.
         let mut best = if matches!(action, Action::Command(c) if c.len() > MAX_COMMAND_BYTES) {
             Verdict {
                 decision: Decision::Ask,
                 reason: Some("The command is too long for organon to check fully.".into()),
+                class: None,
             }
         } else {
             Verdict {
                 decision: Decision::Allow,
                 reason: None,
+                class: None,
             }
         };
         if let Action::Command(cmd) = action {
-            if let Some(reason) = self.merge_denial(cmd, repo_of, origin_of, env) {
+            let denied = self
+                .merge_denial(cmd, look.repo_of, look.origin_of, env)
+                .or_else(|| {
+                    self.admin_merge(cmd, look.repo_of, env)
+                        .then_some(MERGE_ADMIN_DENIED)
+                });
+            if let Some(reason) = denied {
                 best = Verdict {
                     decision: Decision::Deny,
                     reason: Some(reason.into()),
+                    class: Some(MERGE_CLASS.into()),
                 };
             }
         }
-        for (r, bash) in self.matching(action, branch_of, repo_of, origin_of, env) {
+        for (r, bash) in self.matching(action, look, env) {
             // Text that only cmd or PowerShell reads as a command (a bash quote that they do
             // not know) may be a commit message: a deny there is an ask.
             let decision = if r.decision == Decision::Deny && !bash {
@@ -622,6 +830,7 @@ impl Policy {
                 best = Verdict {
                     decision,
                     reason: Some(r.reason.clone()),
+                    class: r.class.clone(),
                 };
             }
         }
@@ -633,26 +842,28 @@ impl Policy {
     /// rather than let through unchecked.
     #[must_use]
     pub fn approval_class(&self, action: Action<'_>, branch_of: BranchOf<'_>) -> Option<&Rule> {
-        self.matching(
-            action,
+        let look = Lookups {
+            cwd: None,
             branch_of,
-            &no_repo,
-            &no_origin,
-            Inherited::default(),
-        )
-        .into_iter()
-        .map(|(r, _)| r)
-        .find(|r| r.class.is_some())
+            repo_of: &no_repo,
+            origin_of: &no_origin,
+            remotes_of: &no_remotes,
+        };
+        self.matching(action, &look, Inherited::default())
+            .into_iter()
+            .map(|(r, _)| r)
+            .find(|r| r.class.is_some())
     }
 
     fn matching(
         &self,
         action: Action<'_>,
-        branch_of: BranchOf<'_>,
-        repo_of: RepoOf<'_>,
-        origin_of: OriginOf<'_>,
+        look: &Lookups<'_>,
         env: Inherited,
     ) -> Vec<(&Rule, bool)> {
+        let (branch_of, repo_of, origin_of) = (look.branch_of, look.repo_of, look.origin_of);
+        let home = self.home_key();
+        let home = home.as_deref();
         // Each rule with whether a bash reading of the command matched it.
         let mut out: Vec<(&Rule, bool)> = Vec::new();
         match action {
@@ -668,7 +879,9 @@ impl Policy {
                     let first = vec![Parsed {
                         segs: split(cmd, OLD),
                         bash: true,
+                        other: false,
                         bang: true,
+                        wild: Vec::new(),
                     }];
                     (first, Vec::new())
                 } else {
@@ -678,39 +891,194 @@ impl Policy {
                 // or `GH_HOST` set in the environment or named anywhere in the command, and
                 // the one form of command a `merge` exception may lift. Over the cap neither
                 // exists: nothing is lifted there.
-                let exceptions = !self.exceptions.is_empty() && !oversize;
+                let exceptions = self.lifts_any() && !oversize;
                 let gh_target = env.gh_target || (exceptions && names_a_gh_target(cmd, &raw));
                 let lone = if exceptions { lone_merge(cmd) } else { None };
+                // A command that moves the home folder (`export HOME=...`) changes what `~` and
+                // every path under it mean: nothing is lifted there.
+                let home_names = ["HOME".to_owned(), "USERPROFILE".to_owned()];
+                let home_set = raw.iter().any(|ws| assigns_any(ws, &home_names));
                 let reads: Vec<Reading> = parsed
                     .into_iter()
                     .map(|p| {
                         let mut segs = p.segs;
-                        let certain = !p.bang && folders_are_certain(cmd, &segs);
+                        let moves = folder_moves(cmd, &segs);
                         let dirs = segment_dirs(&segs);
+                        let written = segs.clone();
                         resolve_pushes(&mut segs, branch_of);
+                        // In the spelling of [`norm_seg_at`], also without a leading `<`.
+                        let wild = p
+                            .wild
+                            .iter()
+                            .flat_map(|w| [w.as_str(), w.trim_start_matches('<')])
+                            .flat_map(|w| [true, false].map(|l| norm_text_at(w, l, home)))
+                            .collect();
                         Reading {
                             segs,
-                            certain,
+                            written,
+                            wild,
+                            certain: !p.bang && !home_set && moves == Folders::Certain,
+                            chained: !p.bang && !home_set && moves != Folders::Unknown,
                             dirs,
                             bash: p.bash,
+                            other: p.other,
                         }
                     })
                     .collect();
-                let agree = reads.iter().all(|r| r.certain)
-                    && reads.windows(2).all(|w| w[0].shape() == w[1].shape());
+                let same = reads.windows(2).all(|w| w[0].shape() == w[1].shape());
+                let agree = same && reads.iter().all(|r| r.certain);
+                // Not certain only because a `cd` is chained with `;`, `|` or `||`: each later
+                // part then runs in one of a few folders that can be read (see `part_folders`).
+                let chained = same && !agree && reads.iter().all(|r| r.chained);
+                // Rules and words are compared in one spelling: see [`norm_seg`].
+                let patterns: Vec<Option<String>> = self
+                    .rules
+                    .iter()
+                    .map(|r| r.command.as_deref().map(|c| norm_pattern(c, home)))
+                    .collect();
+                let steered = env.gh_target || names_a_gh_target(cmd, &raw);
+                let job_dir = !sets_job_dir(cmd);
+                // Looked up at most once per command: the agent's own folder, and the remotes
+                // of each repository a push is judged by.
+                let own_folder: std::cell::OnceCell<Option<String>> = std::cell::OnceCell::new();
+                let own_folder = || own_folder.get_or_init(|| repo_of(None)).as_deref();
+                let remotes = RemoteCache::default();
+                // A command that sets one of the guarded variables, in any reading.
+                for r in self.rules.iter().filter(|r| !r.assigns.is_empty()) {
+                    if raw.iter().any(|ws| assigns_any(ws, &r.assigns)) {
+                        out.push((r, true));
+                    }
+                }
                 for read in &reads {
-                    for (seg, dir) in read.segs.iter().zip(&read.dirs) {
+                    for (k, (seg, dir)) in read.segs.iter().zip(&read.dirs).enumerate() {
                         // Some(None): looked up, no repository; looked up at most once per part.
                         let mut repo: Option<Option<String>> = None;
-                        for r in &self.rules {
-                            if !r.command.as_deref().is_some_and(|p| matches(p, seg)) {
+                        let nseg = norm_seg_at(seg, home);
+                        // The folders the part may run in: the one the `cd`s lead to when that
+                        // is certain, else every one a `cd` that worked or failed leaves it in.
+                        let folders: Option<Vec<Option<String>>> = if agree {
+                            Some(vec![dir.clone()])
+                        } else if oversize {
+                            None
+                        } else {
+                            part_folders(&read.segs, k)
+                        };
+                        // The words as the paths they name from each of those folders, for the
+                        // rules marked `paths`.
+                        let mut hints: Vec<Option<&str>> = match &folders {
+                            Some(fs) => fs.iter().map(Option::as_deref).collect(),
+                            None => vec![None],
+                        };
+                        if !hints.contains(&dir.as_deref()) {
+                            hints.push(dir.as_deref());
+                        }
+                        // Over the cap the words are only matched as written: reading
+                        // them as paths costs time, and such a command asks anyway.
+                        let named: Vec<Vec<String>> = hints
+                            .iter()
+                            .filter(|_| !oversize)
+                            .map(|h| {
+                                let base = look.cwd.map(|cwd| lexical_folder(cwd, *h, home));
+                                resolved_seg(&nseg, base.as_deref())
+                            })
+                            .collect();
+                        // A word the shell may expand stays one when read as a path.
+                        let mut wild = read.wild.clone();
+                        for s in &named {
+                            for (w, path) in nseg.iter().zip(s) {
+                                if read.wild.contains(w) {
+                                    wild.insert(path.clone());
+                                }
+                            }
+                        }
+                        for (r, pattern) in self.rules.iter().zip(&patterns) {
+                            let Some(p) = pattern.as_deref() else {
                                 continue;
+                            };
+                            let hit = if r.paths && !oversize {
+                                names_file(p, &nseg, r, &wild)
+                                    || named.iter().any(|s| names_file(p, s, r, &wild))
+                            } else {
+                                matches_with(p, &nseg, &r.unless)
+                            };
+                            if !hit
+                                || !(r.rewrites.is_empty() || rewrites_branch(&nseg, &r.rewrites))
+                                || (r.sends && !sends_data(&nseg))
+                                || (r.foreign
+                                    && !(names_foreign(&nseg, &self.own_repos)
+                                        || (steered && runs_gh(&nseg))
+                                        || self.pushes_elsewhere(
+                                            &read.written[k],
+                                            &read.written,
+                                            folders.as_deref(),
+                                            look,
+                                            &remotes,
+                                        )))
+                                || self.agreed_command(r, &nseg, home)
+                            {
+                                continue;
+                            }
+                            if r.owned_only {
+                                // Skipped only where both the agent's folder and the part's
+                                // are known to be outside the territory.
+                                let outside = |f: Option<&str>| {
+                                    f.is_some_and(|f| !self.in_territory(f, false))
+                                };
+                                let part = if agree { dir.as_deref() } else { None };
+                                if outside(own_folder())
+                                    && (part.is_none() || outside(repo_of(part).as_deref()))
+                                {
+                                    continue;
+                                }
                             }
                             if let Some(seen) = out.iter_mut().find(|(o, _)| *o == r) {
                                 seen.1 |= read.bash;
                                 continue;
                             }
-                            if agree && r.decision == Decision::Ask && !self.exceptions.is_empty() {
+                            if !agree
+                                && same
+                                && !home_set
+                                && r.decision == Decision::Ask
+                                && !self.territory.is_empty()
+                            {
+                                if let Some(class) = r.class.as_deref() {
+                                    let bash_only = read.bash && !read.other;
+                                    // Every folder the part may run in is theirs, and a delete
+                                    // stays inside from each of them.
+                                    let everywhere = chained
+                                        && class != MERGE_CLASS
+                                        && !(gh_target && runs_gh(seg))
+                                        && folders.as_ref().is_some_and(|fs| {
+                                            fs.iter().all(|f| {
+                                                // A folder the command itself makes is not
+                                                // there yet: it is read as written.
+                                                let here =
+                                                    repo_of(f.as_deref()).or_else(|| f.clone());
+                                                here.is_some_and(|h| {
+                                                    self.owned(class, &h)
+                                                        && (class != DELETE_CLASS
+                                                            || self.deletes_inside(
+                                                                &nseg,
+                                                                Some(&h),
+                                                                bash_only,
+                                                                job_dir,
+                                                                false,
+                                                            ))
+                                                })
+                                            })
+                                        });
+                                    // Whatever the folder: a delete of absolute paths that are
+                                    // all inside, run from one of their folders.
+                                    let absolute = class == DELETE_CLASS
+                                        && own_folder().is_some_and(|h| self.owned(class, h))
+                                        && self
+                                            .deletes_inside(&nseg, None, bash_only, job_dir, true);
+                                    if everywhere || absolute {
+                                        continue;
+                                    }
+                                }
+                            }
+                            if agree && r.decision == Decision::Ask && self.lifts_any() {
                                 if let Some(mut class) = r.class.as_deref() {
                                     // A rule that asks because the merge names its repository
                                     // by flag is lifted like the merge rule, when the flag names
@@ -727,7 +1095,18 @@ impl Policy {
                                     // apply: a merge only as `lone_merge` reads it and with a
                                     // clean environment, any other class where the part runs
                                     // unless `GH_REPO` or `GH_HOST` steers a `gh` command.
-                                    let hint: Option<Option<&str>> = if class == MERGE_CLASS {
+                                    // In a territory a merge may also be part of a longer
+                                    // certain chain, if it names no other repository and
+                                    // nothing steers `gh` (lifted by the territory only).
+                                    let chained = class == MERGE_CLASS
+                                        && lone.is_none()
+                                        && !self.territory.is_empty()
+                                        && !gh_target
+                                        && !env.init_unsafe
+                                        && plain_merge(seg);
+                                    let hint: Option<Option<&str>> = if chained {
+                                        Some(dir.as_deref())
+                                    } else if class == MERGE_CLASS {
                                         lone.filter(|_| !env.gh_target && !env.init_unsafe)
                                             .map(|l| l.dir)
                                     } else if !(gh_target && runs_gh(seg)) {
@@ -750,8 +1129,23 @@ impl Policy {
                                             .and_then(|u| github_slug(&u))
                                             .is_some_and(|o| Some(o) == flag_slug(flag))
                                     };
-                                    if here.as_deref().is_some_and(|f| self.excepted(class, f))
-                                        && (class != MERGE_CLASS || named_ok())
+                                    let lifted = if chained {
+                                        here.as_deref().is_some_and(|f| self.owned(class, f))
+                                    } else {
+                                        here.as_deref().is_some_and(|f| self.excepted(class, f))
+                                            && (class != MERGE_CLASS || named_ok())
+                                    };
+                                    // A delete is lifted only while what it deletes stays
+                                    // inside the person's own folders.
+                                    if lifted
+                                        && (class != DELETE_CLASS
+                                            || self.deletes_inside(
+                                                &nseg,
+                                                here.as_deref(),
+                                                read.bash && !read.other,
+                                                job_dir,
+                                                false,
+                                            ))
                                     {
                                         continue;
                                     }
@@ -763,20 +1157,45 @@ impl Policy {
                 }
             }
             Action::Write { path } => {
-                let path = path.replace('\\', "/");
+                let path = norm_path_at(path, home);
                 out.extend(
                     self.rules
                         .iter()
-                        .filter(|r| r.path.as_deref().is_some_and(|p| glob(p, &path)))
+                        .filter(|r| {
+                            r.path
+                                .as_deref()
+                                .is_some_and(|p| path_matches(p, &path, &r.unless, home))
+                        })
                         .map(|r| (r, true)),
                 );
             }
-            Action::Tool(name) => out.extend(
-                self.rules
-                    .iter()
-                    .filter(|r| r.tool.as_deref().is_some_and(|p| glob(p, name)))
-                    .map(|r| (r, true)),
-            ),
+            Action::Read { path } => {
+                let path = norm_path_at(path, home);
+                out.extend(
+                    self.rules
+                        .iter()
+                        .filter(|r| {
+                            r.read
+                                .as_deref()
+                                .is_some_and(|p| path_matches(p, &path, &r.unless, home))
+                        })
+                        .map(|r| (r, true)),
+                );
+            }
+            Action::Tool(name) => {
+                let name = name.to_lowercase();
+                out.extend(
+                    self.rules
+                        .iter()
+                        .filter(|r| {
+                            r.tool
+                                .as_deref()
+                                .is_some_and(|p| pat(&p.to_lowercase(), &name))
+                        })
+                        .filter(|r| !self.agreed_tool(r, &name))
+                        .map(|r| (r, true)),
+                );
+            }
         }
         out
     }
@@ -793,11 +1212,7 @@ impl Policy {
         origin_of: OriginOf<'_>,
         env: Inherited,
     ) -> Option<&'static str> {
-        if self.exceptions.is_empty()
-            || cmd.len() > MAX_COMMAND_BYTES
-            || env.gh_target
-            || env.init_unsafe
-        {
+        if !self.lifts_any() || cmd.len() > MAX_COMMAND_BYTES || env.gh_target || env.init_unsafe {
             return None;
         }
         let (dir, words) = merge_shape(cmd)?;
@@ -818,12 +1233,288 @@ impl Policy {
         self.excepted(MERGE_CLASS, &folder).then_some(reason)
     }
 
-    /// Whether a person lifted `class` for the repository in `folder`.
+    /// Whether a person lifted `class` for the repository in `folder`: an exception for it,
+    /// or the folder is in the territory. Never for one of the [`Policy::lines`].
     fn excepted(&self, class: &str, folder: &str) -> bool {
-        let folder = folder.replace('\\', "/").to_lowercase();
-        self.exceptions
-            .iter()
-            .any(|e| e.class == class && glob(&e.repo.replace('\\', "/").to_lowercase(), &folder))
+        if self.lines.iter().any(|l| l == class) {
+            return false;
+        }
+        let lower = folder.replace('\\', "/").to_lowercase();
+        self.owned(class, folder)
+            || self.exceptions.iter().any(|e| {
+                e.class == class && glob(&e.repo.replace('\\', "/").to_lowercase(), &lower)
+            })
+    }
+
+    /// Whether a bash reading of `cmd` has a `gh pr merge` with `--admin`, behind any prefix
+    /// or inside any chain ([`merge_denial`](Self::merge_denial) reads only the two plain
+    /// forms), in a folder where a merge is lifted: the agent's own, or the one the part
+    /// moved to. Denied there like the plain form; elsewhere the rules keep asking.
+    fn admin_merge(&self, cmd: &str, repo_of: RepoOf<'_>, env: Inherited) -> bool {
+        if !self.lifts_any() || cmd.len() > MAX_COMMAND_BYTES || env.gh_target || env.init_unsafe {
+            return false;
+        }
+        parse_all(cmd).iter().filter(|p| p.bash).any(|p| {
+            let dirs = segment_dirs(&p.segs);
+            p.segs.iter().zip(&dirs).any(|(seg, dir)| {
+                seg.len() > 3
+                    && seg[..3] == ["gh", "pr", "merge"]
+                    && seg[3..].iter().any(|w| w.starts_with("--admin"))
+                    && [None, dir.as_deref()]
+                        .iter()
+                        .any(|h| repo_of(*h).is_some_and(|f| self.excepted(MERGE_CLASS, &f)))
+            })
+        })
+    }
+
+    /// [`Policy::home`] in the spelling paths are compared in: `/`, lower case, a drive
+    /// letter (`/c/Users/x` is `c:/users/x`), no trailing `/`.
+    fn home_key(&self) -> Option<String> {
+        let h = self.home.as_deref()?.replace('\\', "/").to_lowercase();
+        let h = match h.as_bytes() {
+            [b'/', d, b'/', ..] if d.is_ascii_alphabetic() => {
+                format!("{}:{}", *d as char, &h[2..])
+            }
+            _ => h,
+        };
+        let h = h.trim_end_matches('/');
+        (!h.is_empty()).then(|| h.to_owned())
+    }
+
+    /// Whether a `git push` part (as written, not normalised: a remote's name keeps its case)
+    /// pushes to a remote that is not one of [`Policy::own_repos`], or to one whose URL cannot
+    /// be known. A remote given as a URL is judged by [`names_foreign`], a local path is not
+    /// a send. A name is looked up, first among the remotes the command itself sets
+    /// (`git remote add`, `git remote set-url`; a `git config` of a remote or a URL rewrite
+    /// is not followed and asks), then among the remotes of the repository in every folder
+    /// the part may run in (`folders`; `None`: they cannot be read). A bare `git push` goes
+    /// to a remote the text does not name: every remote must then be the person's own.
+    fn pushes_elsewhere(
+        &self,
+        seg: &[String],
+        segs: &[Vec<String>],
+        folders: Option<&[Option<String>]>,
+        look: &Lookups<'_>,
+        cache: &RemoteCache,
+    ) -> bool {
+        let Some(words) = git_words(seg).filter(|w| w.first().is_some_and(|s| s == "push")) else {
+            return false;
+        };
+        let words = &words[1..];
+        let args = push_arguments(words);
+        if args.flags.iter().any(|f| f.starts_with("--repo")) {
+            return true;
+        }
+        let name = match args.positional.first().map(|&k| words[k].as_str()) {
+            Some(r)
+                if r.contains("://")
+                    || r.contains(['/', '\\'])
+                    || r.starts_with(['.', '~'])
+                    || r.split_once(':').is_some_and(|(a, _)| a.contains('@')) =>
+            {
+                return false;
+            }
+            other => other,
+        };
+        let foreign = |url: &str| {
+            github_slug(url)
+                .is_none_or(|s| !self.own_repos.iter().any(|o| glob(&o.to_lowercase(), &s)))
+        };
+        // What the command itself does to the remotes.
+        let mut set_here = false;
+        for other in segs {
+            let Some(w) = git_words(other) else {
+                continue;
+            };
+            match w.first().map(String::as_str) {
+                Some("config")
+                    if w.iter().any(|x| {
+                        let x = x.to_lowercase();
+                        x.starts_with("remote.") || x.starts_with("url.") || x.contains("insteadof")
+                    }) =>
+                {
+                    return true;
+                }
+                Some("remote") => {
+                    let rest: Vec<&String> =
+                        w[1..].iter().filter(|x| !x.starts_with('-')).collect();
+                    if let [verb, remote, url, ..] = rest.as_slice() {
+                        let sets = matches!(verb.as_str(), "add" | "set-url");
+                        if sets && name.is_none_or(|n| n == remote.as_str()) {
+                            if foreign(url) {
+                                return true;
+                            }
+                            set_here = true;
+                        }
+                    } else if rest.first().is_some_and(|v| *v == "rename") {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if set_here && name.is_some() {
+            return false;
+        }
+        let Some(folders) = folders else {
+            return true;
+        };
+        folders.iter().any(|f| {
+            let Some(root) = (look.repo_of)(f.as_deref()) else {
+                return true;
+            };
+            let Some(remotes) = cache.get(&root, look.remotes_of) else {
+                return true;
+            };
+            match name {
+                Some(n) => remotes
+                    .iter()
+                    .find(|(r, _)| r == n)
+                    .is_none_or(|(_, url)| foreign(url)),
+                None => remotes.iter().any(|(_, url)| foreign(url)),
+            }
+        })
+    }
+
+    /// Whether an agreed exception lifts `r` (an `ask` with a class) for this part of a command.
+    fn agreed_command(&self, r: &Rule, seg: &[String], home: Option<&str>) -> bool {
+        r.decision == Decision::Ask
+            && self.agreed.iter().any(|a| {
+                r.class.as_deref() == Some(a.class.as_str())
+                    && a.command
+                        .as_deref()
+                        .is_some_and(|p| matches(&norm_pattern(p, home), seg))
+            })
+    }
+
+    /// Whether an agreed exception lifts `r` (an `ask` with a class) for the tool `name`.
+    fn agreed_tool(&self, r: &Rule, name: &str) -> bool {
+        r.decision == Decision::Ask
+            && self.agreed.iter().any(|a| {
+                r.class.as_deref() == Some(a.class.as_str())
+                    && a.tool
+                        .as_deref()
+                        .is_some_and(|p| pat(&p.to_lowercase(), name))
+            })
+    }
+
+    /// Whether anything can lift an `ask` here: an exception or a territory.
+    fn lifts_any(&self) -> bool {
+        !self.exceptions.is_empty() || !self.territory.is_empty()
+    }
+
+    /// Whether `folder` is in the territory and `class` is not one of the lines.
+    fn owned(&self, class: &str, folder: &str) -> bool {
+        !self.lines.iter().any(|l| l == class) && self.in_territory(folder, false)
+    }
+
+    /// Whether `path` is one of the territory's folders or inside one; with `strictly`, only
+    /// inside one (the folder itself does not count). Both are read in one spelling
+    /// ([`norm_path`]): `\` or `/`, any case, `~`, `$HOME` or `C:/Users/<name>`.
+    #[must_use]
+    pub fn in_territory(&self, path: &str, strictly: bool) -> bool {
+        within(&self.territory, path, strictly, self.home_key().as_deref())
+    }
+
+    /// Whether every file a delete command names stays inside the person's own folders: a
+    /// plain relative path (no `..`, variable or `.git`, not the folder itself) inside the
+    /// folder it runs in (`here`, already known to be theirs), or an absolute path strictly
+    /// inside the territory or a [`Policy::scratch`] folder, with no glob. `seg` is
+    /// normalised ([`norm_seg`]). `bash_only`: only a bash reading gives these words, so a
+    /// PowerShell or cmd program in them would not run (and its `\` paths were eaten by
+    /// bash's escapes): the other readings judge it. `job_dir`: `$CLAUDE_JOB_DIR` is the one
+    /// the session inherited (the command does not set it). Other commands of the class
+    /// (`git ...`) delete inside their repository. With `absolute_only` the folder is not
+    /// known (`here` is not read): only a delete program whose targets are all absolute paths
+    /// inside counts. A program run through a package runner (`npx rimraf x`) is read as the
+    /// program; a target with braces (`{a,../b}`) is never inside.
+    fn deletes_inside(
+        &self,
+        seg: &[String],
+        here: Option<&str>,
+        bash_only: bool,
+        job_dir: bool,
+        absolute_only: bool,
+    ) -> bool {
+        let unwrapped = unwrap_runner(seg).filter(|s| s.first().is_some_and(|p| p == "rimraf"));
+        let seg = unwrapped.as_deref().unwrap_or(seg);
+        let Some(prog) = seg.first() else {
+            return !absolute_only;
+        };
+        if prog == "cmd" && seg.get(1).is_some_and(|w| w == "/c" || w == "/k") {
+            return bash_only
+                || self.deletes_inside(&seg[2..], here, false, job_dir, absolute_only);
+        }
+        let cmd_flags = matches!(prog.as_str(), "rmdir" | "rd" | "del" | "erase");
+        let find = prog == "find";
+        if !cmd_flags
+            && !find
+            && !matches!(
+                prog.as_str(),
+                "rm" | "unlink" | "remove-item" | "ri" | "rimraf"
+            )
+        {
+            return !absolute_only;
+        }
+        // `rmdir /s /q C:\x` is cmd's: bash would have eaten its `\`, the cmd reading has it.
+        let cmd_style = cmd_flags && seg[1..].iter().any(|w| w.len() == 2 && w.starts_with('/'));
+        if bash_only
+            && (cmd_style || matches!(prog.as_str(), "remove-item" | "ri" | "rd" | "del" | "erase"))
+        {
+            return true;
+        }
+        if here.is_none() && !absolute_only {
+            return false;
+        }
+        let targets: Vec<&String> = if find {
+            // `find <paths> <expression>`: the paths come before the first expression word.
+            seg[1..]
+                .iter()
+                .take_while(|w| !w.starts_with(['-', '(', '!']))
+                .collect()
+        } else {
+            seg[1..]
+                .iter()
+                .filter(|w| {
+                    !w.starts_with('-') && !(cmd_flags && w.starts_with('/') && w.len() == 2)
+                })
+                .collect()
+        };
+        // A delete that names nothing is fed its files (`... | Remove-Item`, `xargs rm`).
+        !targets.is_empty()
+            && targets.iter().all(|t| {
+                let t = t.as_str();
+                let (t, scratch_var) = match t.strip_prefix("$claude_job_dir/tmp/") {
+                    Some(rest) if job_dir => (rest, true),
+                    _ => (t, false),
+                };
+                let glob_chars = t.contains(['*', '?', '[']);
+                if t.contains(['$', '%', '`', '{'])
+                    || (t.contains('~') && !t.starts_with("~/"))
+                    || t.split('/').any(|part| {
+                        part == ".."
+                        // Bash's `*` skips dot files; PowerShell's `-Force` does not.
+                        || ((part.starts_with('.') || is_powershell(prog)) && glob(part, ".git"))
+                        || (glob_chars && part.starts_with('.') && part.contains(['?', '[']))
+                    })
+                {
+                    return false;
+                }
+                if scratch_var {
+                    return !glob_chars && !t.is_empty();
+                }
+                let b = t.as_bytes();
+                let absolute =
+                    t.starts_with('/') || t.starts_with('~') || (b.len() >= 2 && b[1] == b':');
+                if !absolute {
+                    // Not the folder itself (`.`, `./`), except as where `find` looks.
+                    return !absolute_only
+                        && (find || !t.split('/').all(|part| part.is_empty() || part == "."));
+                }
+                !glob_chars
+                    && (self.in_territory(t, true)
+                        || within(&self.scratch, t, true, self.home_key().as_deref()))
+            })
     }
 
     /// Whether every part of `cmd` is something allowed after the budget ran out. A wrap-up
@@ -857,10 +1548,19 @@ pub const MAX_COMMAND_BYTES: usize = 64 * 1024;
 /// One reading of a command: its parts, and where each works (see [`readings`]).
 struct Reading {
     segs: Vec<Vec<String>>,
+    /// The parts before [`resolve_pushes`] added a branch to a bare `git push`.
+    written: Vec<Vec<String>>,
+    /// The words the shell may expand into file names ([`Split::wild`]), normalised.
+    wild: std::collections::HashSet<String>,
     certain: bool,
+    /// Whether the folders are certain, or uncertain only because a `cd` is chained with
+    /// something other than `&&` ([`Folders::Chained`]).
+    chained: bool,
     dirs: Vec<Option<String>>,
     /// Whether a bash reading gives these parts.
     bash: bool,
+    /// Whether a PowerShell or cmd reading gives them too.
+    other: bool,
 }
 
 impl Reading {
@@ -912,6 +1612,9 @@ struct Syntax {
     ansi_c: bool,
     /// Bash `${...}`, inside which a `&` is text.
     braces: bool,
+    /// PowerShell script blocks: a `{` that starts a word and the `}` that closes it end a
+    /// command, so `try {vercel --prod} catch {}` is read as the commands inside.
+    blocks: bool,
     amp: Amp,
     /// Whether this is a reading of bash (as opposed to PowerShell or cmd).
     bash: bool,
@@ -927,6 +1630,7 @@ const OLD: Syntax = Syntax {
     smart_quotes: false,
     ansi_c: false,
     braces: false,
+    blocks: false,
     amp: Amp::Keep,
     bash: true,
 };
@@ -951,6 +1655,7 @@ const POWERSHELL: Syntax = Syntax {
     smart_quotes: true,
     ansi_c: false,
     braces: false,
+    blocks: true,
     amp: Amp::Split { amp_gt: false },
     bash: false,
 };
@@ -962,6 +1667,7 @@ const CMD: Syntax = Syntax {
     smart_quotes: false,
     ansi_c: false,
     braces: false,
+    blocks: false,
     amp: Amp::Split { amp_gt: false },
     bash: false,
 };
@@ -1014,9 +1720,13 @@ struct Parsed {
     segs: Vec<Vec<String>>,
     /// Whether a bash reading gives these parts (and not only PowerShell or cmd).
     bash: bool,
+    /// Whether a PowerShell or cmd reading gives them.
+    other: bool,
     /// Whether a part started with `!`, which inverts its status: a failed `cd` then lets
     /// the next part run in the folder before it.
     bang: bool,
+    /// The words with a wildcard outside quotes (see [`Split::wild`]).
+    wild: Vec<String>,
 }
 
 fn parse_all(cmd: &str) -> Vec<Parsed> {
@@ -1036,12 +1746,16 @@ fn parse_with_raw(cmd: &str) -> (Vec<Parsed>, Vec<Vec<String>>) {
         match out.iter_mut().find(|p| p.segs == s.segs) {
             Some(p) => {
                 p.bash |= syntax.bash;
+                p.other |= !syntax.bash;
                 p.bang |= s.bang;
+                p.wild.extend(s.wild);
             }
             None => out.push(Parsed {
                 segs: s.segs,
                 bash: syntax.bash,
+                other: !syntax.bash,
                 bang: s.bang,
+                wild: s.wild,
             }),
         }
     }
@@ -1529,38 +2243,311 @@ struct Split {
     /// Every unquoted word of every simple command, assignments and commands made only of
     /// assignments included, with the program as written.
     raw: Vec<Vec<String>>,
+    /// The words that have a `*`, `?`, `[` or `{` outside quotes: the shell may expand them
+    /// into file names (`cat .e*`), which a quoted one (`--jq '.[].name'`) never is.
+    wild: Vec<String>,
 }
 
 fn split_full(cmd: &str, sh: Syntax) -> Split {
+    split_at(cmd, sh, 0)
+}
+
+/// How deep a command run by another (`bash -c "sh -c '...'"`) is still read.
+const MAX_INNER: u8 = 3;
+
+/// Programs that run the command that follows them, with their options that take a value and
+/// how many words come before that command (the duration of `timeout`). PowerShell's block
+/// words are here too: what follows them is a `{`, which is dropped like a shell keyword.
+const PREFIXES: &[(&str, &[&str], usize)] = &[
+    ("timeout", &["-k", "--kill-after", "-s", "--signal"], 1),
+    ("nohup", &[], 0),
+    ("winpty", &[], 0),
+    ("builtin", &[], 0),
+    ("command", &[], 0),
+    ("setsid", &[], 0),
+    ("chronic", &[], 0),
+    ("stdbuf", &["-i", "-o", "-e"], 0),
+    ("nice", &["-n", "--adjustment"], 0),
+    ("ionice", &["-c", "-n", "-p"], 0),
+    (
+        "sudo",
+        &[
+            "-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U", "-r", "-t",
+        ],
+        0,
+    ),
+    ("doas", &["-u", "-C"], 0),
+    ("exec", &["-a"], 0),
+    (
+        "env",
+        &["-u", "--unset", "-C", "--chdir", "-S", "--split-string"],
+        0,
+    ),
+    (
+        "xargs",
+        &[
+            "-I",
+            "-n",
+            "-P",
+            "-d",
+            "-L",
+            "-s",
+            "-a",
+            "-E",
+            "--max-args",
+            "--max-procs",
+            "--delimiter",
+            "--arg-file",
+            "--replace",
+        ],
+        0,
+    ),
+    ("try", &[], 0),
+    ("catch", &[], 0),
+    ("finally", &[], 0),
+    ("foreach-object", &[], 0),
+    ("%", &[], 0),
+    ("foreach", &[], 0),
+    ("where-object", &[], 0),
+    ("?", &[], 0),
+    ("start-job", &[], 0),
+    ("start-threadjob", &[], 0),
+    ("invoke-command", &[], 0),
+    ("icm", &[], 0),
+    ("measure-command", &[], 0),
+];
+
+/// What a simple command runs besides itself.
+enum Inner {
+    Nothing,
+    /// The words of the command it runs (`timeout 60 git push` runs `git push`); `true` when
+    /// it also moves to another folder first (`env -C dir`), which is not followed.
+    Words(Vec<String>, bool),
+    /// A command line it hands to a shell (`bash -c "..."`, `cmd /c ...`, `eval ...`), and
+    /// how that shell reads it.
+    Text(String, Syntax),
+}
+
+/// The command `ws` (program first, as written) runs, if it is a prefix program, a
+/// PowerShell block word or assignment (`$x = command`), or a shell given a command line.
+fn inner_of(prog: &str, ws: &[String], sh: Syntax) -> Inner {
+    let rest = &ws[1..];
+    if prog.starts_with('$') {
+        if rest.first().is_some_and(|w| w == "=" || w == "+=") {
+            return Inner::Words(rest[1..].to_vec(), false);
+        }
+        return match ws[0].split_once('=') {
+            Some((_, v)) => {
+                let mut inner = rest.to_vec();
+                if !v.is_empty() {
+                    inner.insert(0, v.to_owned());
+                }
+                Inner::Words(inner, false)
+            }
+            None => Inner::Nothing,
+        };
+    }
+    if let Some((_, values, before)) = PREFIXES.iter().find(|(p, ..)| *p == prog) {
+        // `command -v git` looks a program up; it runs nothing.
+        if prog == "command" && rest.first().is_some_and(|w| w == "-v" || w == "-V") {
+            return Inner::Nothing;
+        }
+        let mut i = 0;
+        let mut moved = false;
+        while i < rest.len() {
+            let w = rest[i].as_str();
+            if prog == "env" && is_assignment(w) {
+                i += 1;
+                continue;
+            }
+            if w == "--" {
+                i += 1;
+                break;
+            }
+            if !w.starts_with('-') || w == "-" {
+                break;
+            }
+            moved |= matches!(prog, "env" | "sudo")
+                && (w == "-C" || w == "-D" || w.starts_with("--chdir"));
+            i += if values.contains(&w) { 2 } else { 1 };
+        }
+        i += before;
+        return if i < rest.len() {
+            Inner::Words(rest[i..].to_vec(), moved)
+        } else {
+            Inner::Nothing
+        };
+    }
+    let flag = |test: &dyn Fn(&str) -> bool| rest.iter().position(|w| test(&w.to_lowercase()));
+    let from = |i: Option<usize>, sh: Syntax| match i {
+        Some(i) if i + 1 < rest.len() => Inner::Text(rest[i + 1..].join(" "), sh),
+        _ => Inner::Nothing,
+    };
+    match prog {
+        "cmd" => from(flag(&|w| w == "/c" || w == "/k"), CMD),
+        "bash" | "sh" | "zsh" | "dash" | "ksh" => {
+            match flag(&|w| w.starts_with('-') && !w.starts_with("--") && w.ends_with('c')) {
+                Some(i) if i + 1 < rest.len() => Inner::Text(rest[i + 1].clone(), BASH_QUOTING),
+                _ => Inner::Nothing,
+            }
+        }
+        "powershell" | "pwsh" => from(
+            flag(&|w| w.len() >= 2 && "-command".starts_with(w)),
+            POWERSHELL,
+        ),
+        "eval" if !rest.is_empty() => Inner::Text(rest.join(" "), sh),
+        "invoke-expression" | "iex" if !rest.is_empty() => {
+            let words: Vec<&str> = rest
+                .iter()
+                .filter(|w| !w.starts_with('-'))
+                .map(String::as_str)
+                .collect();
+            Inner::Text(words.join(" "), POWERSHELL)
+        }
+        "start-process" | "saps" | "start" => start_process(rest),
+        _ => Inner::Nothing,
+    }
+}
+
+/// `Start-Process vercel -ArgumentList '--prod'` runs `vercel --prod`: the program is the
+/// first plain word or the value of `-FilePath`, its arguments the value of `-ArgumentList`
+/// (or `-Args`, or the second plain word), split at spaces and commas.
+fn start_process(rest: &[String]) -> Inner {
+    const VALUES: &[&str] = &[
+        "workingdirectory",
+        "verb",
+        "windowstyle",
+        "redirectstandardoutput",
+        "redirectstandarderror",
+        "redirectstandardinput",
+        "credential",
+    ];
+    let mut prog: Option<&String> = None;
+    let mut args: Vec<String> = Vec::new();
+    let split = |a: &String, args: &mut Vec<String>| {
+        args.extend(
+            a.split([' ', ','])
+                .filter(|p| !p.is_empty())
+                .map(str::to_owned),
+        );
+    };
+    let mut i = 0;
+    while i < rest.len() {
+        let w = &rest[i];
+        let lower = w.to_lowercase();
+        if let Some(name) = lower.strip_prefix('-').filter(|n| !n.is_empty()) {
+            if "filepath".starts_with(name) {
+                prog = rest.get(i + 1);
+                i += 2;
+            } else if "argumentlist".starts_with(name) || name == "args" {
+                if let Some(a) = rest.get(i + 1) {
+                    split(a, &mut args);
+                }
+                i += 2;
+            } else if VALUES.iter().any(|v| v.starts_with(name)) {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if prog.is_none() {
+            prog = Some(w);
+        } else {
+            split(w, &mut args);
+        }
+        i += 1;
+    }
+    match prog {
+        Some(p) => {
+            args.insert(0, p.clone());
+            Inner::Words(args, false)
+        }
+        None => Inner::Nothing,
+    }
+}
+
+/// The name a simple command's program is matched by: its file name in lower case
+/// ([`program_name`]). PowerShell's and cmd's `cd..`, `cd\` and `cd/x` are all `cd..`: a
+/// change of folder that is not followed.
+fn program_of(p: &str) -> String {
+    let l = p.to_ascii_lowercase();
+    if l.len() > 2 && l.starts_with("cd") && matches!(l.as_bytes()[2], b'.' | b'\\' | b'/') {
+        return "cd..".to_owned();
+    }
+    program_name(p)
+}
+
+/// Add the simple command `ws` (leading assignments, keywords and redirections already
+/// dropped) to `out`, and after it every command it runs ([`inner_of`]): `timeout 60 git
+/// push` is judged as itself and as `git push`. The command itself always stays, so nothing
+/// is judged more leniently than before the inner one was read.
+fn push_command(mut ws: Vec<String>, sh: Syntax, depth: u8, out: &mut Split) {
+    for _ in 0..8 {
+        let Some(first) = ws.first() else {
+            return;
+        };
+        let prog = program_of(first);
+        let mut seg = ws.clone();
+        seg[0].clone_from(&prog);
+        out.segs.push(seg);
+        if depth >= MAX_INNER {
+            return;
+        }
+        match inner_of(&prog, &ws, sh) {
+            Inner::Nothing => return,
+            Inner::Words(inner, moved) => {
+                if moved {
+                    out.segs.push(vec!["chdir".to_owned()]);
+                }
+                ws = strip_leading(inner).0;
+            }
+            Inner::Text(text, inner_sh) => {
+                let inner = split_at(&text, inner_sh, depth + 1);
+                out.segs.extend(inner.segs);
+                out.raw.extend(inner.raw);
+                out.wild.extend(inner.wild);
+                out.bang |= inner.bang;
+                return;
+            }
+        }
+    }
+}
+
+fn split_at(cmd: &str, sh: Syntax, depth: u8) -> Split {
     let mut out = Split {
         segs: Vec::new(),
         bang: false,
         raw: Vec::new(),
+        wild: Vec::new(),
     };
     let mut words: Vec<String> = Vec::new();
     let mut word = String::new();
     let mut quote: Option<Quote> = None;
     let mut chars = cmd.chars().peekable();
     let mut prev = ' ';
-    let push_word = |word: &mut String, words: &mut Vec<String>| {
-        if !word.is_empty() {
-            words.push(std::mem::take(word));
-        }
-    };
+    // How many PowerShell script blocks are open (see [`Syntax::blocks`]).
+    let mut blocks = 0_u32;
+    // Whether the word being read has a wildcard or brace outside quotes (see [`Split::wild`]).
+    let mut wild = false;
+    let push_word =
+        |word: &mut String, words: &mut Vec<String>, wild: &mut bool, seen: &mut Vec<String>| {
+            if std::mem::take(wild) && !seen.contains(word) {
+                seen.push(word.clone());
+            }
+            if !word.is_empty() {
+                words.push(std::mem::take(word));
+            }
+        };
     let end = |words: &mut Vec<String>, out: &mut Split| {
         let all = std::mem::take(words);
         if all.is_empty() {
             return;
         }
         out.raw.push(all.clone());
-        let (mut ws, negated) = strip_leading(all);
+        let (ws, negated) = strip_leading(all);
         out.bang |= negated && !ws.is_empty();
-        if let Some(p) = ws.first_mut() {
-            *p = program_name(p);
-        }
-        if !ws.is_empty() {
-            out.segs.push(ws);
-        }
+        push_command(ws, sh, depth, out);
     };
     while let Some(c) = chars.next() {
         let before = std::mem::replace(&mut prev, c);
@@ -1629,25 +2616,36 @@ fn split_full(cmd: &str, sh: Syntax) -> Split {
                         word.push(c);
                         continue;
                     }
-                    push_word(&mut word, &mut words);
+                    push_word(&mut word, &mut words, &mut wild, &mut out.wild);
                     end(&mut words, &mut out);
                 }
                 // `(` and `)` also end a command, so a subshell's commands are still read.
                 ';' | '\n' | '(' | ')' => {
-                    push_word(&mut word, &mut words);
+                    push_word(&mut word, &mut words, &mut wild, &mut out.wild);
                     end(&mut words, &mut out);
                 }
-                _ if c.is_whitespace() => push_word(&mut word, &mut words),
+                '{' if sh.blocks && word.is_empty() => {
+                    blocks += 1;
+                    end(&mut words, &mut out);
+                }
+                '}' if sh.blocks && blocks > 0 => {
+                    blocks -= 1;
+                    push_word(&mut word, &mut words, &mut wild, &mut out.wild);
+                    end(&mut words, &mut out);
+                }
+                _ if c.is_whitespace() => {
+                    push_word(&mut word, &mut words, &mut wild, &mut out.wild);
+                }
                 '<' => {
                     // `a<f` → `a`, `<f`; a file descriptor stays with it (`0<&0`).
                     if !word.chars().all(|c| c.is_ascii_digit()) {
-                        push_word(&mut word, &mut words);
+                        push_word(&mut word, &mut words, &mut wild, &mut out.wild);
                     }
                     word.push(c);
                 }
                 '>' => {
                     // Redirections are their own words: `a>>b` → `a`, `>>`, `b`.
-                    push_word(&mut word, &mut words);
+                    push_word(&mut word, &mut words, &mut wild, &mut out.wild);
                     let mut op = String::from('>');
                     if chars.peek() == Some(&'>') {
                         chars.next();
@@ -1655,11 +2653,14 @@ fn split_full(cmd: &str, sh: Syntax) -> Split {
                     }
                     words.push(op);
                 }
-                _ => word.push(c),
+                _ => {
+                    wild |= matches!(c, '*' | '?' | '[' | '{');
+                    word.push(c);
+                }
             },
         }
     }
-    push_word(&mut word, &mut words);
+    push_word(&mut word, &mut words, &mut wild, &mut out.wild);
     end(&mut words, &mut out);
     out
 }
@@ -1775,7 +2776,15 @@ fn program_name(p: &str) -> String {
 /// A command run through a package runner (`npx vercel`, `pnpm dlx vercel`) is matched as
 /// the command it runs.
 fn matches(pattern: &str, seg: &[String]) -> bool {
-    matches_words(pattern, seg) || unwrap_runner(seg).is_some_and(|s| matches_words(pattern, &s))
+    matches_with(pattern, seg, &[])
+}
+
+/// [`matches`], where a word that matches one of `unless` does not count for a pattern word
+/// after the program. A pattern word may hold alternatives (`cp|mv`, see [`pat`]); a final
+/// `$$` means "and no more words at all" (`set $$` is a bare `set`, not `set -e`).
+fn matches_with(pattern: &str, seg: &[String], unless: &[String]) -> bool {
+    matches_words(pattern, seg, unless)
+        || unwrap_runner(seg).is_some_and(|s| matches_words(pattern, &s, unless))
 }
 
 /// Whether `seg` begins with exactly the words of `pattern` (the first may be a glob).
@@ -1787,16 +2796,121 @@ fn leads_with(pattern: &str, seg: &[String]) -> bool {
         && words[1..].iter().zip(&seg[1..]).all(|(p, w)| p == w)
 }
 
-fn matches_words(pattern: &str, seg: &[String]) -> bool {
+fn matches_words(pattern: &str, seg: &[String], unless: &[String]) -> bool {
+    matches_words_as(pattern, seg, unless, None)
+}
+
+/// The words of a command that the shell may expand into file names: see [`Split::wild`].
+type Wild = std::collections::HashSet<String>;
+
+/// Whether a part names one of the files the rule `r` (marked `paths`) guards with `pattern`:
+/// see [`Rule::paths`] and [`Rule::quiet`]. `seg` is normalised; the caller also tries it with
+/// its words resolved from the part's folder ([`resolved_seg`]).
+fn names_file(pattern: &str, seg: &[String], r: &Rule, wild: &Wild) -> bool {
+    let names = |s: &[String]| {
+        let Some(prog) = s.first() else {
+            return false;
+        };
+        if r.quiet.iter().any(|q| glob(&q.to_lowercase(), prog)) {
+            return false;
+        }
+        let copies = matches!(prog.as_str(), "cp" | "copy" | "copy-item" | "cpi");
+        let plain: Vec<usize> = (1..s.len()).filter(|&i| !s[i].starts_with('-')).collect();
+        // The target of a copy whose sources are all excused (`cp .env.example .env`).
+        let target = match plain.split_last() {
+            Some((last, sources)) if copies && !sources.is_empty() => sources
+                .iter()
+                .all(|&i| r.unless.iter().any(|u| glob(u, &s[i])))
+                .then_some(*last),
+            _ => None,
+        };
+        let words: Vec<String> = s
+            .iter()
+            .enumerate()
+            .filter(|(i, w)| {
+                // Text with spaces is a message, unless it starts like a path.
+                let text = w.contains(char::is_whitespace)
+                    && !(is_absolute(w) || w.starts_with("./") || w.starts_with("../"));
+                *i == 0 || !(text || Some(*i) == target || s[i - 1] == "--env-file")
+            })
+            .map(|(_, w)| w.clone())
+            .collect();
+        matches_words_as(pattern, &words, &r.unless, Some(wild))
+    };
+    names(seg)
+        || unwrap_runner(seg).is_some_and(|s| names(&s))
+        || substituted(seg).iter().any(|s| names(s))
+}
+
+/// The commands inside the substitutions a part's words hold (`echo "$(cat .env)"` → `cat
+/// .env`), split on blanks only; a lone file (`"$(<.env)"`) is read by the substitution
+/// itself. So a quoted substitution is not passed over as a message, nor excused by the
+/// program it is handed to. A heredoc in a substitution is a message (`git commit -m
+/// "$(cat <<'EOF'`), and backticks are left alone: commit messages quote names with them.
+fn substituted(seg: &[String]) -> Vec<Vec<String>> {
+    seg.iter()
+        .filter(|w| w.contains("$(") && !w.contains("<<"))
+        .filter_map(|w| {
+            let mut inner: Vec<String> = w
+                .split(|c: char| c.is_whitespace() || "$()<`\"'".contains(c))
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if inner.len() == 1 {
+                inner.insert(0, "$(".to_owned());
+            }
+            (!inner.is_empty()).then_some(inner)
+        })
+        .collect()
+}
+
+/// [`matches_words`]; for a rule marked `paths` (`wild` is given), a word also counts by the
+/// value of a flag it carries (`-Path:.env`, `if=.env`) and, when it is one of `wild`, by
+/// each word its braces expand to and by what its wildcards could expand to
+/// ([`globs_meet`]).
+fn matches_words_as(pattern: &str, seg: &[String], unless: &[String], wild: Option<&Wild>) -> bool {
     let mut p = pattern.split_whitespace();
     let (Some(first), Some(prog)) = (p.next(), seg.first()) else {
         return false;
     };
-    if !glob(first, prog) {
+    if !pat(first, prog) {
         return false;
     }
+    let dots = is_powershell(prog);
+    // An `unless` never excuses a word for `*`, which stands for "something more".
+    let excused = |pw: &str, w: &str| pw != "*" && unless.iter().any(|u| glob(u, w));
+    let hit = |pw: &str, w: &String| {
+        if excused(pw, w) {
+            return false;
+        }
+        let Some(wild) = wild else {
+            return pat(pw, w);
+        };
+        let expands = wild.contains(w.as_str());
+        let value = w.split_once([':', '=']).map(|(_, v)| v);
+        [Some(w.as_str()), value.filter(|v| !v.is_empty())]
+            .into_iter()
+            .flatten()
+            .flat_map(|c| {
+                if expands {
+                    expand_braces(c)
+                } else {
+                    vec![c.to_owned()]
+                }
+            })
+            .any(|e| {
+                (pat(pw, &e) && !excused(pw, &e))
+                    || (expands
+                        && pw != "*"
+                        && e.contains(['*', '?', '['])
+                        && pw.split('|').any(|a| globs_meet(a, &e, dots)))
+            })
+    };
     let mut i = 1;
     for pw in p {
+        if pw == "$$" {
+            return i == seg.len();
+        }
         if pw == "$" {
             // Nothing but flags follows. A redirection is not an argument, wherever it is.
             let rest = &seg[i..];
@@ -1810,7 +2924,7 @@ fn matches_words(pattern: &str, seg: &[String]) -> bool {
             }
             return true;
         }
-        match seg[i..].iter().position(|w| glob(pw, w)) {
+        match seg[i..].iter().position(|w| hit(pw, w)) {
             Some(k) => i += k + 1,
             None => return false,
         }
@@ -1818,12 +2932,261 @@ fn matches_words(pattern: &str, seg: &[String]) -> bool {
     true
 }
 
+/// The words a word with braces expands to in bash (`{.env,x}` → `.env`, `x`; `a{b,c}` →
+/// `ab`, `ac`), at most 32; a word without a brace list is itself.
+#[must_use]
+pub fn expand_braces(w: &str) -> Vec<String> {
+    let mut out = vec![w.to_owned()];
+    let mut i = 0;
+    while i < out.len() && out.len() <= 32 {
+        let s = out[i].clone();
+        let list = s.find('{').and_then(|a| {
+            let b = a + s[a..].find('}')?;
+            let inner = &s[a + 1..b];
+            (inner.contains(',') && !inner.contains('{')).then_some((a, b))
+        });
+        match list {
+            Some((a, b)) => {
+                out.remove(i);
+                for part in s[a + 1..b].split(',') {
+                    out.push(format!("{}{part}{}", &s[..a], &s[b + 1..]));
+                }
+            }
+            None => i += 1,
+        }
+    }
+    out
+}
+
+/// Whether some file name is matched both by the rule pattern `pattern` ([`glob`]: `*` is any
+/// run of characters) and by the shell wildcard `word`: `.e*` and `.env*` meet in `.env`, so
+/// `cat .e*` may read it. The shell's `*`, `?` and `[...]` are all read as "some characters
+/// of one path component", which can only make more words meet. As in bash, a wildcard does
+/// not match a `/` or the dot that starts a component; with `dots` (PowerShell) it matches
+/// that dot.
+fn globs_meet(pattern: &str, word: &str, dots: bool) -> bool {
+    let a: Vec<char> = pattern.chars().collect();
+    let mut b: Vec<char> = Vec::new();
+    let mut it = word.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '*' | '?' => b.push('*'),
+            '[' if it.clone().any(|x| x == ']') => {
+                it.by_ref().take_while(|x| *x != ']').for_each(drop);
+                b.push('*');
+            }
+            _ => b.push(c),
+        }
+        if b.ends_with(&['*', '*']) {
+            b.pop();
+        }
+    }
+    // (i, j, fresh): `fresh` is a word wildcard that starts a component and has matched
+    // nothing yet, so it may not take a dot.
+    fn rec(
+        a: &[char],
+        b: &[char],
+        dots: bool,
+        at: (usize, usize, bool),
+        seen: &mut std::collections::HashSet<(usize, usize, bool)>,
+    ) -> bool {
+        let (i, j, fresh) = at;
+        if i == a.len() && j == b.len() {
+            return true;
+        }
+        if !seen.insert(at) {
+            return false;
+        }
+        let starts = |j: usize| !dots && j < b.len() && b[j] == '*' && (j == 0 || b[j - 1] == '/');
+        if j < b.len() && b[j] == '*' {
+            // The wildcard ends here, or takes one more character from the pattern's side.
+            if rec(a, b, dots, (i, j + 1, false), seen) {
+                return true;
+            }
+            return match a.get(i) {
+                Some('*') => {
+                    rec(a, b, dots, (i + 1, j, fresh), seen)
+                        || (fresh && rec(a, b, dots, (i, j, false), seen))
+                }
+                Some(&c) => {
+                    c != '/' && !(fresh && c == '.') && rec(a, b, dots, (i + 1, j, false), seen)
+                }
+                None => false,
+            };
+        }
+        match (a.get(i), b.get(j)) {
+            (Some('*'), _) => {
+                rec(a, b, dots, (i + 1, j, fresh), seen)
+                    || (j < b.len() && rec(a, b, dots, (i, j + 1, starts(j + 1)), seen))
+            }
+            (Some(x), Some(y)) if x == y => rec(a, b, dots, (i + 1, j + 1, starts(j + 1)), seen),
+            _ => false,
+        }
+    }
+    let fresh = !dots && b.first() == Some(&'*');
+    rec(
+        &a,
+        &b,
+        dots,
+        (0, 0, fresh),
+        &mut std::collections::HashSet::new(),
+    )
+}
+
+/// `p` with its `.` and `..` components resolved by reading it (`a/b/../c` → `a/c`); a `..`
+/// that would leave the root (`/`, `~`, `c:`) or a relative path's start stays.
+fn collapse_dots(p: &str) -> String {
+    let mut parts = p.split('/');
+    let root = parts.next().unwrap_or_default();
+    let rooted = root.is_empty() || root == "~" || root.ends_with(':');
+    let mut stack: Vec<&str> = Vec::new();
+    for part in (!rooted).then_some(root).into_iter().chain(parts) {
+        match part {
+            "" | "." => {}
+            ".." if stack.last().is_some_and(|l| *l != "..") => {
+                stack.pop();
+            }
+            _ => stack.push(part),
+        }
+    }
+    let body = stack.join("/");
+    match (rooted, body.is_empty()) {
+        (true, false) => format!("{root}/{body}"),
+        // The root itself, as written: `/`, `~`, `~/`, `c:/`.
+        (true, true) if p.ends_with('/') => format!("{root}/"),
+        (true, true) => root.to_owned(),
+        (false, _) => body,
+    }
+}
+
+/// The folder `hint` (a `cd` target or `git -C`, `None` for the agent's own) names from the
+/// agent's folder `cwd`, by reading the two: one spelling ([`norm_text_at`]), no `..`.
+fn lexical_folder(cwd: &str, hint: Option<&str>, home: Option<&str>) -> String {
+    let c = norm_text_at(cwd, true, home);
+    let c = c.trim_end_matches('/');
+    match hint.map(|h| norm_text_at(h, true, home)) {
+        Some(h) if is_absolute(&h) => collapse_dots(&h),
+        Some(h) => collapse_dots(&format!("{c}/{h}")),
+        None => collapse_dots(c),
+    }
+}
+
+/// Whether a path (in one spelling) starts at a root: `/x`, `~/x`, `c:/x`.
+fn is_absolute(p: &str) -> bool {
+    let b = p.as_bytes();
+    p.starts_with(['/', '~']) || (b.len() >= 2 && b[1] == b':')
+}
+
+/// A normalised part with each word that may be a path made absolute from `base` (the part's
+/// folder, when known) and its `..` resolved, for the rules marked `paths`. Flags,
+/// redirections, variables, URLs and words with spaces stay as they are.
+fn resolved_seg(seg: &[String], base: Option<&str>) -> Vec<String> {
+    seg.iter()
+        .enumerate()
+        .map(|(i, w)| {
+            if i == 0
+                || w.is_empty()
+                || w.starts_with(['-', '<', '>', '&', '|', '$', '%'])
+                || w.contains("://")
+                || w.contains(char::is_whitespace)
+            {
+                return w.clone();
+            }
+            match base {
+                _ if is_absolute(w) => collapse_dots(w),
+                Some(base) => collapse_dots(&format!("{}/{w}", base.trim_end_matches('/'))),
+                None => w.clone(),
+            }
+        })
+        .collect()
+}
+
+/// The words of a `git` part from its subcommand on (`git -C x push origin` → `push`,
+/// `origin`), skipping git's own options.
+fn git_words(seg: &[String]) -> Option<&[String]> {
+    if seg.first().is_none_or(|p| p != "git") {
+        return None;
+    }
+    let mut i = 1;
+    while i < seg.len() && seg[i].starts_with('-') {
+        i += if GIT_VALUE_FLAGS.contains(&seg[i].as_str()) {
+            2
+        } else {
+            1
+        };
+    }
+    seg.get(i..).filter(|w| !w.is_empty())
+}
+
+/// The remotes of each repository a command's pushes were judged by, read at most once.
+#[derive(Default)]
+struct RemoteCache(std::cell::RefCell<Vec<(String, Remotes)>>);
+
+type Remotes = Option<Vec<(String, String)>>;
+
+impl RemoteCache {
+    fn get(&self, root: &str, remotes_of: RemotesOf<'_>) -> Remotes {
+        let mut seen = self.0.borrow_mut();
+        if let Some((_, r)) = seen.iter().find(|(k, _)| k == root) {
+            return r.clone();
+        }
+        let r = remotes_of(root);
+        seen.push((root.to_owned(), r.clone()));
+        r
+    }
+}
+
+/// The folders part `k` of a command may run in when a `cd` before it is chained with `;`,
+/// `|` or `||`: the agent's own (`None`: every `cd` failed, or ran in a subshell) and the
+/// target of each `cd` before it (all absolute: see [`folder_moves`]). A `git -C <absolute>`
+/// works in that folder whatever the `cd`s did; a relative `-C`, or more than one, is not
+/// read (`None`).
+fn part_folders(segs: &[Vec<String>], k: usize) -> Option<Vec<Option<String>>> {
+    let seg = &segs[k];
+    if seg.first().is_some_and(|p| p == "git") {
+        let mut dash_c: Vec<&String> = Vec::new();
+        let mut i = 1;
+        while i < seg.len() && seg[i].starts_with('-') {
+            if seg[i] == "-C" {
+                dash_c.extend(seg.get(i + 1));
+            }
+            i += if GIT_VALUE_FLAGS.contains(&seg[i].as_str()) {
+                2
+            } else {
+                1
+            };
+        }
+        match dash_c.as_slice() {
+            [] => {}
+            [c] if is_absolute(&c.replace('\\', "/")) => return Some(vec![Some((*c).clone())]),
+            _ => return None,
+        }
+    }
+    let mut out: Vec<Option<String>> = vec![None];
+    for s in &segs[..k] {
+        if matches!(
+            s.first().map(String::as_str),
+            Some("cd" | "set-location" | "sl" | "chdir" | "pushd" | "push-location")
+        ) {
+            if let Some(t) = s[1..].iter().find(|w| !w.starts_with('-')) {
+                if !out.contains(&Some(t.clone())) {
+                    out.push(Some(t.clone()));
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
 /// `npx -y vercel@latest --prod` → `vercel --prod`.
 fn unwrap_runner(seg: &[String]) -> Option<Vec<String>> {
     let skip = match seg.first()?.as_str() {
         "npx" | "pnpx" | "bunx" => 1,
-        "pnpm" | "yarn" if seg.get(1).is_some_and(|w| w == "dlx") => 2,
+        "pnpm" | "yarn" if seg.get(1).is_some_and(|w| w == "dlx" || w == "exec") => 2,
+        "bun" if seg.get(1).is_some_and(|w| w == "x") => 2,
         "npm" if seg.get(1).is_some_and(|w| w == "exec") => 2,
+        // `pnpm vercel --prod`, `yarn npm publish`: a word that is not a flag may be a program.
+        "pnpm" | "yarn" | "bun" if seg.get(1).is_some_and(|w| !w.starts_with('-')) => 1,
         _ => return None,
     };
     let mut rest: Vec<String> = seg[skip..]
@@ -1897,7 +3260,8 @@ fn join_dir(base: Option<&str>, p: &str) -> String {
     let absolute = p.starts_with('/')
         || p.starts_with('\\')
         || p.starts_with('~')
-        || (p.len() >= 2 && p.as_bytes()[1] == b':');
+        || (p.len() >= 2 && p.as_bytes()[1] == b':')
+        || under_job_dir(p).is_some();
     match base {
         Some(b) if !absolute => format!("{}/{p}", b.trim_end_matches(['/', '\\'])),
         _ => p.to_owned(),
@@ -1911,30 +3275,100 @@ fn join_dir(base: Option<&str>, p: &str) -> String {
 /// `--work-tree`, `GIT_DIR`, `GIT_WORK_TREE`). Only `&&` chains of plain commands qualify.
 #[must_use]
 pub fn folders_are_certain(cmd: &str, segs: &[Vec<String>]) -> bool {
+    folder_moves(cmd, segs) == Folders::Certain
+}
+
+/// What reading a command tells about the folder each part works in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Folders {
+    /// Each part's folder is known ([`folders_are_certain`]).
+    Certain,
+    /// Every `cd` is plain and absolute, but one is chained with something other than `&&`
+    /// (`;`, `|`, `||`, a subshell, a new line): a later part runs in the agent's folder or
+    /// in the target of a `cd` before it ([`part_folders`]).
+    Chained,
+    /// Nothing can be said.
+    Unknown,
+}
+
+/// Programs that change the folder, or may, in a way that is not followed: a directory
+/// stack, PowerShell's `cd..` and `cd\` ([`program_of`]), `chdir`, and commands that run text
+/// or a script in the shell itself (`eval`, `.`, `source`, `Invoke-Expression`), which can
+/// `cd` anywhere.
+const MOVES_UNSEEN: &[&str] = &[
+    "pushd",
+    "popd",
+    "push-location",
+    "pop-location",
+    "chdir",
+    "cd..",
+    "eval",
+    ".",
+    "source",
+    "invoke-expression",
+    "iex",
+];
+
+/// The rest of a path under the session's scratch folder, written with the variable
+/// (`$CLAUDE_JOB_DIR/tmp/x`, `${CLAUDE_JOB_DIR}/x`, `$env:CLAUDE_JOB_DIR\x`): a `cd` there is
+/// as certain as an absolute one while the command does not set the variable itself.
+fn under_job_dir(p: &str) -> Option<&str> {
+    let l = p.to_ascii_lowercase();
+    [
+        "${env:claude_job_dir}",
+        "$env:claude_job_dir",
+        "${claude_job_dir}",
+        "$claude_job_dir",
+    ]
+    .iter()
+    .find_map(|v| {
+        l.strip_prefix(v)
+            .filter(|rest| rest.starts_with(['/', '\\']))
+            .map(|_| &p[v.len()..])
+    })
+}
+
+fn folder_moves(cmd: &str, segs: &[Vec<String>]) -> Folders {
     let rest = cmd.replace("&&", " ");
-    if rest.contains(['|', ';', '&', '(', ')', '`', '\n', '\r'])
+    // A lone `&` (not `2>&1`, `>&2`, `&>f`) is read differently by the shells.
+    let b = rest.as_bytes();
+    let lone_amp = b.iter().enumerate().any(|(i, &c)| {
+        c == b'&' && !(i > 0 && matches!(b[i - 1], b'<' | b'>')) && b.get(i + 1) != Some(&b'>')
+    });
+    if lone_amp
+        || rest.contains('`')
         || rest.contains("$(")
         || cmd.contains("GIT_DIR")
         || cmd.contains("GIT_WORK_TREE")
     {
-        return false;
+        return Folders::Unknown;
+    }
+    fn program(seg: &[String]) -> Option<&str> {
+        seg.first().map(String::as_str)
+    }
+    if segs
+        .iter()
+        .any(|seg| program(seg).is_some_and(|p| p.is_empty() || MOVES_UNSEEN.contains(&p)))
+    {
+        return Folders::Unknown;
     }
     // A path the shell would expand (variables, home, globs) cannot be read from the text.
     // `..` is resolved by the shell logically (through the link it came by) but by the
     // repository lookup physically, so a path with `..` cannot be judged either.
-    let literal = |w: &String| {
+    let literal = |w: &str| {
         !w.contains(['$', '%', '~', '*', '?', '{', '['])
             && !w.split(['/', '\\']).any(|part| part == "..")
     };
-    segs.iter()
+    let job_dir = !sets_job_dir(cmd);
+    let plain = segs
+        .iter()
         .all(|seg| match seg.first().map(String::as_str) {
-            Some("pushd" | "popd") => false,
             Some("cd" | "set-location" | "sl") => {
                 let targets: Vec<&String> =
                     seg[1..].iter().filter(|w| !w.starts_with('-')).collect();
                 // A relative `cd` can be redirected by CDPATH (set in the command or inherited),
                 // so only an absolute target is certain.
-                let absolute = |w: &&String| {
+                let absolute = |w: &str| {
                     w.starts_with('/')
                         || w.starts_with('\\')
                         || (w.len() >= 2 && w.as_bytes()[1] == b':')
@@ -1942,7 +3376,12 @@ pub fn folders_are_certain(cmd: &str, segs: &[Vec<String>]) -> bool {
                 // `cd a b` fails in bash and leaves the folder as it was.
                 targets.len() == 1
                     && !seg[1..].iter().any(|w| w == "-")
-                    && targets.iter().all(|w| literal(w) && absolute(w))
+                    && targets
+                        .iter()
+                        .all(|w| match under_job_dir(w).filter(|_| job_dir) {
+                            Some(rest) => literal(rest),
+                            None => literal(w) && absolute(w),
+                        })
             }
             Some("git") => {
                 let mut ok = !seg
@@ -1955,7 +3394,7 @@ pub fn folders_are_certain(cmd: &str, segs: &[Vec<String>]) -> bool {
                     if w.starts_with("-C") && w.len() > 2 {
                         ok = false;
                     }
-                    if w == "-C" && !seg.get(i + 1).is_some_and(literal) {
+                    if w == "-C" && !seg.get(i + 1).is_some_and(|t| literal(t)) {
                         ok = false;
                     }
                     i += if GIT_VALUE_FLAGS.contains(&w) { 2 } else { 1 };
@@ -1963,7 +3402,21 @@ pub fn folders_are_certain(cmd: &str, segs: &[Vec<String>]) -> bool {
                 ok
             }
             _ => true,
-        })
+        });
+    if !plain {
+        return Folders::Unknown;
+    }
+    // Parts chained otherwise (`;`, `|`, `||`, `&`, a subshell, a new line) still run in the
+    // agent's folder when no part changes the folder: only a failed or skipped `cd` makes a
+    // later part run somewhere else.
+    let moves = segs
+        .iter()
+        .any(|seg| matches!(program(seg), Some("cd" | "set-location" | "sl")));
+    if moves && rest.contains(['|', ';', '&', '(', ')', '\n', '\r']) {
+        Folders::Chained
+    } else {
+        Folders::Certain
+    }
 }
 
 pub fn resolve_pushes(segs: &mut [Vec<String>], branch_of: BranchOf<'_>) {
@@ -2091,6 +3544,535 @@ fn push_arguments(words: &[String]) -> PushArguments<'_> {
         i += 1;
     }
     out
+}
+
+/// The text of a word or path in one spelling, so a rule written once matches every way of
+/// writing it: `\` is `/`, the user's home in any spelling is `~` (`~`, `$HOME`, `${HOME}`,
+/// `$env:USERPROFILE`, `%USERPROFILE%`, `C:/Users/<name>`, `/c/Users/<name>`,
+/// `/mnt/c/Users/<name>`, `/home/<name>`), Git Bash's `/c/` is `c:/`, and `$CLAUDE_JOB_DIR` is
+/// `$claude_job_dir`. With `lower`, the whole text is in lower case (Windows paths and
+/// PowerShell words ignore case).
+#[must_use]
+pub fn norm_text(w: &str, lower: bool) -> String {
+    norm_text_at(w, lower, None)
+}
+
+/// [`norm_text`] where only `home` (as [`Policy::home`] gives it: `/`, lower case, a drive
+/// letter) is the home folder when a path spells it out: `C:/Users/Public` and
+/// `D:/Users/<name>` stay as written. `~`, `$HOME` and the like always mean it.
+#[must_use]
+pub fn norm_text_at(w: &str, lower: bool, home: Option<&str>) -> String {
+    let mut s = w.replace('\\', "/");
+    // `C:\\Users\\x` (an escaped `\`) is `C:/Users/x`; a URL keeps its `//`.
+    if !s.find("://").is_some_and(|i| i > 1) {
+        while s.contains("//") {
+            s = s.replace("//", "/");
+        }
+    }
+    let s = if lower { s.to_lowercase() } else { s };
+    let mut s = replace_home(&s, home);
+    for v in [
+        "${claude_job_dir}",
+        "$env:claude_job_dir",
+        "${env:claude_job_dir}",
+    ] {
+        if let Some(i) = s.to_ascii_lowercase().find(v) {
+            s.replace_range(i..i + v.len(), "$claude_job_dir");
+        }
+    }
+    if let Some(i) = s.to_ascii_lowercase().find("$claude_job_dir") {
+        s.replace_range(i..i + 15, "$claude_job_dir");
+    }
+    if let [b'/', d, b'/', ..] = s.as_bytes() {
+        if d.is_ascii_alphabetic() {
+            s = format!("{}:{}", (*d as char).to_ascii_lowercase(), &s[2..]);
+        }
+    }
+    s
+}
+
+/// `s` with each spelling of a user's home (see [`norm_text`]) replaced by `~`, where it starts
+/// a path: at the start of the text or after a character that is not a letter or digit.
+fn replace_home(s: &str, home: Option<&str>) -> String {
+    let l = s.to_ascii_lowercase();
+    let b = l.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        if i == 0 || !b[i - 1].is_ascii_alphanumeric() {
+            if let Some(n) = home_len(&l[i..], home) {
+                out.push('~');
+                i += n;
+                continue;
+            }
+        }
+        let Some(c) = s[i..].chars().next() else {
+            break;
+        };
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
+}
+
+/// How long the spelling of a home folder at the start of `l` (lower case, `/`) is.
+/// With `home`, a folder spelled out (`c:/users/<name>`, `/home/<name>`) counts only when it
+/// is that one.
+fn home_len(l: &str, home: Option<&str>) -> Option<usize> {
+    let ends = |rest: &str| rest.is_empty() || rest.starts_with(['/', '"', '\'']);
+    for t in [
+        "${env:userprofile}",
+        "$env:userprofile",
+        "${env:home}",
+        "$env:home",
+        "%userprofile%",
+        "${home}",
+        "$home",
+        "~",
+    ] {
+        if l.strip_prefix(t).is_some_and(ends) {
+            return Some(t.len());
+        }
+    }
+    let (skip, after) = match l.strip_prefix("/mnt/") {
+        Some(r) => (5, r),
+        None => (0, l),
+    };
+    let users = match after.as_bytes() {
+        [d, b':', b'/', ..] if skip == 0 && d.is_ascii_alphabetic() => Some(3),
+        [b'/', d, b'/', ..] if skip == 0 && d.is_ascii_alphabetic() => Some(3),
+        [d, b'/', ..] if skip > 0 && d.is_ascii_alphabetic() => Some(2),
+        _ => None,
+    };
+    let (prefix, rest) = match users {
+        Some(n) => (skip + n + 6, after[n..].strip_prefix("users/")?),
+        None => match l.strip_prefix("/home/") {
+            Some(r) => (6, r),
+            None => (7, l.strip_prefix("/users/")?),
+        },
+    };
+    let name = rest.find(['/', '"', '\'']).unwrap_or(rest.len());
+    if name == 0 {
+        return None;
+    }
+    if let Some(home) = home {
+        // The same folder in the spelling of `home`: `/c/users/x` and `/mnt/c/users/x` are
+        // `c:/users/x`.
+        let spelled = match users {
+            Some(_) => {
+                let drive = after.trim_start_matches('/').chars().next()?;
+                format!("{drive}:/users/{}", &rest[..name])
+            }
+            None => l[..prefix + name].to_owned(),
+        };
+        if spelled != home {
+            return None;
+        }
+    }
+    Some(prefix + name)
+}
+
+/// A file path a tool reads or writes, in one spelling ([`norm_text`], lower case). A relative
+/// path gets `./`, so `*/.env` matches `.env`.
+#[must_use]
+pub fn norm_path(p: &str) -> String {
+    norm_path_at(p, None)
+}
+
+/// [`norm_path`] with the home folder of [`norm_text_at`], and `.` and `..` resolved by
+/// reading the path (`a/../.env` is `.env`): a tool path cannot hide a guarded file behind
+/// them.
+#[must_use]
+pub fn norm_path_at(p: &str, home: Option<&str>) -> String {
+    let n = collapse_dots(&norm_text_at(p, true, home));
+    let b = n.as_bytes();
+    if n.starts_with(['/', '~'])
+        || n.starts_with("./")
+        || n.starts_with("../")
+        || (b.len() >= 2 && b[1] == b':')
+    {
+        n
+    } else {
+        format!("./{n}")
+    }
+}
+
+/// Whether the path `p` (already [`norm_path`]) matches the path pattern `pattern` and none of
+/// `unless`.
+fn path_matches(pattern: &str, p: &str, unless: &[String], home: Option<&str>) -> bool {
+    pat(&norm_text_at(pattern, true, home), p) && !unless.iter().any(|u| glob(u, p))
+}
+
+/// Whether `path` is one of `folders` ([`glob`]s) or inside one; with `strictly`, only inside.
+fn within(folders: &[String], path: &str, strictly: bool, home: Option<&str>) -> bool {
+    let path = norm_text_at(path, true, home);
+    let path = path.trim_end_matches('/');
+    folders.iter().any(|t| {
+        let t = norm_text_at(t, true, home);
+        let t = t.trim_end_matches('/');
+        (!strictly && glob(t, path)) || glob(&format!("{t}/*"), path)
+    })
+}
+
+/// PowerShell's own programs and aliases, whose parameters ignore case.
+fn is_powershell(prog: &str) -> bool {
+    (prog.contains('-')
+        && !prog.starts_with('-')
+        && prog.chars().next().is_some_and(char::is_alphabetic))
+        || matches!(
+            prog,
+            "irm"
+                | "iwr"
+                | "ri"
+                | "rni"
+                | "mi"
+                | "cpi"
+                | "gci"
+                | "gi"
+                | "gc"
+                | "sc"
+                | "ac"
+                | "ni"
+                | "clc"
+                | "sls"
+        )
+}
+
+/// A simple command in one spelling for the rules: every word after the program goes through
+/// [`norm_text`], in lower case unless it is a flag of a program whose flags keep their case
+/// (`rm -R`, `git branch -D`, `curl -F`); PowerShell's flags ignore case, so theirs are lower
+/// case too. `vc` is `vercel`.
+#[must_use]
+pub fn norm_seg(seg: &[String]) -> Vec<String> {
+    norm_seg_at(seg, None)
+}
+
+/// [`norm_seg`] with the home folder of [`norm_text_at`]. Two more spellings become one: an
+/// input redirection written against its file (`<.env`) is `<` and the file, and the method
+/// of a `gh api` is `-X` and its name in lower case (`-XDelete`, `--method=delete`).
+#[must_use]
+pub fn norm_seg_at(seg: &[String], home: Option<&str>) -> Vec<String> {
+    let Some(prog) = seg.first() else {
+        return Vec::new();
+    };
+    let ps = is_powershell(prog);
+    let gh_api = prog == "gh" && seg.get(1).is_some_and(|w| w == "api");
+    let mut out = Vec::with_capacity(seg.len());
+    out.push(if prog == "vc" {
+        "vercel".to_owned()
+    } else {
+        prog.clone()
+    });
+    let mut method = false;
+    for w in &seg[1..] {
+        if std::mem::take(&mut method) {
+            out.push(w.to_lowercase());
+            continue;
+        }
+        if gh_api {
+            let attached = w
+                .strip_prefix("--method=")
+                .or_else(|| w.strip_prefix("-X").filter(|m| !m.is_empty()));
+            if let Some(m) = attached {
+                out.push("-X".to_owned());
+                out.push(m.to_lowercase());
+                continue;
+            }
+            if w == "-X" || w == "--method" {
+                out.push("-X".to_owned());
+                method = true;
+                continue;
+            }
+        }
+        // Not the word after `<<`, which the splitter leaves as `<`, `<EOF`.
+        let after_op = out
+            .last()
+            .is_some_and(|l: &String| !l.is_empty() && l.chars().all(|c| c == '<'));
+        let file = w
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .strip_prefix('<')
+            .filter(|f| !after_op && !f.is_empty() && !f.starts_with(['<', '&', '(']));
+        if let Some(f) = file {
+            out.push("<".to_owned());
+            out.push(norm_text_at(f, true, home));
+            continue;
+        }
+        out.push(norm_text_at(w, ps || !w.starts_with('-'), home));
+    }
+    out
+}
+
+/// A command pattern in the spelling of [`norm_seg`].
+fn norm_pattern(pattern: &str, home: Option<&str>) -> String {
+    let mut words = pattern.split_whitespace();
+    let Some(first) = words.next() else {
+        return String::new();
+    };
+    let first = first.to_lowercase();
+    let ps = first.split('|').any(is_powershell);
+    let mut out = vec![first.clone()];
+    out.extend(words.map(|w| {
+        if w == "$" || w == "$$" {
+            w.to_owned()
+        } else {
+            norm_text_at(w, ps || !w.starts_with('-'), home)
+        }
+    }));
+    out.join(" ")
+}
+
+/// A [`glob`] with alternatives: `cp|mv|rm` matches any of the three.
+#[must_use]
+pub fn pat(pattern: &str, s: &str) -> bool {
+    pattern.split('|').any(|p| glob(p, s))
+}
+
+/// Whether an HTTP method sends nothing.
+fn reads_only(method: &str) -> bool {
+    matches!(
+        method.to_ascii_lowercase().trim_matches(['"', '\'']),
+        "get" | "head" | "options" | "default"
+    )
+}
+
+/// curl's short options that take a value (the rest of the group, or the next word).
+const CURL_VALUE_SHORT: &str = "oHuAewmxbcrYyzKECPQtDUhv";
+
+/// Whether a (normalised) simple command sends data somewhere: curl with a body, an upload or
+/// a method other than GET or HEAD in any spelling (`-d`, `-sd@f`, `--data*`, `--json`,
+/// `-F`, `--form*`, `-T`, `--upload-file`, `-XPOST`, `-X PATCH`, `--request=PUT`); wget with
+/// `--post-*`, `--body-*` or such a `--method`; `Invoke-RestMethod`, `Invoke-WebRequest` and
+/// their aliases with such a `-Method` (any prefix, `-Method:Post` too), `-Body`, `-InFile` or
+/// `-Form`; `gh api` with such a method or a field (`-f`, `-F`, `--field`, `--raw-field`,
+/// `--input`) and no `GET`.
+#[must_use]
+pub fn sends_data(seg: &[String]) -> bool {
+    let Some(prog) = seg.first() else {
+        return false;
+    };
+    let w = &seg[1..];
+    match prog.as_str() {
+        "curl" => curl_sends(w),
+        "wget" => w.iter().enumerate().any(|(i, a)| {
+            ["--post-data", "--post-file", "--body-data", "--body-file"]
+                .iter()
+                .any(|f| a.starts_with(f))
+                || a.strip_prefix("--method=").is_some_and(|m| !reads_only(m))
+                || (a == "--method" && w.get(i + 1).is_some_and(|m| !reads_only(m)))
+        }),
+        "invoke-restmethod" | "irm" | "invoke-webrequest" | "iwr" => {
+            w.iter().enumerate().any(|(i, a)| {
+                let Some(p) = a.strip_prefix('-') else {
+                    return false;
+                };
+                let (name, val) = p.split_once(':').map_or((p, None), |(n, v)| (n, Some(v)));
+                let method = name.len() >= 2 && "method".starts_with(name);
+                (method
+                    && val
+                        .or_else(|| w.get(i + 1).map(String::as_str))
+                        .is_some_and(|m| !reads_only(m)))
+                    || (!name.is_empty() && "body".starts_with(name))
+                    || (name.len() >= 2 && "infile".starts_with(name))
+                    || name == "form"
+            })
+        }
+        "gh" => gh_api_writes(seg),
+        // A source or target on another host: `user@host:path`, `host:path`, `rsync://`,
+        // `host::module`. A drive letter (`c:/x`) is not a host.
+        "rsync" => w.iter().any(|a| {
+            !a.starts_with('-')
+                && (a.contains("://")
+                    || a.split_once(':')
+                        .is_some_and(|(host, _)| host.len() > 1 && !host.contains('/')))
+        }),
+        _ => false,
+    }
+}
+
+fn curl_sends(w: &[String]) -> bool {
+    let mut i = 0;
+    while i < w.len() {
+        let a = w[i].as_str();
+        if let Some(long) = a.strip_prefix("--") {
+            let (name, val) = long
+                .split_once('=')
+                .map_or((long, None), |(n, v)| (n, Some(v)));
+            if name.starts_with("data")
+                || name == "json"
+                || name == "upload-file"
+                || name.starts_with("form")
+            {
+                return true;
+            }
+            if name == "request"
+                && val
+                    .or_else(|| w.get(i + 1).map(String::as_str))
+                    .is_some_and(|m| !reads_only(m))
+            {
+                return true;
+            }
+        } else if let Some(group) = a.strip_prefix('-') {
+            for (j, c) in group.char_indices() {
+                if matches!(c, 'd' | 'F' | 'T') {
+                    return true;
+                }
+                if c == 'X' {
+                    let m = &group[j + 1..];
+                    let m = if m.is_empty() {
+                        w.get(i + 1).map_or("", String::as_str)
+                    } else {
+                        m
+                    };
+                    if !m.is_empty() && !reads_only(m) {
+                        return true;
+                    }
+                    break;
+                }
+                if CURL_VALUE_SHORT.contains(c) {
+                    if j + c.len_utf8() == group.len() {
+                        i += 1; // the value is the next word
+                    }
+                    break;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether a `gh api` writes: a method other than GET or HEAD, or a field without one. A
+/// GraphQL call always carries fields: it writes when its query is a mutation, or comes from
+/// a file or standard input, which is not read.
+fn gh_api_writes(seg: &[String]) -> bool {
+    if seg.get(1).map(String::as_str) != Some("api") {
+        return false;
+    }
+    let w = &seg[2..];
+    if w.iter().any(|a| a.trim_start_matches('/') == "graphql") {
+        return w.iter().any(|a| {
+            let a = a.to_lowercase();
+            a.contains("mutation") || a.contains("=@") || a.starts_with("--input")
+        });
+    }
+    let mut method: Option<&str> = None;
+    let mut fields = false;
+    for (i, a) in w.iter().enumerate() {
+        let a = a.as_str();
+        if a == "-X" || a == "--method" {
+            method = w.get(i + 1).map(String::as_str);
+        } else if let Some(m) = a.strip_prefix("--method=").or_else(|| a.strip_prefix("-X")) {
+            method = Some(m);
+        } else if a.starts_with("-f")
+            || a.starts_with("-F")
+            || a.starts_with("--field")
+            || a.starts_with("--raw-field")
+            || a.starts_with("--input")
+        {
+            fields = true;
+        }
+    }
+    match method {
+        Some(m) => !reads_only(m),
+        None => fields,
+    }
+}
+
+/// Whether a (normalised) simple command names a GitHub repository that is not one of `own`
+/// (`owner/name` globs): `gh` with `--repo`, `--repo=`, `-R`, a github.com URL or a `gh api`
+/// path under `repos/`, or a `git push` to a remote given as a URL (another host than
+/// github.com counts as foreign; a remote's name or a local path does not).
+#[must_use]
+pub fn names_foreign(seg: &[String], own: &[String]) -> bool {
+    let foreign = |slug: Option<String>| {
+        slug.is_none_or(|s| !own.iter().any(|o| glob(&o.to_lowercase(), &s)))
+    };
+    match seg.first().map(String::as_str) {
+        Some("gh") => seg.iter().enumerate().skip(1).any(|(i, w)| {
+            let w = w.as_str();
+            if w == "--repo" || w == "-R" {
+                return foreign(seg.get(i + 1).and_then(|v| flag_slug(v)));
+            }
+            if let Some(v) = w.strip_prefix("--repo=") {
+                return foreign(flag_slug(v));
+            }
+            if let Some(v) = w.strip_prefix("-R").filter(|v| !v.is_empty()) {
+                return foreign(flag_slug(v));
+            }
+            if w.contains("github.com/") {
+                let path = w.split_once("github.com/").map_or("", |(_, p)| p);
+                let mut parts = path.split('/');
+                let slug = match (parts.next(), parts.next()) {
+                    (Some(o), Some(n)) => flag_slug(&format!("{o}/{}", n.trim_end_matches(".git"))),
+                    _ => None,
+                };
+                return foreign(slug);
+            }
+            if w.contains("://") {
+                return true;
+            }
+            if seg.get(1).map(String::as_str) == Some("api") && !w.starts_with('-') {
+                if let Some(path) = w.trim_start_matches('/').strip_prefix("repos/") {
+                    let mut parts = path.split('/');
+                    if let (Some(o), Some(n)) = (parts.next(), parts.next()) {
+                        return foreign(flag_slug(&format!("{o}/{n}")));
+                    }
+                }
+            }
+            false
+        }),
+        Some("git") => {
+            let Some(at) = seg.iter().position(|w| w == "push") else {
+                return false;
+            };
+            let words = &seg[at + 1..];
+            let args = push_arguments(words);
+            args.positional.first().is_some_and(|&k| {
+                let r = words[k].as_str();
+                let url = r.contains("://")
+                    || r.split_once(':')
+                        .is_some_and(|(a, _)| a.contains('@') && !a.contains('/'));
+                url && foreign(github_slug(r))
+            })
+        }
+        _ => false,
+    }
+}
+
+/// Whether the unquoted words of one part (assignments included) set one of `names`.
+fn assigns_any(words: &[String], names: &[String]) -> bool {
+    words.iter().enumerate().any(|(i, w)| {
+        let w = w.to_lowercase();
+        let w = w.strip_prefix("$env:").unwrap_or(&w);
+        names.iter().any(|n| {
+            let n = n.to_lowercase();
+            w.strip_prefix(n.as_str()).is_some_and(|rest| {
+                rest.starts_with('=')
+                    || (rest.is_empty()
+                        && (words.get(i + 1).is_some_and(|x| x.starts_with('='))
+                            || words.first().is_some_and(|p| {
+                                matches!(
+                                    p.to_lowercase().as_str(),
+                                    "export" | "set" | "setx" | "declare" | "typeset" | "env"
+                                )
+                            })))
+            })
+        })
+    })
+}
+
+/// Whether the command sets `CLAUDE_JOB_DIR` itself, in any form: then `$CLAUDE_JOB_DIR` is not
+/// the session's scratch folder.
+fn sets_job_dir(cmd: &str) -> bool {
+    let s = squashed(cmd);
+    s.match_indices("claude_job_dir").any(|(i, m)| {
+        let before = &s[..i];
+        s[i + m.len()..].trim_start().starts_with('=')
+            || !(before.ends_with('$')
+                || before.ends_with("${")
+                || before.ends_with("$env:")
+                || before.ends_with("${env:"))
+    })
 }
 
 /// Wildcard match where `*` matches any run of characters (including `/`).
@@ -4062,5 +6044,1171 @@ mod tests {
         assert!(glob("--force*", "--force-with-lease"));
         assert!(glob("a*b*c", "aXXbYYc"));
         assert!(!glob("a*b*c", "aXXbYY"));
+    }
+}
+
+#[cfg(test)]
+mod territory_tests {
+    //! The territory policy (`policy/territory.json`): each line holds inside Philip's own
+    //! folders, the common work of the week of 17-23 Nov passes there, and nothing changes
+    //! elsewhere.
+    use super::*;
+
+    const OWN: &str = "C:/Users/phili/Desktop/Projects/ergon";
+    const CLIENT: &str = "C:/Users/phili/Desktop/Projects/Kalyth";
+
+    fn territory() -> Policy {
+        Policy::from_json(TERRITORY)
+            .expect("the territory policy parses")
+            .with_floor(&Policy::builtin())
+    }
+
+    /// Decide `cmd` as run from `cwd`, on branch `branch`; a `cd` or `git -C` folder counts as
+    /// its own repository.
+    fn decide_in(p: &Policy, cwd: &str, branch: &str, cmd: &str) -> Verdict {
+        with_lookups(cwd, branch, &|look| {
+            p.decide_where(Action::Command(cmd), look, Inherited::default())
+        })
+    }
+
+    /// The remotes every repository has in these tests: `origin` is Philip's, `up` is not.
+    fn remotes(_: &str) -> Option<Vec<(String, String)>> {
+        Some(vec![
+            (
+                "origin".to_owned(),
+                "https://github.com/Philipjj609/ergon.git".to_owned(),
+            ),
+            (
+                "up".to_owned(),
+                "https://github.com/someone/else.git".to_owned(),
+            ),
+        ])
+    }
+
+    /// Run `f` with the lookups of a session in `cwd` on `branch`: a `cd` or `git -C` folder
+    /// counts as its own repository, a path under `$CLAUDE_JOB_DIR` as the job folder it names.
+    fn with_lookups<T>(cwd: &str, branch: &str, f: &dyn Fn(&Lookups<'_>) -> T) -> T {
+        let repo = |hint: Option<&str>| {
+            let h = hint.unwrap_or(cwd);
+            Some(match under_job_dir(h) {
+                Some(rest) => format!("C:/Users/phili/.claude/jobs/80855714{rest}"),
+                None => h.to_owned(),
+            })
+        };
+        let branch_of = |_: Option<&str>| Some(branch.to_owned());
+        f(&Lookups {
+            cwd: Some(cwd),
+            branch_of: &branch_of,
+            repo_of: &repo,
+            origin_of: &no_origin,
+            remotes_of: &remotes,
+        })
+    }
+
+    /// The classes of the rules that match `cmd` in Philip's own folder.
+    fn classes_of(p: &Policy, cmd: &str) -> Vec<String> {
+        with_lookups(OWN, "feature", &|look| {
+            p.matching(Action::Command(cmd), look, Inherited::default())
+                .into_iter()
+                .filter_map(|(r, _)| r.class.clone())
+                .collect()
+        })
+    }
+
+    fn at(cwd: &str, cmd: &str) -> Decision {
+        decide_in(&territory(), cwd, "feature", cmd).decision
+    }
+
+    #[test]
+    fn a_territory_without_lines_is_refused() {
+        let text = r#"{"efforts":{},"routes":{},"rules":[],"territory":["C:/x"]}"#;
+        assert!(Policy::from_json(text).is_err());
+    }
+
+    #[test]
+    fn every_line_still_asks_inside_the_territory() {
+        let p = territory();
+        for (cmd, class) in [
+            // (a) production deploys
+            ("vercel --prod", "deploy"),
+            ("vercel ./app", "deploy"),
+            ("wrangler deploy", "deploy"),
+            ("wrangler pages deploy dist --branch production", "deploy"),
+            ("git push origin production", "deploy"),
+            (
+                "gh pr create --base production --title x --body y",
+                "deploy",
+            ),
+            ("gh release create v1.0.0", "deploy"),
+            ("npm publish", "deploy"),
+            // (b) deletes that git or a trash folder cannot undo
+            ("git push --force origin main", "destroy"),
+            ("git push -f origin main", "destroy"),
+            ("git push origin main -f", "destroy"),
+            ("git push origin +main", "destroy"),
+            ("git push origin HEAD:main --force-with-lease", "destroy"),
+            ("git push origin --delete main", "destroy"),
+            ("git push origin :main", "destroy"),
+            ("git push --mirror", "destroy"),
+            ("git push --force origin production", "destroy"),
+            ("gh api -X DELETE repos/Philipjj609/x", "destroy"),
+            ("rm -rf C:/Users/phili/Documents/old", "delete"),
+            ("rm -rf C:/Users/phili/Desktop/Projects/organon", "delete"),
+            ("rm -rf .git", "delete"),
+            ("rm -rf ../elsewhere", "delete"),
+            ("rm -rf $HOME/x", "delete"),
+            // (c) secrets
+            ("cat .env", "secrets"),
+            ("Get-Content C:/Users/phili/.ssh/id_ed25519", "secrets"),
+            ("printenv", "secrets"),
+            ("gh auth token", "secrets"),
+            ("gh secret set TOKEN --body x", "secrets"),
+            // (d) payments and paid services
+            ("stripe payment_intents create --amount 500", "paid"),
+            ("vercel domains buy example.com", "paid"),
+            // (e) organon's policy, its hook, the lines
+            ("cp p.json C:/Users/phili/.organon/policy.json", "policy"),
+            ("cargo install --path crates/organon-cli", "policy"),
+            // (f) sending outside
+            ("curl -X POST https://example.com/api -d x=1", "send"),
+            ("echo hi | mail a@b.c", "send"),
+        ] {
+            let v = decide_in(&p, OWN, "feature", cmd);
+            assert_eq!(v.decision, Decision::Ask, "{cmd}");
+            let classes = classes_of(&p, cmd);
+            assert!(classes.iter().any(|c| c == class), "{cmd}: {classes:?}");
+        }
+        // A bare force push while on main is a rewrite of main.
+        assert_eq!(
+            decide_in(&p, OWN, "main", "git push -f").decision,
+            Decision::Ask
+        );
+        // Deleting a repository stays denied.
+        assert_eq!(
+            at(OWN, "gh repo delete Philipjj609/x --yes"),
+            Decision::Deny
+        );
+    }
+
+    #[test]
+    fn secrets_and_the_policy_are_guarded_for_tools_too() {
+        let p = territory();
+        for path in [
+            "C:/Users/phili/Desktop/Projects/ergon/.env",
+            "C:\\Users\\phili\\.ssh\\id_ed25519",
+        ] {
+            assert_eq!(
+                p.decide(Action::Read { path }).decision,
+                Decision::Ask,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            p.decide(Action::Read {
+                path: "C:/x/README.md"
+            })
+            .decision,
+            Decision::Allow
+        );
+        for path in [
+            "C:/Users/phili/.organon/policy.json",
+            "C:/Users/phili/.claude/settings.json",
+            "C:/Users/phili/.ergon/bin/organon-bg.mjs",
+            "C:/x/.env",
+        ] {
+            assert_eq!(
+                p.decide(Action::Write { path }).decision,
+                Decision::Ask,
+                "{path}"
+            );
+        }
+        for tool in [
+            "mcp__claude_ai_Gmail__send_message",
+            "mcp__claude_ai_Supabase__apply_migration",
+            "mcp__claude_ai_Vercel__buy_domain",
+        ] {
+            assert_eq!(
+                p.decide(Action::Tool(tool)).decision,
+                Decision::Ask,
+                "{tool}"
+            );
+        }
+    }
+
+    /// Real commands from the friction ledger (`jobs/J32/notes/06-friction-ledger.md`, rows
+    /// 2, 4, 7, 8, 10, 11 and 25) and the daily flow of the main agent and its workers.
+    #[test]
+    fn the_common_work_of_the_week_passes_inside_the_territory() {
+        for cmd in [
+            "gh pr merge 47 --squash --delete-branch",
+            "cd C:/Users/phili/Desktop/Projects/ergon && gh pr merge 47 --squash --match-head-commit 1a2b3c",
+            "cd C:/Users/phili/Desktop/Projects/organon && git fetch origin && git reset --hard origin/main",
+            "git push origin main",
+            "git push -u origin jobs/j32-territory",
+            "git push --force-with-lease origin jobs/j32-territory",
+            "git push origin --delete jobs/old",
+            "git branch -D jobs/old",
+            "git merge --ff-only origin/main",
+            "rm -f shots/*",
+            "rm -rf target",
+            "rm -rf C:/Users/phili/.ergon/scratch/j32",
+            "rm -rf C:/Users/phili/Desktop/Projects/ergon-wt/j20-design/node_modules",
+            "Remove-Item -Recurse -Force C:/Users/phili/Desktop/Projects/ergon/tmp-shots",
+            "git worktree remove --force C:/Users/phili/Desktop/Projects/ergon-wt/j20-design",
+            "git clean -fdx",
+            "claude --bg -p brief --permission-mode bypassPermissions",
+            "gh pr create --draft --title x --body y",
+            "cargo test",
+        ] {
+            assert_eq!(at(OWN, cmd), Decision::Allow, "{cmd}");
+        }
+        assert_eq!(
+            at("C:/Users/phili/.ergon/scratch/x", "rm -rf build"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn outside_the_territory_nothing_changes() {
+        let def = Policy::builtin();
+        for cmd in [
+            "git push origin main",
+            "gh pr merge 5 --squash",
+            "rm -rf build",
+            "git reset --hard origin/main",
+            "git push --force origin feature",
+        ] {
+            assert_eq!(at(CLIENT, cmd), Decision::Ask, "{cmd}");
+            assert_eq!(
+                decide_in(&def, CLIENT, "feature", cmd).decision,
+                Decision::Ask,
+                "{cmd}"
+            );
+        }
+        // A merge in the territory that names another repository, or uses --admin, is not
+        // lifted.
+        assert_ne!(
+            at(OWN, "gh pr merge 5 --repo someone/client"),
+            Decision::Allow
+        );
+        assert_ne!(
+            at(
+                OWN,
+                "cd C:/Users/phili/Desktop/Projects/ergon && git status && gh pr merge 5 --admin"
+            ),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn an_agreed_exception_lifts_only_its_own_target() {
+        let mut p = territory();
+        p.agreed.push(Agreed {
+            class: "send".into(),
+            command: Some("curl -X POST http://localhost:*".into()),
+            tool: None,
+            reason: "test".into(),
+        });
+        let d = |cmd: &str| decide_in(&p, OWN, "feature", cmd).decision;
+        assert_eq!(d("curl -X POST http://localhost:4347/api"), Decision::Allow);
+        assert_eq!(d("curl -X POST https://example.com/api"), Decision::Ask);
+        // An exception to one line never lifts another.
+        assert_eq!(
+            d("curl -X POST http://localhost:4347 && vercel --prod"),
+            Decision::Ask
+        );
+    }
+
+    #[test]
+    fn a_line_is_not_lifted_by_an_exception_either() {
+        let mut p = territory();
+        p.exceptions.push(Exception {
+            class: "deploy".into(),
+            repo: OWN.into(),
+            reason: "test".into(),
+        });
+        assert_eq!(
+            decide_in(&p, OWN, "feature", "vercel deploy").decision,
+            Decision::Ask
+        );
+    }
+
+    #[test]
+    fn rewrites_branch_reads_force_delete_and_refspecs() {
+        let w = |s: &str| s.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        let b = vec!["main".to_owned()];
+        for yes in [
+            "git push -f origin main",
+            "git push -uf origin main",
+            "git push origin +main",
+            "git push origin +HEAD:refs/heads/main",
+            "git push origin :main",
+            "git push -d origin main",
+            "git push --all --force origin",
+            "git push --prune origin",
+        ] {
+            assert!(rewrites_branch(&w(yes), &b), "{yes}");
+        }
+        for no in [
+            "git push origin main",
+            "git push -f origin feature",
+            "git push origin +feature",
+            "git push --follow-tags origin main",
+            "git push -u origin main",
+        ] {
+            assert!(!rewrites_branch(&w(no), &b), "{no}");
+        }
+    }
+
+    // ------------------------------------------------ fix round 1 (Fable's review of 23 Nov)
+
+    #[test]
+    fn every_spelling_of_a_path_is_one_spelling() {
+        for (given, want) in [
+            ("C:\\Users\\phili\\.ssh\\id_ed25519", "~/.ssh/id_ed25519"),
+            ("c:/users/Phili/.ssh/id_ed25519", "~/.ssh/id_ed25519"),
+            ("/c/Users/phili/.ssh/id_ed25519", "~/.ssh/id_ed25519"),
+            ("/mnt/c/Users/phili/.ssh/id_ed25519", "~/.ssh/id_ed25519"),
+            ("$HOME/.ssh/id_ed25519", "~/.ssh/id_ed25519"),
+            ("${HOME}\\.ssh\\id_ed25519", "~/.ssh/id_ed25519"),
+            ("$env:USERPROFILE\\.ssh\\id_ed25519", "~/.ssh/id_ed25519"),
+            ("%USERPROFILE%\\.ssh\\id_ed25519", "~/.ssh/id_ed25519"),
+            ("~/.ssh/id_ed25519", "~/.ssh/id_ed25519"),
+            ("/home/philip/.ssh", "~/.ssh"),
+            ("-Path:C:\\Users\\phili\\x", "-path:~/x"),
+            ("/c/tmp/x", "c:/tmp/x"),
+            ("$CLAUDE_JOB_DIR/tmp/x", "$claude_job_dir/tmp/x"),
+            ("$HOMEPATH/x", "$homepath/x"),
+            ("~user/x", "~user/x"),
+        ] {
+            assert_eq!(norm_text(given, true), want, "{given}");
+        }
+        assert_eq!(norm_path(".env"), "./.env");
+        assert_eq!(
+            norm_path(".claude/settings.json"),
+            "./.claude/settings.json"
+        );
+        assert_eq!(norm_path("./.env"), "./.env");
+        // A flag keeps its case outside PowerShell; PowerShell's does not.
+        let w = |s: &str| s.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(norm_seg(&w("rm -R X")), w("rm -R x"));
+        assert_eq!(
+            norm_seg(&w("remove-item -Recurse X")),
+            w("remove-item -recurse x")
+        );
+        assert_eq!(norm_seg(&w("vc --prod")), w("vercel --prod"));
+    }
+
+    /// Each hole of the review's section 1, in `/` and `\` forms where it has a path.
+    #[test]
+    fn the_holes_of_the_review_ask_in_every_spelling() {
+        let p = territory();
+        for (cmd, class) in [
+            // secrets
+            ("Get-Content C:\\Users\\phili\\.ssh\\id_ed25519", "secrets"),
+            ("Get-Content C:/Users/phili/.ssh/id_ed25519", "secrets"),
+            ("Get-Content $HOME\\.ssh\\id_ed25519", "secrets"),
+            ("Get-Content .\\.env", "secrets"),
+            ("Get-Content ./.env", "secrets"),
+            ("cat .env.development", "secrets"),
+            ("cat apps/web/.env.staging", "secrets"),
+            ("type apps\\web\\.env.staging", "secrets"),
+            ("grep KEY .env*", "secrets"),
+            ("cp .env backup.txt", "secrets"),
+            (
+                "cat \"C:/Users/phili/AppData/Roaming/GitHub CLI/hosts.yml\"",
+                "secrets",
+            ),
+            (
+                "type \"C:\\Users\\phili\\AppData\\Roaming\\GitHub CLI\\hosts.yml\"",
+                "secrets",
+            ),
+            ("cat ~/.claude/.credentials.json", "secrets"),
+            ("cat ~/.aws/credentials", "secrets"),
+            ("cat ~/.npmrc", "secrets"),
+            (
+                "echo url=https://github.com | git credential fill",
+                "secrets",
+            ),
+            ("ls Env:", "secrets"),
+            ("dir Env:", "secrets"),
+            ("Get-Item Env:*", "secrets"),
+            ("$env:VERCEL_TOKEN", "secrets"),
+            ("echo $VERCEL_TOKEN", "secrets"),
+            ("set", "secrets"),
+            ("export -p", "secrets"),
+            ("cmd /c set", "secrets"),
+            ("rg -uu SECRET", "secrets"),
+            ("vercel env pull", "secrets"),
+            // the policy and the hook
+            ("rm -rf C:/Users/phili/.ergon/bin", "policy"),
+            (
+                "Remove-Item -Recurse -Force C:\\Users\\phili\\.ergon\\bin",
+                "policy",
+            ),
+            (
+                "mv C:/Users/phili/.ergon/bin C:/Users/phili/.ergon/bin.old",
+                "policy",
+            ),
+            (
+                "Move-Item C:\\Users\\phili\\.ergon\\bin C:\\Users\\phili\\.ergon\\old",
+                "policy",
+            ),
+            (
+                "cp scripts/organon-bg.mjs C:/Users/phili/.ergon/bin/",
+                "policy",
+            ),
+            (
+                "cp target/release/organon.exe C:/Users/phili/.cargo/bin/organon.exe",
+                "policy",
+            ),
+            (
+                "Copy-Item x.exe C:\\Users\\phili\\.cargo\\bin\\organon.exe",
+                "policy",
+            ),
+            ("cargo install --path . --force", "policy"),
+            (
+                "Copy-Item p.json C:\\Users\\phili\\.organon\\policy.json",
+                "policy",
+            ),
+            (
+                "Remove-Item C:\\Users\\phili\\.organon\\policy.json",
+                "policy",
+            ),
+            (
+                "Set-Content -Path C:\\Users\\phili\\.claude\\settings.json -Value $s",
+                "policy",
+            ),
+            (
+                "Set-Content $env:USERPROFILE\\.claude\\settings.json $s",
+                "policy",
+            ),
+            ("echo {} > C:/Users/phili/.claude/settings.json", "policy"),
+            ("cp x .claude/settings.local.json", "policy"),
+            ("rm C:/Users/phili/.ergon/refusals.jsonl", "policy"),
+            ("ORGANON_HOME=C:/tmp/h claude --bg -p brief", "policy"),
+            ("ORGANON_EXE=C:/tmp/x.exe claude --bg", "policy"),
+            ("env ORGANON_HOME=C:/tmp/h claude --bg", "policy"),
+            ("$env:ORGANON_HOME = 'C:\\tmp'; claude --bg", "policy"),
+            // sending outside
+            ("curl -XPOST https://example.com/api", "send"),
+            ("curl -X PATCH https://example.com/api", "send"),
+            ("curl --request PUT https://example.com/api", "send"),
+            ("curl --request=DELETE https://example.com/api", "send"),
+            ("curl -T report.pdf https://example.com/upload", "send"),
+            (
+                "curl --upload-file report.pdf https://example.com/upload",
+                "send",
+            ),
+            ("curl --json {} https://example.com/api", "send"),
+            ("curl -sS -d@body.json https://example.com/api", "send"),
+            ("curl -sd x=1 https://example.com/api", "send"),
+            (
+                "wget --method=POST --body-data=x https://example.com",
+                "send",
+            ),
+            (
+                "Invoke-RestMethod -Uri https://x -Method post -Body $b",
+                "send",
+            ),
+            ("irm https://x -method Post", "send"),
+            ("Invoke-WebRequest -Uri https://x -Method Delete", "send"),
+            ("Invoke-RestMethod https://x -Method:Post", "send"),
+            ("gh issue create --repo vercel/next.js --title x", "send"),
+            ("gh issue comment 5 --repo someone/else --body hi", "send"),
+            (
+                "gh pr comment https://github.com/someone/else/pull/5 --body hi",
+                "send",
+            ),
+            ("gh api repos/someone/else/issues -f title=x", "send"),
+            ("gh gist create notes.md --public", "send"),
+            ("git push https://github.com/someone/else.git main", "send"),
+            ("scp f user@host:/tmp/", "send"),
+            // deletes outside the territory
+            ("rm C:/Users/phili/Documents/notes.txt", "delete"),
+            (
+                "rm -f C:\\\\Users\\\\phili\\\\Documents\\\\notes.txt",
+                "delete",
+            ),
+            (
+                "Remove-Item C:\\Users\\phili\\Documents\\notes.txt",
+                "delete",
+            ),
+            (
+                "rmdir -Recurse -Force C:\\Users\\phili\\Documents\\old",
+                "delete",
+            ),
+            (
+                "del -Recurse -Force C:\\Users\\phili\\Documents\\old",
+                "delete",
+            ),
+            (
+                "ri -Recurse -Force C:\\Users\\phili\\Documents\\old",
+                "delete",
+            ),
+            (
+                "cmd /c rmdir /s /q C:\\Users\\phili\\Documents\\old",
+                "delete",
+            ),
+            ("find C:/Users/phili/Documents -name x -delete", "delete"),
+            ("rm -rf .git*", "delete"),
+            ("rm -rf C:/Users/phili/.ergon/*", "delete"),
+            (
+                "Get-ChildItem C:\\x | Remove-Item -Recurse -Force",
+                "delete",
+            ),
+            // remote deletes and rewrites
+            ("gh api --method=DELETE repos/Philipjj609/ergon", "destroy"),
+            (
+                "gh api -X PATCH repos/Philipjj609/ergon/git/refs/heads/main -F force=true",
+                "destroy",
+            ),
+            (
+                "git push --force origin 'refs/heads/*:refs/heads/*'",
+                "destroy",
+            ),
+            ("git push -f origin :", "destroy"),
+            // production
+            ("gh pr create --base=production --title x", "deploy"),
+            ("gh pr edit 5 --base=production", "deploy"),
+            ("gh workflow run deploy.yml", "deploy"),
+            ("pnpm exec vercel --prod", "deploy"),
+            ("pnpm vercel --prod", "deploy"),
+            ("vc --prod", "deploy"),
+            ("bun publish", "deploy"),
+            ("docker push ghcr.io/x/y", "deploy"),
+            ("gh release upload v1 f.zip", "deploy"),
+            // paid
+            ("supabase projects create x", "paid"),
+            ("supabase branches create x", "paid"),
+            ("fly scale count 3", "paid"),
+            ("vercel install neon", "paid"),
+        ] {
+            let v = decide_in(&p, OWN, "feature", cmd);
+            assert_eq!(v.decision, Decision::Ask, "{cmd}");
+            let classes = classes_of(&p, cmd);
+            assert!(classes.iter().any(|c| c == class), "{cmd}: {classes:?}");
+        }
+    }
+
+    #[test]
+    fn tools_and_files_ask_in_every_spelling() {
+        let p = territory();
+        let ask = |a: Action<'_>| p.decide(a).decision == Decision::Ask;
+        for path in [
+            "C:\\Users\\phili\\Desktop\\Projects\\ergon\\.env",
+            ".env",
+            ".env.local",
+            "C:/x/.env.development",
+            "C:/x/.dev.vars",
+            "C:\\Users\\phili\\AppData\\Roaming\\GitHub CLI\\hosts.yml",
+            "C:\\Users\\phili\\.claude\\.credentials.json",
+            "C:/Users/phili/.aws/credentials",
+            "C:\\Users\\phili\\.npmrc",
+            "/c/Users/phili/.ssh/id_ed25519",
+            "C:/Users/phili/.ssh",
+        ] {
+            assert!(ask(Action::Read { path }), "read {path}");
+        }
+        for path in [
+            "c:\\Users\\phili\\.claude\\settings.json",
+            "C:/Users/Phili/.claude/settings.json",
+            "/c/Users/phili/.claude/settings.json",
+            "C:/Users/phili/Desktop/Projects/ergon/.claude/settings.local.json",
+            ".claude/settings.json",
+            "C:/Users/phili/.claude.json",
+            "C:\\Users\\phili\\.organon\\policy.json",
+            "C:/Users/phili/.cargo/bin/organon.exe",
+            "C:/Users/phili/.ergon/bin/organon-bg.mjs",
+            "C:/Users/phili/.ergon/refusals.jsonl",
+            "C:/x/.env.development",
+            "C:/x/.dev.vars",
+        ] {
+            assert!(ask(Action::Write { path }), "write {path}");
+        }
+        for tool in [
+            "mcp__claude_ai_Google_Drive__share_file",
+            "mcp__claude_ai_Google_Calendar__create_event",
+            "mcp__claude_ai_Google_Calendar__respond_to_event",
+            "mcp__gemini-notebook-mcp__notebook_share_public",
+            "mcp__gemini-notebook-mcp__notebook_share_invite",
+            "mcp__claude_ai_Vercel__reply_to_board_thread",
+            "mcp__claude_ai_Vercel__reply_to_toolbar_thread",
+            "mcp__claude_ai_Vercel__submit_feedback",
+            "mcp__claude_ai_Vercel__request_rollback",
+            "mcp__claude_ai_Vercel__assign_alias",
+            "mcp__claude_ai_Vercel__start_rolling_release",
+            "mcp__claude_ai_Vercel__complete_rolling_release",
+            "mcp__claude_ai_Supabase__execute_sql",
+            "mcp__claude_ai_Vercel__create_or_transfer_domain",
+            "mcp__claude_ai_Supabase__create_branch",
+            "mcp__claude_ai_Supabase__restore_project",
+            "mcp__claude_ai_Supabase__create_edge_function_secret",
+            "mcp__claude_ai_Vercel__get_project_env",
+            "mcp__claude_ai_Vercel__create_ai_gateway_api_key",
+        ] {
+            assert!(ask(Action::Tool(tool)), "{tool}");
+        }
+        // Reading the policy or the settings is not changing them; examples are not secrets.
+        for path in [
+            "C:/Users/phili/.claude/settings.json",
+            "C:\\Users\\phili\\.organon\\policy.json",
+            "C:/x/.env.example",
+            "C:/x/src/main.rs",
+        ] {
+            assert!(!ask(Action::Read { path }), "read {path}");
+        }
+        for tool in [
+            "mcp__claude_ai_Supabase__list_tables",
+            "mcp__claude_ai_Google_Calendar__list_events",
+        ] {
+            assert!(!ask(Action::Tool(tool)), "{tool}");
+        }
+    }
+
+    /// The review's section 3, in both slash forms, and the work that must keep passing.
+    #[test]
+    fn the_regressions_of_the_review_pass() {
+        for cmd in [
+            "Remove-Item -Recurse -Force C:\\Users\\phili\\Desktop\\Projects\\ergon\\tmp-shots",
+            "Remove-Item -Recurse -Force C:/Users/phili/Desktop/Projects/ergon/tmp-shots",
+            "Remove-Item -Recurse -Force C:\\Users\\phili\\.ergon\\scratch\\x",
+            "Remove-Item -Recurse -Force .\\tmp-shots",
+            "cmd /c rmdir /s /q C:\\Users\\phili\\Desktop\\Projects\\ergon\\tmp",
+            "rm -rf /tmp/build-test",
+            "rm -rf \"$CLAUDE_JOB_DIR/tmp/x\"",
+            "rm -rf ${CLAUDE_JOB_DIR}/tmp/x",
+            "rm -rf C:/Users/phili/.claude/jobs/7d002948/tmp/x",
+            "rm -rf C:\\\\Users\\\\phili\\\\.claude\\\\jobs\\\\7d002948\\\\tmp\\\\x",
+            "rm -rf ~/.ergon/scratch/x",
+            "rm -rf /c/Users/phili/.ergon/scratch/x",
+            "rm notes.txt",
+            "find . -name '*.bak' -delete",
+            "echo \".env\" >> .gitignore",
+            "test -f .env",
+            "cp .env.example .env",
+            "docker compose --env-file .env up -d",
+            "cat .env.example",
+            "cat ~/.claude/settings.json",
+            "cat ~/.organon/policy.json",
+            "Get-Content $env:USERPROFILE\\.claude\\settings.json",
+            "node C:/Users/phili/.ergon/bin/organon-bg.mjs",
+            "git -C C:/Users/phili/.ergon status",
+            // chained with `;`, `|` or `||`, no folder change
+            "git fetch origin; git reset --hard origin/main",
+            "git push origin main 2>&1 | tail -2",
+            "gh pr merge 47 --squash 2>&1 | tail -2",
+            "rm -rf dist; npm run build",
+            "rm -rf dist || true",
+            // sending to his own repositories, and reading
+            "gh issue create --title x --body y",
+            "gh issue comment 5 --repo Philipjj609/organon --body hi",
+            "gh api -X POST repos/Philipjj609/ergon/issues -f title=x",
+            "gh api repos/someone/else/issues",
+            "git push https://github.com/Philipjj609/ergon.git main",
+            "curl -fsSL https://example.com/install.sh -o i.sh",
+            "curl -D headers.txt https://example.com",
+            "curl -X GET https://example.com",
+            "irm https://example.com/x",
+            "Invoke-WebRequest -Uri https://example.com -Method Get",
+            "set -euo pipefail",
+            "export PATH=$PATH:/x",
+            "echo $ORGANON_HOME",
+            "pnpm install",
+            "pnpm run build",
+            "vercel env ls",
+            "gh pr create --base=main --title x",
+        ] {
+            assert_eq!(at(OWN, cmd), Decision::Allow, "{cmd}");
+        }
+        // A `cd` chained with `;` still makes the folder uncertain; a command that sets
+        // `CLAUDE_JOB_DIR` itself is not deleting scratch.
+        assert_eq!(at(OWN, "cd C:/x; rm -rf old"), Decision::Ask);
+        assert_eq!(
+            at(OWN, "CLAUDE_JOB_DIR=C:/ rm -rf $CLAUDE_JOB_DIR/tmp/x"),
+            Decision::Ask
+        );
+        // Any other spelling that sets it asks too; reading it does not.
+        for cmd in [
+            "read CLAUDE_JOB_DIR <<< C:/Users/phili/Documents; cd $CLAUDE_JOB_DIR/tmp && rm -rf *",
+            "printf -v CLAUDE_JOB_DIR %s C:/Users/phili/Documents; cd $CLAUDE_JOB_DIR/tmp && rm -rf *",
+            "for CLAUDE_JOB_DIR in C:/Users/phili/Documents; do cd $CLAUDE_JOB_DIR/tmp && rm -rf *; done",
+        ] {
+            assert_eq!(at(OWN, cmd), Decision::Ask, "{cmd}");
+        }
+        assert!(!sets_job_dir("cd $CLAUDE_JOB_DIR/tmp && rm -f x.jpg"));
+        assert!(!sets_job_dir("cd ${env:CLAUDE_JOB_DIR}/tmp; ri x.jpg"));
+    }
+
+    const ERGON_HOME: &str = "C:/Users/phili/.ergon";
+    const HOME: &str = "C:/Users/phili";
+
+    /// Every command of `cmds`, run from `cwd`, gets `want`.
+    fn all(cwd: &str, want: Decision, cmds: &[&str]) {
+        for cmd in cmds {
+            assert_eq!(at(cwd, cmd), want, "{cwd}: {cmd}");
+        }
+    }
+
+    /// The re-check's 2a and 1.7: any program that names a secret file asks, but the few that
+    /// cannot show what is in it; `unless` never excuses the target of a copy.
+    #[test]
+    fn any_program_naming_a_secret_file_asks() {
+        all(
+            OWN,
+            Decision::Ask,
+            &[
+                "cp .env .env.example",
+                "cp .env backup.sample",
+                "cp C:\\Users\\phili\\Desktop\\Projects\\ergon\\.env C:\\x\\backup.sample",
+                "cp C:/Users/phili/Desktop/Projects/ergon/.env C:/x/backup.sample",
+                "Copy-Item .env .env.dist",
+                "Copy-Item .\\.env .\\.env.dist",
+                "cat .env > env.example",
+                "git diff --no-index /dev/null .env",
+                "git add -f .env",
+                "python read.py .env",
+                "zip x.zip .env",
+                "tar cf - .env",
+                "source .env",
+                "code .env",
+                "try { Get-Content .env } catch {}",
+                "Get-Content -Path:.env",
+                "Get-Content .\\.env",
+                "Get-Content C:\\Users\\phili\\Desktop\\Projects\\ergon\\.env.local",
+                "cat C:/Users/phili/Desktop/Projects/ergon/.env.local",
+                "cat .e*",
+                "echo \"$(cat .env)\"",
+                "echo \"$(cat C:/Users/phili/Desktop/Projects/ergon/.env)\"",
+                "printf '%s' \"$(<.env)\"",
+                "Write-Output \"$(Get-Content .\\.env)\"",
+                "echo ${env:VERCEL_TOKEN}",
+                "[System.Environment]::GetEnvironmentVariable('GH_TOKEN')",
+                "node -p process.env",
+                "gh api -XDelete repos/Philipjj609/ergon",
+            ],
+        );
+        all(
+            OWN,
+            Decision::Allow,
+            &[
+                "test -f .env",
+                "[ -f .env ] && echo yes",
+                "ls -la .env",
+                "touch .env",
+                "echo .env >> .gitignore",
+                "docker run --env-file .env img",
+                "cp .env.example .env",
+                "cat .env.example",
+                "cat .env.local.example",
+                "echo \"$(cat .env.example)\"",
+                "git commit -m \"$(cat <<'EOF'\nRead .env only at start\nEOF\n)\"",
+                "git commit -m \"Ignore `.env` files\"",
+            ],
+        );
+        // A search of the whole home folder reads its hidden folders, in either slash form.
+        let p = territory();
+        for path in ["C:/Users/phili", "C:\\Users\\phili", "C:\\Users\\phili\\"] {
+            assert_eq!(
+                p.decide(Action::Read { path }).decision,
+                Decision::Ask,
+                "{path}"
+            );
+        }
+    }
+
+    /// The re-check's 2b and 1.2: the hook's own folders by relative path, by a parent, by
+    /// `..`, and the two ways to start a session without the hook.
+    #[test]
+    fn the_hooks_own_folders_ask_by_any_route() {
+        all(
+            OWN,
+            Decision::Ask,
+            &[
+                "cd C:/Users/phili/.ergon && rm -rf bin",
+                "cd C:\\Users\\phili\\.ergon && rm -rf bin",
+                "cd C:/Users/phili/.organon && cp C:/x/p.json policy.json",
+                "cd C:\\Users\\phili\\.organon && cp C:\\x\\p.json policy.json",
+                "cd C:/Users/phili/.claude && cp C:/x/s.json settings.json",
+                "Set-Location C:\\Users\\phili\\.claude; Set-Content settings.json '{}'",
+                "pushd ~/.organon; echo x > policy.json",
+                "pushd C:\\Users\\phili\\.organon; echo x > policy.json",
+                "mv C:/Users/phili/.ergon C:/Users/phili/.ergon-old",
+                "Move-Item C:\\Users\\phili\\.ergon C:\\Users\\phili\\.ergon-old",
+                "mv C:/Users/phili/.ergon/b* /tmp/",
+                "mv C:\\Users\\phili\\.ergon\\b* C:\\tmp\\",
+                "CLAUDE_CONFIG_DIR=C:/tmp/c claude --bg -p brief",
+                "claude --settings C:/tmp/s.json --bg -p brief",
+                "claude --settings=C:\\tmp\\s.json --bg -p brief",
+            ],
+        );
+        all(
+            ERGON_HOME,
+            Decision::Ask,
+            &[
+                "rm -rf bin",
+                "mv bin bin.old",
+                "Remove-Item -Recurse -Force .\\bin",
+                "rm -rf ./bin",
+            ],
+        );
+        all(
+            HOME,
+            Decision::Ask,
+            &["cd .claude && echo '{}' > settings.local.json"],
+        );
+        let p = territory();
+        for path in [
+            "C:/Users/phili/.claude/hooks/../settings.json",
+            "C:\\Users\\phili\\.claude\\hooks\\..\\settings.json",
+            "C:/Users/phili/.ergon/scratch/../bin/organon-bg.mjs",
+            "C:\\Users\\phili\\.ergon\\scratch\\..\\bin\\organon-bg.mjs",
+        ] {
+            assert_eq!(
+                p.decide(Action::Write { path }).decision,
+                Decision::Ask,
+                "{path}"
+            );
+        }
+        // The rest of `~/.ergon` is still his to work in, and a plain session still starts.
+        all(ERGON_HOME, Decision::Allow, &["rm -rf scratch/x"]);
+        all(OWN, Decision::Allow, &["claude --bg -p brief"]);
+    }
+
+    /// The re-check's 2c and section 3: a word that changes the folder unseen makes a delete
+    /// uncertain, and a program that only runs another is judged by the one it runs.
+    #[test]
+    fn a_prefix_or_a_hidden_folder_change_does_not_hide_a_line() {
+        all(
+            OWN,
+            Decision::Ask,
+            &[
+                "cd.. ; Remove-Item -Recurse -Force Aegis",
+                "cd.. && Remove-Item -Recurse -Force Aegis",
+                "builtin cd C:/Users/phili/Documents; rm -rf old",
+                "builtin cd C:\\Users\\phili\\Documents; rm -rf old",
+                "eval \"cd C:/Users/phili/Documents\"; rm -rf old",
+                ". ./go.sh; rm -rf old",
+                "source go.sh; rm -rf old",
+                "timeout 60 git push --force origin main",
+                "timeout 120 vercel --prod",
+                "timeout 5 cat .env",
+                "env FOO=1 git push --force origin main",
+                "nohup vercel --prod",
+                "exec vercel --prod",
+                "command git push --force origin main",
+                "sudo rm -rf C:/Users/phili/Documents/old",
+                "sudo rm -rf C:\\Users\\phili\\Documents\\old",
+                "winpty vercel --prod",
+                "try { vercel --prod } catch { Write-Host failed }",
+                "1..3 | ForEach-Object { npm publish }",
+                "1..3 | % { git push --force origin main }",
+                "Start-Process vercel -ArgumentList '--prod'",
+            ],
+        );
+        // A kept deny stays a deny under any prefix.
+        all(
+            OWN,
+            Decision::Deny,
+            &[
+                "timeout 60 gh pr merge 5 --admin --squash",
+                "env A=1 gh pr merge 5 --admin --squash",
+                "nohup gh pr merge 5 --admin --squash",
+                "exec gh pr merge 5 --admin --squash",
+                "command gh pr merge 5 --admin --squash",
+                "sudo gh pr merge 5 --admin --squash",
+                "winpty gh pr merge 5 --admin --squash",
+                "try { gh pr merge 5 --admin --squash } catch {}",
+                "1..3 | ForEach-Object { gh pr merge 5 --admin --squash }",
+                "$r = try { gh pr merge 5 --admin --squash } catch {}",
+                "Start-Process gh -ArgumentList 'pr merge 5 --admin --squash'",
+            ],
+        );
+        // A prefix does not make plain work ask.
+        all(
+            OWN,
+            Decision::Allow,
+            &[
+                "timeout 120 git push -u origin feature",
+                "timeout 60 cargo test",
+                "env FOO=1 pnpm run build",
+            ],
+        );
+    }
+
+    /// The re-check's 2d: only the real home folder is `~`, a command that moves `HOME` is
+    /// uncertain, and a brace list in a delete is a glob.
+    #[test]
+    fn only_the_real_home_is_home() {
+        all(
+            OWN,
+            Decision::Ask,
+            &[
+                "rm -rf C:/Users/Public/.ergon/scratch/x",
+                "rm -rf C:\\Users\\Public\\.ergon\\scratch\\x",
+                "rm -rf D:/Users/phili/Desktop/Projects/ergon/x",
+                "rm -rf /home/bob/.ergon/scratch/x",
+                "export HOME=C:/Users/phili/Documents; rm -rf ~/.ergon/scratch/x",
+                "$env:HOME='C:\\Users\\phili\\Documents'; Remove-Item -Recurse -Force ~/.ergon/scratch/x",
+                "rm -rf {dist,../Aegis}",
+                "rm -rf .{git,github}",
+            ],
+        );
+        all(
+            OWN,
+            Decision::Allow,
+            &[
+                "rm -rf ~/.ergon/scratch/x",
+                "rm -rf C:/Users/phili/.ergon/scratch/x",
+                "Remove-Item -Recurse -Force C:\\Users\\phili\\.ergon\\scratch\\x",
+            ],
+        );
+    }
+
+    /// The re-check's section 4: a `cd` chained with `;` is followed between his own folders,
+    /// absolute targets inside the territory need no folder, and the live top-level worktrees
+    /// and the job scratch folders are his.
+    #[test]
+    fn the_regressions_of_the_recheck_pass() {
+        all(
+            OWN,
+            Decision::Allow,
+            &[
+                "cd C:/Users/phili/.ergon/compendium/books/don-t-panic/work; rm -f ctx.mjs v.txt; ls; node -e \"console.log(1)\"",
+                "cd C:/Users/phili/.ergon/proof/casa-lumera/demo-shots-r4; mkdir -p run1; cp run-all-out.txt run1/run-all-out-1.txt; rm -f checks/t.txt; echo \"ok\"",
+                "cd C:/Users/phili/.ergon/tmp-ed2 && (cat hdr.mjs; sed -n '12,$p' gen.mjs) > gen2.mjs && node gen2.mjs 2>&1 | head -20; rm -f C:/Users/phili/.ergon/compendium/books/x/work/in-2.lines.json",
+                "cd C:/Users/phili/Desktop/Projects/philipciuca.com-wt/j23-collector; rm -r .wrangler/state",
+                "cd C:/Users/phili/Documents; rm -f C:/Users/phili/.ergon/scratch/a.txt",
+                "Remove-Item C:\\Users\\phili\\.ergon\\scratch\\a.txt; Get-ChildItem",
+                "rm -rf C:/Users/phili/.ergon/tmp-ed2; ls C:/Users/phili/.ergon/compendium",
+                "rm -r C:/Users/phili/.ergon/site-maps/g",
+                "Remove-Item -Recurse -Force C:\\Users\\phili\\.claude\\jobs\\990104f7\\tmp\\x",
+                "Remove-Item -Confirm:$false C:/Users/phili/.claude/jobs/42484048/tmp/bkts-qcheck.mjs",
+            ],
+        );
+        for own in [
+            "C:/Users/phili/Desktop/Projects/ergon-wt-j28-deep",
+            "C:/Users/phili/Desktop/Projects/ergon-wt-j30-senses",
+            "C:/Users/phili/Desktop/Projects/ergon-wt-j31-craft",
+            "C:\\Users\\phili\\Desktop\\Projects\\ergon-wt-j32-organism",
+            "C:/Users/phili/Desktop/Projects/ergon-wt-state-c17b",
+            "C:/Users/phili/.claude/jobs/990104f7/tmp/wt",
+            "C:\\Users\\phili\\.claude\\jobs\\990104f7\\tmp\\wt",
+        ] {
+            all(own, Decision::Allow, &["rm -rf dist", "git reset --hard"]);
+        }
+        // Named one by one, not by a pattern: another top-level worktree is still outside,
+        // and so is the rest of a job folder.
+        for other in [
+            "C:/Users/phili/Desktop/Projects/ergon-wt-pulse",
+            "C:/Users/phili/Desktop/Projects/ergon-wt-j28-deeper",
+            "C:/Users/phili/.claude/jobs/990104f7",
+        ] {
+            assert!(!territory().in_territory(other, false), "{other}");
+        }
+        // A `cd` to a folder that is not his still makes a relative delete ask.
+        all(
+            OWN,
+            Decision::Ask,
+            &[
+                "cd C:/Users/phili/Documents; rm -f notes.txt",
+                "cd C:\\Users\\phili\\Documents; rm -f notes.txt",
+            ],
+        );
+    }
+
+    /// The re-check's 1.5: deletes outside the territory, through the forms that hid them.
+    #[test]
+    fn deletes_outside_ask_through_every_wrapper() {
+        all(
+            OWN,
+            Decision::Ask,
+            &[
+                "cmd /c \"rmdir /s /q C:\\Users\\phili\\Documents\\old\"",
+                "cmd /c \"rmdir /s /q C:/Users/phili/Documents/old\"",
+                "cd C:/Users/phili/Documents && rm notes.txt",
+                "cd C:\\Users\\phili\\Documents && rm notes.txt",
+                "try { Remove-Item -Recurse -Force C:\\Users\\phili\\Documents\\old } catch {}",
+                "try { Remove-Item -Recurse -Force C:/Users/phili/Documents/old } catch {}",
+                "Get-ChildItem C:\\Users\\phili\\Documents\\old | ForEach-Object { Remove-Item -Recurse -Force $_.FullName }",
+                "find C:/Users/phili/Documents -name '*.bak' -exec rm -rf {} +",
+                "find C:\\Users\\phili\\Documents -name '*.bak' -exec rm -rf {} +",
+                "echo x | xargs rm -rf",
+                "npx rimraf C:/Users/phili/Documents/old",
+                "npx rimraf C:\\Users\\phili\\Documents\\old",
+            ],
+        );
+        all(
+            OWN,
+            Decision::Allow,
+            &[
+                "npx rimraf dist",
+                "find . -name '*.bak' -delete",
+                "Remove-Item -Recurse -Force .\\tmp-shots",
+            ],
+        );
+    }
+
+    /// The re-check's section 6: the tools that change what is live, reset a branch or send
+    /// logs outside.
+    #[test]
+    fn the_rechecks_tools_ask() {
+        let p = territory();
+        for (tool, class) in [
+            (
+                "mcp__claude_ai_Vercel__replace_domain_dns_records",
+                "deploy",
+            ),
+            ("mcp__claude_ai_Vercel__update_record", "deploy"),
+            ("mcp__claude_ai_Vercel__add_project_domain", "deploy"),
+            ("mcp__claude_ai_Vercel__pause_project", "deploy"),
+            ("mcp__claude_ai_Supabase__pause_project", "deploy"),
+            ("mcp__claude_ai_Vercel__put_firewall_config", "deploy"),
+            ("mcp__claude_ai_Vercel__create_drain", "send"),
+            ("mcp__claude_ai_Supabase__reset_branch", "destroy"),
+        ] {
+            let v = p.decide(Action::Tool(tool));
+            assert_eq!(v.decision, Decision::Ask, "{tool}");
+            assert_eq!(v.class.as_deref(), Some(class), "{tool}");
+        }
+        for tool in [
+            "mcp__claude_ai_Vercel__get_records",
+            "mcp__claude_ai_Vercel__get_firewall_config",
+            "mcp__claude_ai_Vercel__list_drains",
+            "mcp__claude_ai_Supabase__list_branches",
+        ] {
+            assert_eq!(
+                p.decide(Action::Tool(tool)).decision,
+                Decision::Allow,
+                "{tool}"
+            );
+        }
+    }
+
+    /// The re-check's 1.4: a push to a remote that is not his, or that cannot be known, a
+    /// copy to a host, and the two `gh api` forms that write without a method flag.
+    #[test]
+    fn sends_to_other_places_ask() {
+        all(
+            OWN,
+            Decision::Ask,
+            &[
+                "git push up main",
+                "git push up feature",
+                "git remote add fork https://github.com/someone/else.git && git push fork feature",
+                "git remote add fork https://github.com/someone/else.git; git push fork feature",
+                "git push https://github.com/someone/else.git feature",
+                "git push nosuchremote feature",
+                "rsync -a . user@host:/tmp/",
+                "rsync -a C:\\Users\\phili\\Desktop\\Projects\\ergon\\ user@host:/tmp/",
+                "gh api gists -f description=x -F public=true",
+                "gh api graphql -f query='mutation { addStar(input:{starrableId:\"x\"}) { clientMutationId } }'",
+            ],
+        );
+        all(
+            OWN,
+            Decision::Allow,
+            &[
+                "git push origin feature",
+                "git push -u origin feature",
+                "git remote add mine https://github.com/Philipjj609/organon.git && git push mine feature",
+                "git push https://github.com/Philipjj609/ergon.git feature",
+                "rsync -a src/ dist/",
+                "gh api graphql -f query='query { viewer { login } }'",
+                "gh api gists",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_plain_delete_asks_only_from_the_territory() {
+        // From a client folder a plain `rm` is as it was: the rule is the territory's.
+        assert_eq!(
+            at(CLIENT, "rm C:/Users/phili/Documents/notes.txt"),
+            Decision::Allow
+        );
+        assert_eq!(
+            at(OWN, "rm C:/Users/phili/Documents/notes.txt"),
+            Decision::Ask
+        );
+    }
+
+    #[test]
+    fn the_territory_is_the_folders_it_names() {
+        let p = territory();
+        for own in [
+            "C:/Users/phili/Desktop/Projects/ergon",
+            "C:/Users/phili/Desktop/Projects/ergon-wt/j32-territory",
+            "C:/Users/phili/Desktop/Projects/organon-wt/territory",
+            "C:/Users/phili/Desktop/Projects/organon-vision",
+            "C:/Users/phili/Desktop/Projects/mneme-memory",
+            "c:\\users\\phili\\.ergon\\scratch",
+        ] {
+            assert!(p.in_territory(own, false), "{own}");
+        }
+        for other in [
+            "C:/Users/phili/Desktop/Projects/ergon-wt-pulse",
+            "C:/Users/phili/Desktop/Projects/organon-wt-merge",
+            "C:/Users/phili/Desktop/Projects/organon-client",
+            "C:/Users/phili/Desktop/Projects/mneme-other",
+            "C:/Users/phili/Desktop/Projects/ergon-evil",
+        ] {
+            assert!(!p.in_territory(other, false), "{other}");
+        }
+    }
+
+    #[test]
+    fn sends_and_foreign_read_their_flags() {
+        let w = |s: &str| norm_seg(&s.split(' ').map(str::to_owned).collect::<Vec<_>>());
+        for yes in [
+            "curl -d x url",
+            "curl -sSd@f url",
+            "curl --data-binary @f url",
+            "curl -XPOST url",
+            "curl -sX PUT url",
+            "curl -F a=b url",
+            "wget --post-file=f url",
+            "irm url -Me Patch",
+            "iwr url -InFile f",
+            "invoke-restmethod url -Body x",
+            "gh api repos/a/b -f x=1",
+            "gh api -X DELETE repos/a/b",
+        ] {
+            assert!(sends_data(&w(yes)), "{yes}");
+        }
+        for no in [
+            "curl -f url",
+            "curl -o out -H h url",
+            "curl -X GET url",
+            "curl -D d url",
+            "irm url",
+            "iwr url -Method Get",
+            "gh api repos/a/b",
+            "gh api -X GET repos/a/b -f q=1",
+        ] {
+            assert!(!sends_data(&w(no)), "{no}");
+        }
+        let own = vec!["philipjj609/*".to_owned()];
+        for yes in [
+            "gh issue create --repo a/b",
+            "gh pr comment -Ra/b 5",
+            "gh issue comment https://github.com/a/b/issues/1",
+            "gh api repos/a/b/issues",
+            "git push https://github.com/a/b.git main",
+            "git push git@github.com:a/b.git main",
+            "git push https://gitlab.com/a/b.git main",
+        ] {
+            assert!(names_foreign(&w(yes), &own), "{yes}");
+        }
+        for no in [
+            "gh issue create --title x",
+            "gh issue create --repo Philipjj609/ergon",
+            "gh api /repos/Philipjj609/ergon/pulls",
+            "git push origin main",
+            "git push ../remote.git main",
+            "git push https://github.com/Philipjj609/ergon main",
+        ] {
+            assert!(!names_foreign(&w(no), &own), "{no}");
+        }
     }
 }

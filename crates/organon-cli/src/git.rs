@@ -28,6 +28,17 @@ pub fn repo_root(dir: &Path) -> Option<String> {
         .map(|a| plain_path(&a.to_string_lossy()))
 }
 
+/// The repository root of `dir` as [`repo_root`] finds it, or else the physical folder itself:
+/// a folder that is not in a repository (such as `~/.ergon`) can still be in a territory.
+pub fn root_or_folder(dir: &Path) -> Option<String> {
+    repo_root(dir).or_else(|| {
+        fs::canonicalize(dir)
+            .ok()
+            .filter(|d| d.is_dir())
+            .map(|d| plain_path(&d.to_string_lossy()))
+    })
+}
+
 /// The URL git itself gives the `origin` remote of the repository (or worktree) whose root
 /// folder is `root` (`git remote get-url origin`: includes and `insteadOf` rewrites applied,
 /// which no reading of the config file by hand gets right). `None` when there is no `origin`,
@@ -50,6 +61,37 @@ pub fn origin_url(root: &str) -> Option<String> {
     let url = String::from_utf8(out.stdout).ok()?;
     let url = url.trim();
     (!url.is_empty() && !url.contains('\n')).then(|| url.to_owned())
+}
+
+/// The remotes of the repository (or worktree) whose root folder is `root`, each name with
+/// the URL git pushes to (`git remote -v`, its `(push)` lines: `insteadOf` rewrites applied).
+/// `None` when the folder is not in a repository, git is not there or fails. Variables that
+/// point git at another repository are removed.
+pub fn remotes(root: &str) -> Option<Vec<(String, String)>> {
+    let mut git = std::process::Command::new("git");
+    git.args(["-C", root, "remote", "-v"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+    ] {
+        git.env_remove(var);
+    }
+    let out = git.output().ok().filter(|o| o.status.success())?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    Some(
+        text.lines()
+            .filter_map(|l| l.strip_suffix("(push)"))
+            .filter_map(|l| {
+                let (name, url) = l.split_once('\t')?;
+                Some((name.to_owned(), url.trim().to_owned()))
+            })
+            .collect(),
+    )
 }
 
 /// A path without Windows' verbatim prefix (`\\?\C:\x` → `C:/x`), with forward slashes.
@@ -86,8 +128,29 @@ pub fn folder(cwd: &str, hint: Option<&str>) -> PathBuf {
         PathBuf::from(cwd)
     };
     match hint {
-        Some(h) => base.join(drive_path(h)),
+        Some(h) => base.join(drive_path(&job_dir_path(h))),
         None => base,
+    }
+}
+
+/// A path under the session's scratch folder written with its variable
+/// (`$CLAUDE_JOB_DIR/tmp/x`, `${CLAUDE_JOB_DIR}/x`, `$env:CLAUDE_JOB_DIR\x`) as the folder it
+/// names, when this process inherited the variable; any other path unchanged. The policy
+/// only follows such a `cd` when the command does not set the variable itself.
+fn job_dir_path(p: &str) -> String {
+    let lower = p.to_ascii_lowercase();
+    let rest = [
+        "${env:claude_job_dir}",
+        "$env:claude_job_dir",
+        "${claude_job_dir}",
+        "$claude_job_dir",
+    ]
+    .iter()
+    .find_map(|v| lower.strip_prefix(v).map(|_| &p[v.len()..]))
+    .filter(|rest| rest.starts_with(['/', '\\']));
+    match (rest, std::env::var("CLAUDE_JOB_DIR")) {
+        (Some(rest), Ok(dir)) if !dir.is_empty() => format!("{dir}{rest}"),
+        _ => p.to_owned(),
     }
 }
 

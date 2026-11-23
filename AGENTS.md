@@ -10,6 +10,7 @@
 - `crates/organon-cli` (`organon`): does the I/O.
   - `home` (`~/.organon`), `agent` (finding and reading the agent's transcript), `organs` (discovery on PATH).
 - `policy/default.json`: the default policy, embedded in the binary.
+- `policy/territory.json`: the territory policy (`organon init --territory` writes it), embedded too.
 
 **Quality gate** (CI runs it on Linux, macOS and Windows):
 
@@ -26,3 +27,4 @@ Every bug fix gets a regression test. `tests/hook.rs` drives the hook end to end
 4. A budget stop is final for its task. Never make it retryable.
 5. Approval-class rules are a floor: the built-in ones always apply, whatever `policy.json` says. A policy file can add rules, never drop or weaken them.
 6. Each agent session has its own record (`sessions/<id>.json`). Never write state that one session's hook shares with another's.
+7. A territory (`territory` + `lines` in a policy, as in `policy/territory.json`) lifts every `ask` in the person's own folders except the classes in `lines`; nothing lifts a line, not even an exception, and only the person adds to `agreed` (an exception to a line). A delete is lifted only while what it deletes stays inside the territory. Every ask and deny goes to `refusal_log` when it is set.
