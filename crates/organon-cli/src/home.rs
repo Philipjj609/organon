@@ -80,15 +80,20 @@ impl Home {
     pub fn policy(&self) -> Result<(Policy, bool)> {
         let builtin = Policy::from_json(DEFAULT).context("built-in policy")?;
         let path = self.policy_path();
-        if path.exists() {
+        let (mut policy, from_file) = if path.exists() {
             let text =
                 fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
             let p = Policy::from_json(&text)
                 .with_context(|| format!("{} is not a valid policy", path.display()))?;
-            Ok((p.with_floor(&builtin), true))
+            (p.with_floor(&builtin), true)
         } else {
-            Ok((builtin, false))
+            (builtin, false)
+        };
+        // Only the real home folder is `~` to the policy, unless the file names another.
+        if policy.home.is_none() {
+            policy.home = user_home().map(|h| h.to_string_lossy().into_owned());
         }
+        Ok((policy, from_file))
     }
 
     fn tasks_dir(&self) -> PathBuf {

@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use organon_core::audit::audit;
 use organon_core::budget::{standing, Budget, Effort, Level, Minutes, Standing, Usd};
 use organon_core::meter::SessionSpend;
-use organon_core::policy::{glob, segments, Action, Decision, Verdict};
+use organon_core::policy::{expand_braces, glob, segments, Action, Decision, Lookups, Verdict};
 use organon_core::route::Tier;
 use organon_core::task::{Event, Task};
 use organon_core::time::rfc3339;
@@ -587,11 +587,19 @@ fn check(home: &Home, write: Option<&str>, command: &str) -> Result<ExitCode> {
     let branch_of = |hint: Option<&str>| git::branch_in(&git::folder("", hint));
     let repo_of = |hint: Option<&str>| git::root_or_folder(&git::folder("", hint));
     let origin_of = |root: &str| git::origin_url(root);
-    let v = policy.decide_with_origin(
+    let remotes_of = |root: &str| git::remotes(root);
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|d| d.to_string_lossy().into_owned());
+    let v = policy.decide_where(
         action,
-        &branch_of,
-        &repo_of,
-        &origin_of,
+        &Lookups {
+            cwd: cwd.as_deref(),
+            branch_of: &branch_of,
+            repo_of: &repo_of,
+            origin_of: &origin_of,
+            remotes_of: &remotes_of,
+        },
         git::inherited(None, &policy.merge_env_names),
     );
     let d = format!("{:?}", v.decision).to_lowercase();
@@ -923,21 +931,56 @@ const REFUSAL_LOG_CAP: u64 = 1024 * 1024;
 
 /// Whether a command may carry a value that must not be written down: a pipe or a here-string
 /// (`echo <value> | vercel env add`), an assignment (`TOKEN=<value> gh ...`), or a word that
-/// names a token, key, secret or password.
+/// names a token, key, secret or password, a URL with a password in it
+/// (`://user:pass@host`), a one-time code (`--otp`), or a short flag followed by a word that
+/// looks like a token (`-t vcp_9f8e7d6c5b4a`: twelve or more letters, digits, `_` or `-`,
+/// with a digit among them).
 fn carries_values(cmd: &str) -> bool {
     let lower = cmd.to_lowercase();
+    let words: Vec<&str> = cmd.split_whitespace().collect();
+    let token_like = |w: &str| {
+        let w = w.trim_matches(['"', '\'']);
+        w.len() >= 12
+            && w.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            && w.chars().any(|c| c.is_ascii_digit())
+            && w.chars().any(|c| c.is_ascii_alphabetic())
+    };
+    let short_flag = |w: &str| w.len() == 2 && w.starts_with('-') && w != "--";
     cmd.contains('|')
         || cmd.contains("<<")
-        || ["token", "key", "secret", "passw", "auth", "bearer"]
+        || ["token", "key", "secret", "passw", "auth", "bearer", "--otp"]
             .iter()
             .any(|w| lower.contains(w))
-        || cmd.split_whitespace().any(|w| {
+        || words.iter().any(|w| {
+            w.split_once("://")
+                .and_then(|(_, rest)| rest.split('/').next())
+                .is_some_and(|authority| authority.contains('@'))
+        })
+        || words
+            .windows(2)
+            .any(|p| short_flag(p[0]) && token_like(p[1]))
+        || words.iter().any(|w| {
             let w = w.trim_start_matches(['"', '\'']);
             let w = w.strip_prefix("$env:").unwrap_or(w);
             w.split_once('=').is_some_and(|(k, _)| {
                 !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             })
         })
+}
+
+/// What is written down of an action that was asked about or denied: a command in a class
+/// whose words are values (`secrets`, `send`, `paid`, `deploy`), or one that may carry a value
+/// ([`carries_values`]), by its programs only ([`program_words`]).
+fn logged_action(action: Action<'_>, class: Option<&str>, limit: usize) -> String {
+    let cut = matches!(class, Some("secrets" | "send" | "paid" | "deploy"));
+    match action {
+        Action::Command(c) if cut || carries_values(c) => program_words(c),
+        Action::Command(c) => c.chars().take(limit).collect(),
+        Action::Write { path } => format!("write {path}"),
+        Action::Read { path } => format!("read {path}"),
+        Action::Tool(t) => t.to_owned(),
+    }
 }
 
 /// A command reduced to its programs and their subcommands (`vercel env … | gh secret …`):
@@ -982,9 +1025,8 @@ fn program_words(cmd: &str) -> String {
 }
 
 /// Append an ask or deny to the policy's refusal log, so friction becomes data. A failure is
-/// logged to `hook-errors.log` and never changes the answer. A command in the `secrets`,
-/// `send` or `paid` class, or one that may carry a value ([`carries_values`]), is logged by
-/// its programs only ([`program_words`]). Past [`REFUSAL_LOG_CAP`] the log starts again.
+/// logged to `hook-errors.log` and never changes the answer. What is written of the action is
+/// [`logged_action`]. Past [`REFUSAL_LOG_CAP`] the log starts again.
 fn log_refusal(home: &Home, policy: &organon_core::policy::Policy, ev: &HookEvent, v: &Verdict) {
     let Some(log) = policy.refusal_log.as_deref() else {
         return;
@@ -996,14 +1038,7 @@ fn log_refusal(home: &Home, policy: &organon_core::policy::Policy, ev: &HookEven
         },
         None => PathBuf::from(log),
     };
-    let cut = matches!(v.class.as_deref(), Some("secrets" | "send" | "paid"));
-    let action = match ev.action() {
-        Action::Command(c) if cut || carries_values(c) => program_words(c),
-        Action::Command(c) => c.chars().take(300).collect(),
-        Action::Write { path } => format!("write {path}"),
-        Action::Read { path } => format!("read {path}"),
-        Action::Tool(t) => t.to_owned(),
-    };
+    let action = logged_action(ev.action(), v.class.as_deref(), 300);
     let line = json!({
         "time": rfc3339(now()),
         "decision": v.decision,
@@ -1057,21 +1092,33 @@ fn hook(home: &Home, ev: &HookEvent) -> Result<Option<String>> {
     let branch_of = |hint: Option<&str>| git::branch_in(&git::folder(&ev.cwd, hint));
     let repo_of = |hint: Option<&str>| git::root_or_folder(&git::folder(&ev.cwd, hint));
     let origin_of = |root: &str| git::origin_url(root);
-    let mut verdict = policy.decide_with_origin(
+    let remotes_of = |root: &str| git::remotes(root);
+    let mut verdict = policy.decide_where(
         action,
-        &branch_of,
-        &repo_of,
-        &origin_of,
+        &Lookups {
+            cwd: Some(ev.cwd.as_str()).filter(|c| !c.is_empty()),
+            branch_of: &branch_of,
+            repo_of: &repo_of,
+            origin_of: &origin_of,
+            remotes_of: &remotes_of,
+        },
         git::inherited(Some(&ev.session_id), &policy.merge_env_names),
     );
     // A `Grep` reads the files its glob names too: `glob=".env*"` reads secrets. The glob is
-    // tried on the names of the secret files the policy knows of.
+    // tried on the names of the secret files the policy knows of, each alternative of a
+    // brace list (`{.env,.env.local}`) on its own.
     if let Some(g) = ev.read_glob.as_deref() {
         let base = ev.read.as_deref().unwrap_or(".");
         let base = base.trim_end_matches(['/', '\\']);
         let g = g.replace('\\', "/").to_lowercase();
-        let name = g.rsplit('/').next().unwrap_or(&g);
-        for file in SECRET_NAMES.iter().filter(|f| glob(name, f)) {
+        let names: Vec<String> = expand_braces(&g)
+            .iter()
+            .map(|g| g.rsplit('/').next().unwrap_or(g).to_owned())
+            .collect();
+        for file in SECRET_NAMES
+            .iter()
+            .filter(|f| names.iter().any(|name| glob(name, f)))
+        {
             let v = policy.decide(Action::Read {
                 path: &format!("{base}/{file}"),
             });
@@ -1113,12 +1160,7 @@ fn hook(home: &Home, ev: &HookEvent) -> Result<Option<String>> {
                     time: rfc3339(now()),
                     decision: verdict.decision,
                     reason: verdict.reason.clone().unwrap_or_default(),
-                    action: match action {
-                        Action::Command(c) => c.chars().take(200).collect(),
-                        Action::Write { path } => format!("write {path}"),
-                        Action::Read { path } => format!("read {path}"),
-                        Action::Tool(t) => t.to_owned(),
-                    },
+                    action: logged_action(action, verdict.class.as_deref(), 200),
                 },
             )?;
         }
