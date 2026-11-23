@@ -4066,10 +4066,12 @@ fn assigns_any(words: &[String], names: &[String]) -> bool {
 fn sets_job_dir(cmd: &str) -> bool {
     let s = squashed(cmd);
     s.match_indices("claude_job_dir").any(|(i, m)| {
+        let before = &s[..i];
         s[i + m.len()..].trim_start().starts_with('=')
-            || s[..i].trim_end().ends_with("export")
-            || s[..i].trim_end().ends_with("set")
-            || s[..i].trim_end().ends_with("setx")
+            || !(before.ends_with('$')
+                || before.ends_with("${")
+                || before.ends_with("$env:")
+                || before.ends_with("${env:"))
     })
 }
 
@@ -6726,6 +6728,16 @@ mod territory_tests {
             at(OWN, "CLAUDE_JOB_DIR=C:/ rm -rf $CLAUDE_JOB_DIR/tmp/x"),
             Decision::Ask
         );
+        // Any other spelling that sets it asks too; reading it does not.
+        for cmd in [
+            "read CLAUDE_JOB_DIR <<< C:/Users/phili/Documents; cd $CLAUDE_JOB_DIR/tmp && rm -rf *",
+            "printf -v CLAUDE_JOB_DIR %s C:/Users/phili/Documents; cd $CLAUDE_JOB_DIR/tmp && rm -rf *",
+            "for CLAUDE_JOB_DIR in C:/Users/phili/Documents; do cd $CLAUDE_JOB_DIR/tmp && rm -rf *; done",
+        ] {
+            assert_eq!(at(OWN, cmd), Decision::Ask, "{cmd}");
+        }
+        assert!(!sets_job_dir("cd $CLAUDE_JOB_DIR/tmp && rm -f x.jpg"));
+        assert!(!sets_job_dir("cd ${env:CLAUDE_JOB_DIR}/tmp; ri x.jpg"));
     }
 
     const ERGON_HOME: &str = "C:/Users/phili/.ergon";

@@ -1000,10 +1000,18 @@ fn program_words(cmd: &str) -> String {
         "cat",
         "type",
     ];
+    // A PowerShell assignment (`$t = 'v'`, `$env:X='v'`) leaves its value as a segment of its
+    // own, right after the `$name` segment: that value is dropped, and the name is cut at `=`.
     let parts: Vec<String> = segs
         .iter()
-        .map(|seg| {
-            let mut w = seg[0].clone();
+        .enumerate()
+        .filter(|(i, seg)| {
+            let w = seg[0].as_str();
+            let value_of_assignment = seg.len() == 1 && *i > 0 && segs[i - 1][0].starts_with('$');
+            !value_of_assignment && !w.starts_with(['\'', '"', '='])
+        })
+        .map(|(_, seg)| {
+            let mut w = seg[0].split('=').next().unwrap_or_default().to_owned();
             if let Some(sub) = seg.get(1).filter(|s| {
                 !printers.contains(&seg[0].as_str())
                     && s.len() <= 24

@@ -383,7 +383,7 @@
       "class": "deploy"
     },
     {
-      "tool": "mcp__*__request_rollback|mcp__*__assign_alias|mcp__*__start_rolling_release|mcp__*__complete_rolling_release|mcp__*__approve_rolling_release_stage|mcp__*__promote*|mcp__*__execute_sql|mcp__*__replace_domain_dns_records|mcp__*__update_record|mcp__*__add_project_domain|mcp__*__pause_project|mcp__*__put_firewall_config",
+      "tool": "mcp__*__request_rollback|mcp__*__assign_alias|mcp__*__start_rolling_release|mcp__*__complete_rolling_release|mcp__*__approve_rolling_release_stage|mcp__*__promote*|mcp__*__execute_sql|mcp__*__replace_domain_dns_records|mcp__*__update_record|mcp__*__add_project_domain|mcp__*__pause_project|mcp__*__put_firewall_config|mcp__*__create_record|mcp__*__update_firewall_config|mcp__*__update_drain|mcp__*__update_project|mcp__*__unpause_project|mcp__*__update_project_protection_bypass|mcp__*__patch_url_protection_bypass|mcp__*__stage_routes|mcp__*__restore_redirects|mcp__*__update_edge_config",
       "decision": "ask",
       "reason": "Changes what is live (an alias, a rollback, a rolling release, a domain or its DNS, the firewall, a paused project) or a live database. Philip's line: deploys to production.",
       "class": "deploy"
@@ -557,7 +557,7 @@
       "class": "secrets"
     },
     {
-      "tool": "mcp__*__create_edge_function_secret|mcp__*__get_project_env|mcp__*__filter_project_envs|mcp__*__get_shared_env_var|mcp__*__create_ai_gateway_api_key|mcp__*__create_edge_config_token|mcp__*__get_edge_config_token*|mcp__*__create_sdk_key|mcp__*__list_feature_flag_sdk_keys|mcp__*__save_auth_tokens",
+      "tool": "mcp__*__create_edge_function_secret|mcp__*__get_project_env|mcp__*__filter_project_envs|mcp__*__get_shared_env_var|mcp__*__create_ai_gateway_api_key|mcp__*__create_edge_config_token|mcp__*__get_edge_config_token*|mcp__*__create_sdk_key|mcp__*__list_feature_flag_sdk_keys|mcp__*__save_auth_tokens|mcp__*__get_publishable_keys",
       "decision": "ask",
       "reason": "Secret values must not enter an agent's context. Philip's line: secrets.",
       "class": "secrets"

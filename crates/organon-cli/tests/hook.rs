@@ -1194,6 +1194,9 @@ fn the_refusal_log_cuts_deploys_urls_codes_and_tokens_and_a_brace_glob_is_seen()
         "wipe postgres://postgres:LEAK4pw@db.example.co:5432/postgres",
         "wipe -t vcp_9f8e7dLEAK5",
         "wipe --otp 271828",
+        "$env:GH_TOKEN='ghp_LEAK6'; vercel --prod",
+        "$env:VERCEL_TOKEN = 'vcp_LEAK7'; vercel --prod",
+        "$t = 'LEAK8'; vercel --prod --token $t",
     ] {
         assert!(is_ask(&run("Bash", &command(cmd))), "{cmd}");
     }
@@ -1211,9 +1214,11 @@ fn the_refusal_log_cuts_deploys_urls_codes_and_tokens_and_a_brace_glob_is_seen()
         run("Grep", r#"{"pattern":"TODO","glob":"*.{rs,toml}"}"#),
         ""
     );
-    let text = fs::read_to_string(&log).unwrap();
-    for leak in ["LEAK1", "LEAK2", "314159", "LEAK4", "LEAK5", "271828"] {
+    let text = fs::read_to_string(&log).unwrap().to_ascii_lowercase();
+    for leak in [
+        "leak1", "leak2", "314159", "leak4", "leak5", "271828", "leak6", "leak7", "leak8",
+    ] {
         assert!(!text.contains(leak), "{leak}: {text}");
     }
-    assert!(text.contains("wipe C:/elsewhere/plain"), "{text}");
+    assert!(text.contains("wipe c:/elsewhere/plain"), "{text}");
 }
