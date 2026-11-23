@@ -1071,9 +1071,8 @@ impl Policy {
                                     // all inside, run from one of their folders.
                                     let absolute = class == DELETE_CLASS
                                         && own_folder().is_some_and(|h| self.owned(class, h))
-                                        && self.deletes_inside(
-                                            &nseg, None, bash_only, job_dir, true,
-                                        );
+                                        && self
+                                            .deletes_inside(&nseg, None, bash_only, job_dir, true);
                                     if everywhere || absolute {
                                         continue;
                                     }
@@ -1261,9 +1260,9 @@ impl Policy {
                 seg.len() > 3
                     && seg[..3] == ["gh", "pr", "merge"]
                     && seg[3..].iter().any(|w| w.starts_with("--admin"))
-                    && [None, dir.as_deref()].iter().any(|h| {
-                        repo_of(*h).is_some_and(|f| self.excepted(MERGE_CLASS, &f))
-                    })
+                    && [None, dir.as_deref()]
+                        .iter()
+                        .any(|h| repo_of(*h).is_some_and(|f| self.excepted(MERGE_CLASS, &f)))
             })
         })
     }
@@ -1318,7 +1317,8 @@ impl Policy {
             other => other,
         };
         let foreign = |url: &str| {
-            github_slug(url).is_none_or(|s| !self.own_repos.iter().any(|o| glob(&o.to_lowercase(), &s)))
+            github_slug(url)
+                .is_none_or(|s| !self.own_repos.iter().any(|o| glob(&o.to_lowercase(), &s)))
         };
         // What the command itself does to the remotes.
         let mut set_here = false;
@@ -1327,15 +1327,17 @@ impl Policy {
                 continue;
             };
             match w.first().map(String::as_str) {
-                Some("config") if w.iter().any(|x| {
-                    let x = x.to_lowercase();
-                    x.starts_with("remote.") || x.starts_with("url.") || x.contains("insteadof")
-                }) =>
+                Some("config")
+                    if w.iter().any(|x| {
+                        let x = x.to_lowercase();
+                        x.starts_with("remote.") || x.starts_with("url.") || x.contains("insteadof")
+                    }) =>
                 {
                     return true;
                 }
                 Some("remote") => {
-                    let rest: Vec<&String> = w[1..].iter().filter(|x| !x.starts_with('-')).collect();
+                    let rest: Vec<&String> =
+                        w[1..].iter().filter(|x| !x.starts_with('-')).collect();
                     if let [verb, remote, url, ..] = rest.as_slice() {
                         let sets = matches!(verb.as_str(), "add" | "set-url");
                         if sets && name.is_none_or(|n| n == remote.as_str()) {
@@ -1411,12 +1413,7 @@ impl Policy {
     /// ([`norm_path`]): `\` or `/`, any case, `~`, `$HOME` or `C:/Users/<name>`.
     #[must_use]
     pub fn in_territory(&self, path: &str, strictly: bool) -> bool {
-        within(
-            &self.territory,
-            path,
-            strictly,
-            self.home_key().as_deref(),
-        )
+        within(&self.territory, path, strictly, self.home_key().as_deref())
     }
 
     /// Whether every file a delete command names stays inside the person's own folders: a
@@ -1460,10 +1457,7 @@ impl Policy {
             return !absolute_only;
         }
         // `rmdir /s /q C:\x` is cmd's: bash would have eaten its `\`, the cmd reading has it.
-        let cmd_style = cmd_flags
-            && seg[1..]
-                .iter()
-                .any(|w| w.len() == 2 && w.starts_with('/'));
+        let cmd_style = cmd_flags && seg[1..].iter().any(|w| w.len() == 2 && w.starts_with('/'));
         if bash_only
             && (cmd_style || matches!(prog.as_str(), "remove-item" | "ri" | "rd" | "del" | "erase"))
         {
@@ -2843,7 +2837,31 @@ fn names_file(pattern: &str, seg: &[String], r: &Rule, wild: &Wild) -> bool {
             .collect();
         matches_words_as(pattern, &words, &r.unless, Some(wild))
     };
-    names(seg) || unwrap_runner(seg).is_some_and(|s| names(&s))
+    names(seg)
+        || unwrap_runner(seg).is_some_and(|s| names(&s))
+        || substituted(seg).iter().any(|s| names(s))
+}
+
+/// The commands inside the substitutions a part's words hold (`echo "$(cat .env)"` → `cat
+/// .env`), split on blanks only; a lone file (`"$(<.env)"`) is read by the substitution
+/// itself. So a quoted substitution is not passed over as a message, nor excused by the
+/// program it is handed to. A heredoc in a substitution is a message (`git commit -m
+/// "$(cat <<'EOF'`), and backticks are left alone: commit messages quote names with them.
+fn substituted(seg: &[String]) -> Vec<Vec<String>> {
+    seg.iter()
+        .filter(|w| w.contains("$(") && !w.contains("<<"))
+        .filter_map(|w| {
+            let mut inner: Vec<String> = w
+                .split(|c: char| c.is_whitespace() || "$()<`\"'".contains(c))
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if inner.len() == 1 {
+                inner.insert(0, "$(".to_owned());
+            }
+            (!inner.is_empty()).then_some(inner)
+        })
+        .collect()
 }
 
 /// [`matches_words`]; for a rule marked `paths` (`wild` is given), a word also counts by the
@@ -2990,7 +3008,9 @@ fn globs_meet(pattern: &str, word: &str, dots: bool) -> bool {
                     rec(a, b, dots, (i + 1, j, fresh), seen)
                         || (fresh && rec(a, b, dots, (i, j, false), seen))
                 }
-                Some(&c) => c != '/' && !(fresh && c == '.') && rec(a, b, dots, (i + 1, j, false), seen),
+                Some(&c) => {
+                    c != '/' && !(fresh && c == '.') && rec(a, b, dots, (i + 1, j, false), seen)
+                }
                 None => false,
             };
         }
@@ -3004,7 +3024,13 @@ fn globs_meet(pattern: &str, word: &str, dots: bool) -> bool {
         }
     }
     let fresh = !dots && b.first() == Some(&'*');
-    rec(&a, &b, dots, (0, 0, fresh), &mut std::collections::HashSet::new())
+    rec(
+        &a,
+        &b,
+        dots,
+        (0, 0, fresh),
+        &mut std::collections::HashSet::new(),
+    )
 }
 
 /// `p` with its `.` and `..` components resolved by reading it (`a/b/../c` → `a/c`); a `..`
@@ -3140,7 +3166,7 @@ fn part_folders(segs: &[Vec<String>], k: usize) -> Option<Vec<Option<String>>> {
     for s in &segs[..k] {
         if matches!(
             s.first().map(String::as_str),
-            Some("cd" | "set-location" | "sl")
+            Some("cd" | "set-location" | "sl" | "chdir" | "pushd" | "push-location")
         ) {
             if let Some(t) = s[1..].iter().find(|w| !w.starts_with('-')) {
                 if !out.contains(&Some(t.clone())) {
@@ -6699,6 +6725,386 @@ mod territory_tests {
         assert_eq!(
             at(OWN, "CLAUDE_JOB_DIR=C:/ rm -rf $CLAUDE_JOB_DIR/tmp/x"),
             Decision::Ask
+        );
+    }
+
+    const ERGON_HOME: &str = "C:/Users/phili/.ergon";
+    const HOME: &str = "C:/Users/phili";
+
+    /// Every command of `cmds`, run from `cwd`, gets `want`.
+    fn all(cwd: &str, want: Decision, cmds: &[&str]) {
+        for cmd in cmds {
+            assert_eq!(at(cwd, cmd), want, "{cwd}: {cmd}");
+        }
+    }
+
+    /// The re-check's 2a and 1.7: any program that names a secret file asks, but the few that
+    /// cannot show what is in it; `unless` never excuses the target of a copy.
+    #[test]
+    fn any_program_naming_a_secret_file_asks() {
+        all(
+            OWN,
+            Decision::Ask,
+            &[
+                "cp .env .env.example",
+                "cp .env backup.sample",
+                "cp C:\\Users\\phili\\Desktop\\Projects\\ergon\\.env C:\\x\\backup.sample",
+                "cp C:/Users/phili/Desktop/Projects/ergon/.env C:/x/backup.sample",
+                "Copy-Item .env .env.dist",
+                "Copy-Item .\\.env .\\.env.dist",
+                "cat .env > env.example",
+                "git diff --no-index /dev/null .env",
+                "git add -f .env",
+                "python read.py .env",
+                "zip x.zip .env",
+                "tar cf - .env",
+                "source .env",
+                "code .env",
+                "try { Get-Content .env } catch {}",
+                "Get-Content -Path:.env",
+                "Get-Content .\\.env",
+                "Get-Content C:\\Users\\phili\\Desktop\\Projects\\ergon\\.env.local",
+                "cat C:/Users/phili/Desktop/Projects/ergon/.env.local",
+                "cat .e*",
+                "echo \"$(cat .env)\"",
+                "echo \"$(cat C:/Users/phili/Desktop/Projects/ergon/.env)\"",
+                "printf '%s' \"$(<.env)\"",
+                "Write-Output \"$(Get-Content .\\.env)\"",
+                "echo ${env:VERCEL_TOKEN}",
+                "[System.Environment]::GetEnvironmentVariable('GH_TOKEN')",
+                "node -p process.env",
+                "gh api -XDelete repos/Philipjj609/ergon",
+            ],
+        );
+        all(
+            OWN,
+            Decision::Allow,
+            &[
+                "test -f .env",
+                "[ -f .env ] && echo yes",
+                "ls -la .env",
+                "touch .env",
+                "echo .env >> .gitignore",
+                "docker run --env-file .env img",
+                "cp .env.example .env",
+                "cat .env.example",
+                "cat .env.local.example",
+                "echo \"$(cat .env.example)\"",
+                "git commit -m \"$(cat <<'EOF'\nRead .env only at start\nEOF\n)\"",
+                "git commit -m \"Ignore `.env` files\"",
+            ],
+        );
+        // A search of the whole home folder reads its hidden folders, in either slash form.
+        let p = territory();
+        for path in ["C:/Users/phili", "C:\\Users\\phili", "C:\\Users\\phili\\"] {
+            assert_eq!(
+                p.decide(Action::Read { path }).decision,
+                Decision::Ask,
+                "{path}"
+            );
+        }
+    }
+
+    /// The re-check's 2b and 1.2: the hook's own folders by relative path, by a parent, by
+    /// `..`, and the two ways to start a session without the hook.
+    #[test]
+    fn the_hooks_own_folders_ask_by_any_route() {
+        all(
+            OWN,
+            Decision::Ask,
+            &[
+                "cd C:/Users/phili/.ergon && rm -rf bin",
+                "cd C:\\Users\\phili\\.ergon && rm -rf bin",
+                "cd C:/Users/phili/.organon && cp C:/x/p.json policy.json",
+                "cd C:\\Users\\phili\\.organon && cp C:\\x\\p.json policy.json",
+                "cd C:/Users/phili/.claude && cp C:/x/s.json settings.json",
+                "Set-Location C:\\Users\\phili\\.claude; Set-Content settings.json '{}'",
+                "pushd ~/.organon; echo x > policy.json",
+                "pushd C:\\Users\\phili\\.organon; echo x > policy.json",
+                "mv C:/Users/phili/.ergon C:/Users/phili/.ergon-old",
+                "Move-Item C:\\Users\\phili\\.ergon C:\\Users\\phili\\.ergon-old",
+                "mv C:/Users/phili/.ergon/b* /tmp/",
+                "mv C:\\Users\\phili\\.ergon\\b* C:\\tmp\\",
+                "CLAUDE_CONFIG_DIR=C:/tmp/c claude --bg -p brief",
+                "claude --settings C:/tmp/s.json --bg -p brief",
+                "claude --settings=C:\\tmp\\s.json --bg -p brief",
+            ],
+        );
+        all(
+            ERGON_HOME,
+            Decision::Ask,
+            &[
+                "rm -rf bin",
+                "mv bin bin.old",
+                "Remove-Item -Recurse -Force .\\bin",
+                "rm -rf ./bin",
+            ],
+        );
+        all(
+            HOME,
+            Decision::Ask,
+            &["cd .claude && echo '{}' > settings.local.json"],
+        );
+        let p = territory();
+        for path in [
+            "C:/Users/phili/.claude/hooks/../settings.json",
+            "C:\\Users\\phili\\.claude\\hooks\\..\\settings.json",
+            "C:/Users/phili/.ergon/scratch/../bin/organon-bg.mjs",
+            "C:\\Users\\phili\\.ergon\\scratch\\..\\bin\\organon-bg.mjs",
+        ] {
+            assert_eq!(
+                p.decide(Action::Write { path }).decision,
+                Decision::Ask,
+                "{path}"
+            );
+        }
+        // The rest of `~/.ergon` is still his to work in, and a plain session still starts.
+        all(ERGON_HOME, Decision::Allow, &["rm -rf scratch/x"]);
+        all(OWN, Decision::Allow, &["claude --bg -p brief"]);
+    }
+
+    /// The re-check's 2c and section 3: a word that changes the folder unseen makes a delete
+    /// uncertain, and a program that only runs another is judged by the one it runs.
+    #[test]
+    fn a_prefix_or_a_hidden_folder_change_does_not_hide_a_line() {
+        all(
+            OWN,
+            Decision::Ask,
+            &[
+                "cd.. ; Remove-Item -Recurse -Force Aegis",
+                "cd.. && Remove-Item -Recurse -Force Aegis",
+                "builtin cd C:/Users/phili/Documents; rm -rf old",
+                "builtin cd C:\\Users\\phili\\Documents; rm -rf old",
+                "eval \"cd C:/Users/phili/Documents\"; rm -rf old",
+                ". ./go.sh; rm -rf old",
+                "source go.sh; rm -rf old",
+                "timeout 60 git push --force origin main",
+                "timeout 120 vercel --prod",
+                "timeout 5 cat .env",
+                "env FOO=1 git push --force origin main",
+                "nohup vercel --prod",
+                "exec vercel --prod",
+                "command git push --force origin main",
+                "sudo rm -rf C:/Users/phili/Documents/old",
+                "sudo rm -rf C:\\Users\\phili\\Documents\\old",
+                "winpty vercel --prod",
+                "try { vercel --prod } catch { Write-Host failed }",
+                "1..3 | ForEach-Object { npm publish }",
+                "1..3 | % { git push --force origin main }",
+                "Start-Process vercel -ArgumentList '--prod'",
+            ],
+        );
+        // A kept deny stays a deny under any prefix.
+        all(
+            OWN,
+            Decision::Deny,
+            &[
+                "timeout 60 gh pr merge 5 --admin --squash",
+                "env A=1 gh pr merge 5 --admin --squash",
+                "nohup gh pr merge 5 --admin --squash",
+                "exec gh pr merge 5 --admin --squash",
+                "command gh pr merge 5 --admin --squash",
+                "sudo gh pr merge 5 --admin --squash",
+                "winpty gh pr merge 5 --admin --squash",
+                "try { gh pr merge 5 --admin --squash } catch {}",
+                "1..3 | ForEach-Object { gh pr merge 5 --admin --squash }",
+                "$r = try { gh pr merge 5 --admin --squash } catch {}",
+                "Start-Process gh -ArgumentList 'pr merge 5 --admin --squash'",
+            ],
+        );
+        // A prefix does not make plain work ask.
+        all(
+            OWN,
+            Decision::Allow,
+            &[
+                "timeout 120 git push -u origin feature",
+                "timeout 60 cargo test",
+                "env FOO=1 pnpm run build",
+            ],
+        );
+    }
+
+    /// The re-check's 2d: only the real home folder is `~`, a command that moves `HOME` is
+    /// uncertain, and a brace list in a delete is a glob.
+    #[test]
+    fn only_the_real_home_is_home() {
+        all(
+            OWN,
+            Decision::Ask,
+            &[
+                "rm -rf C:/Users/Public/.ergon/scratch/x",
+                "rm -rf C:\\Users\\Public\\.ergon\\scratch\\x",
+                "rm -rf D:/Users/phili/Desktop/Projects/ergon/x",
+                "rm -rf /home/bob/.ergon/scratch/x",
+                "export HOME=C:/Users/phili/Documents; rm -rf ~/.ergon/scratch/x",
+                "$env:HOME='C:\\Users\\phili\\Documents'; Remove-Item -Recurse -Force ~/.ergon/scratch/x",
+                "rm -rf {dist,../Aegis}",
+                "rm -rf .{git,github}",
+            ],
+        );
+        all(
+            OWN,
+            Decision::Allow,
+            &[
+                "rm -rf ~/.ergon/scratch/x",
+                "rm -rf C:/Users/phili/.ergon/scratch/x",
+                "Remove-Item -Recurse -Force C:\\Users\\phili\\.ergon\\scratch\\x",
+            ],
+        );
+    }
+
+    /// The re-check's section 4: a `cd` chained with `;` is followed between his own folders,
+    /// absolute targets inside the territory need no folder, and the live top-level worktrees
+    /// and the job scratch folders are his.
+    #[test]
+    fn the_regressions_of_the_recheck_pass() {
+        all(
+            OWN,
+            Decision::Allow,
+            &[
+                "cd C:/Users/phili/.ergon/compendium/books/don-t-panic/work; rm -f ctx.mjs v.txt; ls; node -e \"console.log(1)\"",
+                "cd C:/Users/phili/.ergon/proof/casa-lumera/demo-shots-r4; mkdir -p run1; cp run-all-out.txt run1/run-all-out-1.txt; rm -f checks/t.txt; echo \"ok\"",
+                "cd C:/Users/phili/.ergon/tmp-ed2 && (cat hdr.mjs; sed -n '12,$p' gen.mjs) > gen2.mjs && node gen2.mjs 2>&1 | head -20; rm -f C:/Users/phili/.ergon/compendium/books/x/work/in-2.lines.json",
+                "cd C:/Users/phili/Desktop/Projects/philipciuca.com-wt/j23-collector; rm -r .wrangler/state",
+                "cd C:/Users/phili/Documents; rm -f C:/Users/phili/.ergon/scratch/a.txt",
+                "Remove-Item C:\\Users\\phili\\.ergon\\scratch\\a.txt; Get-ChildItem",
+                "rm -rf C:/Users/phili/.ergon/tmp-ed2; ls C:/Users/phili/.ergon/compendium",
+                "rm -r C:/Users/phili/.ergon/site-maps/g",
+                "Remove-Item -Recurse -Force C:\\Users\\phili\\.claude\\jobs\\990104f7\\tmp\\x",
+                "Remove-Item -Confirm:$false C:/Users/phili/.claude/jobs/42484048/tmp/bkts-qcheck.mjs",
+            ],
+        );
+        for own in [
+            "C:/Users/phili/Desktop/Projects/ergon-wt-j28-deep",
+            "C:/Users/phili/Desktop/Projects/ergon-wt-j30-senses",
+            "C:/Users/phili/Desktop/Projects/ergon-wt-j31-craft",
+            "C:\\Users\\phili\\Desktop\\Projects\\ergon-wt-j32-organism",
+            "C:/Users/phili/Desktop/Projects/ergon-wt-state-c17b",
+            "C:/Users/phili/.claude/jobs/990104f7/tmp/wt",
+            "C:\\Users\\phili\\.claude\\jobs\\990104f7\\tmp\\wt",
+        ] {
+            all(own, Decision::Allow, &["rm -rf dist", "git reset --hard"]);
+        }
+        // Named one by one, not by a pattern: another top-level worktree is still outside,
+        // and so is the rest of a job folder.
+        for other in [
+            "C:/Users/phili/Desktop/Projects/ergon-wt-pulse",
+            "C:/Users/phili/Desktop/Projects/ergon-wt-j28-deeper",
+            "C:/Users/phili/.claude/jobs/990104f7",
+        ] {
+            assert!(!territory().in_territory(other, false), "{other}");
+        }
+        // A `cd` to a folder that is not his still makes a relative delete ask.
+        all(
+            OWN,
+            Decision::Ask,
+            &[
+                "cd C:/Users/phili/Documents; rm -f notes.txt",
+                "cd C:\\Users\\phili\\Documents; rm -f notes.txt",
+            ],
+        );
+    }
+
+    /// The re-check's 1.5: deletes outside the territory, through the forms that hid them.
+    #[test]
+    fn deletes_outside_ask_through_every_wrapper() {
+        all(
+            OWN,
+            Decision::Ask,
+            &[
+                "cmd /c \"rmdir /s /q C:\\Users\\phili\\Documents\\old\"",
+                "cmd /c \"rmdir /s /q C:/Users/phili/Documents/old\"",
+                "cd C:/Users/phili/Documents && rm notes.txt",
+                "cd C:\\Users\\phili\\Documents && rm notes.txt",
+                "try { Remove-Item -Recurse -Force C:\\Users\\phili\\Documents\\old } catch {}",
+                "try { Remove-Item -Recurse -Force C:/Users/phili/Documents/old } catch {}",
+                "Get-ChildItem C:\\Users\\phili\\Documents\\old | ForEach-Object { Remove-Item -Recurse -Force $_.FullName }",
+                "find C:/Users/phili/Documents -name '*.bak' -exec rm -rf {} +",
+                "find C:\\Users\\phili\\Documents -name '*.bak' -exec rm -rf {} +",
+                "echo x | xargs rm -rf",
+                "npx rimraf C:/Users/phili/Documents/old",
+                "npx rimraf C:\\Users\\phili\\Documents\\old",
+            ],
+        );
+        all(
+            OWN,
+            Decision::Allow,
+            &[
+                "npx rimraf dist",
+                "find . -name '*.bak' -delete",
+                "Remove-Item -Recurse -Force .\\tmp-shots",
+            ],
+        );
+    }
+
+    /// The re-check's section 6: the tools that change what is live, reset a branch or send
+    /// logs outside.
+    #[test]
+    fn the_rechecks_tools_ask() {
+        let p = territory();
+        for (tool, class) in [
+            (
+                "mcp__claude_ai_Vercel__replace_domain_dns_records",
+                "deploy",
+            ),
+            ("mcp__claude_ai_Vercel__update_record", "deploy"),
+            ("mcp__claude_ai_Vercel__add_project_domain", "deploy"),
+            ("mcp__claude_ai_Vercel__pause_project", "deploy"),
+            ("mcp__claude_ai_Supabase__pause_project", "deploy"),
+            ("mcp__claude_ai_Vercel__put_firewall_config", "deploy"),
+            ("mcp__claude_ai_Vercel__create_drain", "send"),
+            ("mcp__claude_ai_Supabase__reset_branch", "destroy"),
+        ] {
+            let v = p.decide(Action::Tool(tool));
+            assert_eq!(v.decision, Decision::Ask, "{tool}");
+            assert_eq!(v.class.as_deref(), Some(class), "{tool}");
+        }
+        for tool in [
+            "mcp__claude_ai_Vercel__get_records",
+            "mcp__claude_ai_Vercel__get_firewall_config",
+            "mcp__claude_ai_Vercel__list_drains",
+            "mcp__claude_ai_Supabase__list_branches",
+        ] {
+            assert_eq!(
+                p.decide(Action::Tool(tool)).decision,
+                Decision::Allow,
+                "{tool}"
+            );
+        }
+    }
+
+    /// The re-check's 1.4: a push to a remote that is not his, or that cannot be known, a
+    /// copy to a host, and the two `gh api` forms that write without a method flag.
+    #[test]
+    fn sends_to_other_places_ask() {
+        all(
+            OWN,
+            Decision::Ask,
+            &[
+                "git push up main",
+                "git push up feature",
+                "git remote add fork https://github.com/someone/else.git && git push fork feature",
+                "git remote add fork https://github.com/someone/else.git; git push fork feature",
+                "git push https://github.com/someone/else.git feature",
+                "git push nosuchremote feature",
+                "rsync -a . user@host:/tmp/",
+                "rsync -a C:\\Users\\phili\\Desktop\\Projects\\ergon\\ user@host:/tmp/",
+                "gh api gists -f description=x -F public=true",
+                "gh api graphql -f query='mutation { addStar(input:{starrableId:\"x\"}) { clientMutationId } }'",
+            ],
+        );
+        all(
+            OWN,
+            Decision::Allow,
+            &[
+                "git push origin feature",
+                "git push -u origin feature",
+                "git remote add mine https://github.com/Philipjj609/organon.git && git push mine feature",
+                "git push https://github.com/Philipjj609/ergon.git feature",
+                "rsync -a src/ dist/",
+                "gh api graphql -f query='query { viewer { login } }'",
+                "gh api gists",
+            ],
         );
     }
 

@@ -1152,3 +1152,68 @@ fn the_refusal_log_writes_no_value_and_a_grep_glob_is_seen() {
     }
     assert!(text.contains("curl …"), "{text}");
 }
+
+/// The re-check's section 5 and 1.7: a deploy is logged by its programs only, a password in a
+/// URL, a one-time code and a token after a short flag are cut in any class, and each name
+/// of a brace list in a `Grep` glob is tried.
+#[test]
+fn the_refusal_log_cuts_deploys_urls_codes_and_tokens_and_a_brace_glob_is_seen() {
+    let e = env("territory-log-3");
+    fs::create_dir_all(&e.home).unwrap();
+    let root = e.home.parent().unwrap().to_owned();
+    let own = root.join("own");
+    fs::create_dir_all(own.join(".git")).unwrap();
+    fs::write(own.join(".git").join("HEAD"), "ref: refs/heads/feature\n").unwrap();
+    let log = root.join("refusals.jsonl");
+    let slash = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    fs::write(
+        e.home.join("policy.json"),
+        serde_json::json!({
+            "efforts": {}, "routes": {},
+            "rules": [
+                {"read": "*/.env|*/.env.*", "decision": "ask", "class": "secrets", "reason": "secret"},
+                {"command": "supabase db push", "decision": "ask", "class": "deploy", "reason": "deploy"},
+                {"command": "vercel --prod", "decision": "ask", "class": "deploy", "reason": "deploy"},
+                {"command": "npm publish", "decision": "ask", "class": "deploy", "reason": "deploy"},
+                {"command": "wipe", "decision": "ask", "class": "destroy", "reason": "destroy"},
+            ],
+            "territory": [slash(&own)],
+            "lines": ["deploy", "destroy", "secrets", "paid", "policy", "send"],
+            "refusal_log": slash(&log),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let run = |tool: &str, input: &str| {
+        e.hook_raw(&event("s1", &e.transcript, &slash(&own), tool, input), &[])
+    };
+    for cmd in [
+        "supabase db push --db-url postgres://postgres:LEAK1pw@db.example.co:5432/postgres",
+        "vercel --prod -t vcp_9f8e7dLEAK2",
+        "npm publish --otp 314159",
+        "wipe postgres://postgres:LEAK4pw@db.example.co:5432/postgres",
+        "wipe -t vcp_9f8e7dLEAK5",
+        "wipe --otp 271828",
+    ] {
+        assert!(is_ask(&run("Bash", &command(cmd))), "{cmd}");
+    }
+    // A command that carries no value is still written whole.
+    assert!(is_ask(&run("Bash", &command("wipe C:/elsewhere/plain"))));
+    assert!(is_ask(&run(
+        "Grep",
+        r#"{"pattern":"API_KEY","glob":"{.env,.env.local}"}"#
+    )));
+    assert!(is_ask(&run(
+        "Grep",
+        r#"{"pattern":"API_KEY","glob":"**/{README.md,.env.local}"}"#
+    )));
+    assert_eq!(
+        run("Grep", r#"{"pattern":"TODO","glob":"*.{rs,toml}"}"#),
+        ""
+    );
+    let text = fs::read_to_string(&log).unwrap();
+    for leak in ["LEAK1", "LEAK2", "314159", "LEAK4", "LEAK5", "271828"] {
+        assert!(!text.contains(leak), "{leak}: {text}");
+    }
+    assert!(text.contains("wipe C:/elsewhere/plain"), "{text}");
+}
