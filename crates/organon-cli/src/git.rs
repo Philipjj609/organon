@@ -28,6 +28,17 @@ pub fn repo_root(dir: &Path) -> Option<String> {
         .map(|a| plain_path(&a.to_string_lossy()))
 }
 
+/// The repository root of `dir` as [`repo_root`] finds it, or else the physical folder itself:
+/// a folder that is not in a repository (such as `~/.ergon`) can still be in a territory.
+pub fn root_or_folder(dir: &Path) -> Option<String> {
+    repo_root(dir).or_else(|| {
+        fs::canonicalize(dir)
+            .ok()
+            .filter(|d| d.is_dir())
+            .map(|d| plain_path(&d.to_string_lossy()))
+    })
+}
+
 /// The URL git itself gives the `origin` remote of the repository (or worktree) whose root
 /// folder is `root` (`git remote get-url origin`: includes and `insteadOf` rewrites applied,
 /// which no reading of the config file by hand gets right). `None` when there is no `origin`,

@@ -1023,3 +1023,82 @@ fn parallel_sessions_keep_separate_records_and_spend() {
     let task = fs::read_to_string(e.home.join("tasks").join("named").join("task.json")).unwrap();
     assert!(task.contains("sid-b.jsonl"), "{task}");
 }
+
+// ------------------------------------------------------------ territory and refusal log
+
+#[test]
+fn a_territory_lifts_all_but_its_lines_and_logs_every_refusal() {
+    let e = env("territory");
+    fs::create_dir_all(&e.home).unwrap();
+    let root = e.home.parent().unwrap().to_owned();
+    let own = root.join("own");
+    let scratch = root.join("scratch");
+    fs::create_dir_all(own.join(".git")).unwrap();
+    fs::write(own.join(".git").join("HEAD"), "ref: refs/heads/feature\n").unwrap();
+    fs::create_dir_all(&scratch).unwrap();
+    let client = root.join("client");
+    fs::create_dir_all(client.join(".git")).unwrap();
+    fs::write(
+        client.join(".git").join("HEAD"),
+        "ref: refs/heads/feature\n",
+    )
+    .unwrap();
+    let log = root.join("refusals.jsonl");
+    let slash = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    fs::write(
+        e.home.join("policy.json"),
+        serde_json::json!({
+            "efforts": {}, "routes": {},
+            "rules": [{"read": "*/.env", "decision": "ask", "class": "secrets", "reason": "secret"}],
+            "territory": [slash(&own), slash(&scratch)],
+            "lines": ["deploy", "destroy", "secrets", "paid", "policy", "send"],
+            "refusal_log": slash(&log),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let run = |cwd: &Path, tool: &str, input: &str| {
+        e.hook_raw(&event("s1", &e.transcript, &slash(cwd), tool, input), &[])
+    };
+    // Inside: the common work passes. (A folder outside any repository is judged as itself:
+    // not testable here, cargo's scratch folder is inside this repository.)
+    for cmd in [
+        "git push origin main",
+        "gh pr merge 7 --squash",
+        "rm -rf build",
+    ] {
+        assert_eq!(run(&own, "Bash", &command(cmd)), "", "{cmd}");
+    }
+    // The lines still ask, inside too, and the Read tool is seen.
+    assert!(is_ask(&run(&own, "Bash", &command("vercel --prod"))));
+    assert!(is_ask(&run(
+        &own,
+        "Bash",
+        &command("gh secret set T --body sekrit")
+    )));
+    let read = format!(
+        r#"{{"file_path":{}}}"#,
+        serde_json::to_string(&slash(&own.join(".env"))).unwrap()
+    );
+    assert!(is_ask(&run(&own, "Read", &read)));
+    // Outside: as before.
+    assert!(is_ask(&run(
+        &client,
+        "Bash",
+        &command("git push origin main")
+    )));
+    // Every ask is one line of the log, with what decided it; a secret is not written down.
+    let text = fs::read_to_string(&log).unwrap();
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 4, "{text}");
+    assert_eq!(lines[0]["class"], "deploy");
+    assert_eq!(lines[0]["decision"], "ask");
+    assert_eq!(lines[0]["session"], "s1");
+    assert_eq!(lines[1]["class"], "secrets");
+    assert!(!text.contains("sekrit"), "{text}");
+    assert_eq!(lines[2]["tool"], "Read");
+    assert_eq!(lines[3]["class"], "push-main");
+}

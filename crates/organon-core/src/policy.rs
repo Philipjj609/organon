@@ -16,6 +16,10 @@ use crate::route::Route;
 /// The policy shipped with organon.
 pub const DEFAULT: &str = include_str!("../../../policy/default.json");
 
+/// The territory policy: inside a person's own folders only their lines ask (see
+/// [`Policy::territory`]). Written by `organon init --territory`; never the default.
+pub const TERRITORY: &str = include_str!("../../../policy/territory.json");
+
 /// The kinds of action a person approves before an agent may take them. A rule tagged with
 /// one of these is part of the policy's floor: see [`Policy::with_floor`] and
 /// [`Policy::approval_class`].
@@ -47,6 +51,14 @@ pub struct Rule {
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
+    /// Matches files a tool would read (`Read`, `Grep`), as `path` does for writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<String>,
+    /// With `command`: the rule matches only a `git push` that rewrites or deletes one of
+    /// these branches (a force flag, a `+` or empty source, `--delete`, `--mirror`,
+    /// `--prune`). See [`rewrites_branch`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rewrites: Vec<String>,
     pub decision: Decision,
     pub reason: String,
     /// The approval class this rule guards (one of [`APPROVAL_CLASSES`]), if any.
@@ -71,6 +83,23 @@ pub struct Policy {
     /// lines and comments never do. Checked when the policy is read: see [`env_name_allowed`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merge_env_names: Vec<String>,
+    /// A person's own folders ([`glob`]s, forward slashes, ignoring case; a folder inside one
+    /// counts too). There an `ask` rule is lifted unless its class is one of [`Policy::lines`],
+    /// with the same certainty an [`Exception`] needs. Elsewhere nothing changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub territory: Vec<String>,
+    /// The approval classes that keep asking everywhere, territory included. No exception
+    /// lifts them either: turning one off means removing it from this list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<String>,
+    /// Exceptions to a line that the person agreed one at a time (a channel or a target):
+    /// an `ask` rule of that class does not count for a part of a command, or a tool, that the
+    /// entry matches. Adding one is a change to the lines, so it is theirs to make.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agreed: Vec<Agreed>,
+    /// A file every ask and deny is appended to as one JSON line (`~/` is the user's home).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_log: Option<String>,
 }
 
 /// Name prefixes (lower case) of variables a shell env file may never set to lift a `merge`:
@@ -201,11 +230,27 @@ pub struct Exception {
     pub reason: String,
 }
 
+/// One exception to a line, agreed by the person: `command` is a command pattern as in
+/// [`Rule`], `tool` a tool name [`glob`]. Keep it narrow: it matches like a rule does.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Agreed {
+    pub class: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    pub reason: String,
+}
+
 /// What an agent is about to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action<'a> {
     Command(&'a str),
     Write {
+        path: &'a str,
+    },
+    /// A tool that reads a file into the agent's context (`Read`, `Grep`).
+    Read {
         path: &'a str,
     },
     /// Any other tool, by name.
@@ -216,6 +261,8 @@ pub enum Action<'a> {
 pub struct Verdict {
     pub decision: Decision,
     pub reason: Option<String>,
+    /// The approval class of the rule that decided, if it has one.
+    pub class: Option<String>,
 }
 
 /// Finds the branch checked out in a folder: `None` for the folder the agent runs in, or the
@@ -320,6 +367,65 @@ struct Lone<'a> {
 /// The class of the rule that guards `gh pr merge`. An exception for it lifts a command only
 /// when the whole command is one of two fixed forms: see [`lone_merge`].
 const MERGE_CLASS: &str = "merge";
+
+/// The class of the rules that guard deletes. Where it is lifted, what is deleted must stay
+/// inside the person's own folders: see [`Policy::deletes_inside`].
+const DELETE_CLASS: &str = "delete";
+
+/// `gh pr merge ...` naming no other repository and no `--admin`: the merge a territory lifts
+/// even inside a longer command whose folders are certain.
+fn plain_merge(seg: &[String]) -> bool {
+    seg.len() >= 3
+        && seg[..3] == ["gh", "pr", "merge"]
+        && !seg[3..].iter().any(|w| {
+            w.starts_with("--repo")
+                || w.starts_with("-R")
+                || w.starts_with("--admin")
+                || w.contains("://")
+                || w.to_lowercase().contains("github.com")
+        })
+}
+
+/// Whether a `git push` part rewrites or deletes one of `branches` on the remote: a force
+/// flag (`-f`, `--force*`, a short-flag group with `f`) or a `+refspec` pushing to it, a
+/// delete (`--delete`, `-d`, a group with `d`, an empty source `:main`) of it, or `--mirror`
+/// or `--prune`, which can rewrite or delete any branch. A bare push is read after
+/// [`resolve_pushes`] added the current branch.
+#[must_use]
+pub fn rewrites_branch(seg: &[String], branches: &[String]) -> bool {
+    let Some(at) = seg.iter().position(|w| w == "push") else {
+        return false;
+    };
+    let words = &seg[at + 1..];
+    let args = push_arguments(words);
+    let group = |f: &str, c: char| {
+        f.len() > 1
+            && !f.starts_with("--")
+            && f[1..].chars().all(|x| x.is_ascii_alphanumeric())
+            && f[1..].contains(c)
+    };
+    let any_flag = |test: &dyn Fn(&str) -> bool| args.flags.iter().any(|f| test(f));
+    if any_flag(&|f| f == "--mirror" || f == "--prune") {
+        return true;
+    }
+    let force = any_flag(&|f| f.starts_with("--force") || group(f, 'f'));
+    let delete = any_flag(&|f| f == "--delete" || group(f, 'd'));
+    if force && any_flag(&|f| f == "--all" || f == "--branches") {
+        return true;
+    }
+    args.positional.iter().any(|&k| {
+        let w = words[k].as_str();
+        let plus = w.starts_with('+');
+        let w = w.trim_start_matches('+');
+        let (src, dst) = match w.split_once(':') {
+            Some((s, d)) => (Some(s), d),
+            None => (None, w),
+        };
+        let dst = dst.strip_prefix("refs/heads/").unwrap_or(dst);
+        branches.iter().any(|b| b == dst)
+            && (force || plus || delete || src.is_some_and(str::is_empty))
+    })
+}
 
 /// Why `--admin` on a merge is denied where a `merge` exception applies.
 const MERGE_ADMIN_DENIED: &str =
@@ -493,6 +599,11 @@ impl Policy {
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
         use serde::de::Error;
         let p: Self = serde_json::from_str(s)?;
+        if !p.territory.is_empty() && p.lines.is_empty() {
+            return Err(serde_json::Error::custom(
+                "territory: a territory needs its lines (the classes that still ask there)",
+            ));
+        }
         for n in &p.merge_env_names {
             if let Some(why) = bad_env_pattern(n) {
                 return Err(serde_json::Error::custom(format!(
@@ -595,11 +706,13 @@ impl Policy {
             Verdict {
                 decision: Decision::Ask,
                 reason: Some("The command is too long for organon to check fully.".into()),
+                class: None,
             }
         } else {
             Verdict {
                 decision: Decision::Allow,
                 reason: None,
+                class: None,
             }
         };
         if let Action::Command(cmd) = action {
@@ -607,6 +720,7 @@ impl Policy {
                 best = Verdict {
                     decision: Decision::Deny,
                     reason: Some(reason.into()),
+                    class: Some(MERGE_CLASS.into()),
                 };
             }
         }
@@ -622,6 +736,7 @@ impl Policy {
                 best = Verdict {
                     decision,
                     reason: Some(r.reason.clone()),
+                    class: r.class.clone(),
                 };
             }
         }
@@ -678,7 +793,7 @@ impl Policy {
                 // or `GH_HOST` set in the environment or named anywhere in the command, and
                 // the one form of command a `merge` exception may lift. Over the cap neither
                 // exists: nothing is lifted there.
-                let exceptions = !self.exceptions.is_empty() && !oversize;
+                let exceptions = self.lifts_any() && !oversize;
                 let gh_target = env.gh_target || (exceptions && names_a_gh_target(cmd, &raw));
                 let lone = if exceptions { lone_merge(cmd) } else { None };
                 let reads: Vec<Reading> = parsed
@@ -703,14 +818,17 @@ impl Policy {
                         // Some(None): looked up, no repository; looked up at most once per part.
                         let mut repo: Option<Option<String>> = None;
                         for r in &self.rules {
-                            if !r.command.as_deref().is_some_and(|p| matches(p, seg)) {
+                            if !r.command.as_deref().is_some_and(|p| matches(p, seg))
+                                || !(r.rewrites.is_empty() || rewrites_branch(seg, &r.rewrites))
+                                || self.agreed_command(r, seg)
+                            {
                                 continue;
                             }
                             if let Some(seen) = out.iter_mut().find(|(o, _)| *o == r) {
                                 seen.1 |= read.bash;
                                 continue;
                             }
-                            if agree && r.decision == Decision::Ask && !self.exceptions.is_empty() {
+                            if agree && r.decision == Decision::Ask && self.lifts_any() {
                                 if let Some(mut class) = r.class.as_deref() {
                                     // A rule that asks because the merge names its repository
                                     // by flag is lifted like the merge rule, when the flag names
@@ -727,7 +845,18 @@ impl Policy {
                                     // apply: a merge only as `lone_merge` reads it and with a
                                     // clean environment, any other class where the part runs
                                     // unless `GH_REPO` or `GH_HOST` steers a `gh` command.
-                                    let hint: Option<Option<&str>> = if class == MERGE_CLASS {
+                                    // In a territory a merge may also be part of a longer
+                                    // certain chain, if it names no other repository and
+                                    // nothing steers `gh` (lifted by the territory only).
+                                    let chained = class == MERGE_CLASS
+                                        && lone.is_none()
+                                        && !self.territory.is_empty()
+                                        && !gh_target
+                                        && !env.init_unsafe
+                                        && plain_merge(seg);
+                                    let hint: Option<Option<&str>> = if chained {
+                                        Some(dir.as_deref())
+                                    } else if class == MERGE_CLASS {
                                         lone.filter(|_| !env.gh_target && !env.init_unsafe)
                                             .map(|l| l.dir)
                                     } else if !(gh_target && runs_gh(seg)) {
@@ -750,8 +879,17 @@ impl Policy {
                                             .and_then(|u| github_slug(&u))
                                             .is_some_and(|o| Some(o) == flag_slug(flag))
                                     };
-                                    if here.as_deref().is_some_and(|f| self.excepted(class, f))
-                                        && (class != MERGE_CLASS || named_ok())
+                                    let lifted = if chained {
+                                        here.as_deref().is_some_and(|f| self.owned(class, f))
+                                    } else {
+                                        here.as_deref().is_some_and(|f| self.excepted(class, f))
+                                            && (class != MERGE_CLASS || named_ok())
+                                    };
+                                    // A delete is lifted only while what it deletes stays
+                                    // inside the person's own folders.
+                                    if lifted
+                                        && (class != DELETE_CLASS
+                                            || self.deletes_inside(seg, here.as_deref()))
                                     {
                                         continue;
                                     }
@@ -771,10 +909,20 @@ impl Policy {
                         .map(|r| (r, true)),
                 );
             }
+            Action::Read { path } => {
+                let path = path.replace('\\', "/");
+                out.extend(
+                    self.rules
+                        .iter()
+                        .filter(|r| r.read.as_deref().is_some_and(|p| glob(p, &path)))
+                        .map(|r| (r, true)),
+                );
+            }
             Action::Tool(name) => out.extend(
                 self.rules
                     .iter()
                     .filter(|r| r.tool.as_deref().is_some_and(|p| glob(p, name)))
+                    .filter(|r| !self.agreed_tool(r, name))
                     .map(|r| (r, true)),
             ),
         }
@@ -793,11 +941,7 @@ impl Policy {
         origin_of: OriginOf<'_>,
         env: Inherited,
     ) -> Option<&'static str> {
-        if self.exceptions.is_empty()
-            || cmd.len() > MAX_COMMAND_BYTES
-            || env.gh_target
-            || env.init_unsafe
-        {
+        if !self.lifts_any() || cmd.len() > MAX_COMMAND_BYTES || env.gh_target || env.init_unsafe {
             return None;
         }
         let (dir, words) = merge_shape(cmd)?;
@@ -818,12 +962,99 @@ impl Policy {
         self.excepted(MERGE_CLASS, &folder).then_some(reason)
     }
 
-    /// Whether a person lifted `class` for the repository in `folder`.
+    /// Whether a person lifted `class` for the repository in `folder`: an exception for it,
+    /// or the folder is in the territory. Never for one of the [`Policy::lines`].
     fn excepted(&self, class: &str, folder: &str) -> bool {
-        let folder = folder.replace('\\', "/").to_lowercase();
-        self.exceptions
+        if self.lines.iter().any(|l| l == class) {
+            return false;
+        }
+        let lower = folder.replace('\\', "/").to_lowercase();
+        self.owned(class, folder)
+            || self.exceptions.iter().any(|e| {
+                e.class == class && glob(&e.repo.replace('\\', "/").to_lowercase(), &lower)
+            })
+    }
+
+    /// Whether an agreed exception lifts `r` (an `ask` with a class) for this part of a command.
+    fn agreed_command(&self, r: &Rule, seg: &[String]) -> bool {
+        r.decision == Decision::Ask
+            && self.agreed.iter().any(|a| {
+                r.class.as_deref() == Some(a.class.as_str())
+                    && a.command.as_deref().is_some_and(|p| matches(p, seg))
+            })
+    }
+
+    /// Whether an agreed exception lifts `r` (an `ask` with a class) for the tool `name`.
+    fn agreed_tool(&self, r: &Rule, name: &str) -> bool {
+        r.decision == Decision::Ask
+            && self.agreed.iter().any(|a| {
+                r.class.as_deref() == Some(a.class.as_str())
+                    && a.tool.as_deref().is_some_and(|p| glob(p, name))
+            })
+    }
+
+    /// Whether anything can lift an `ask` here: an exception or a territory.
+    fn lifts_any(&self) -> bool {
+        !self.exceptions.is_empty() || !self.territory.is_empty()
+    }
+
+    /// Whether `folder` is in the territory and `class` is not one of the lines.
+    fn owned(&self, class: &str, folder: &str) -> bool {
+        !self.lines.iter().any(|l| l == class) && self.in_territory(folder, false)
+    }
+
+    /// Whether `path` is one of the territory's folders or inside one; with `strictly`, only
+    /// inside one (the folder itself does not count).
+    #[must_use]
+    pub fn in_territory(&self, path: &str, strictly: bool) -> bool {
+        let path = path.replace('\\', "/").to_lowercase();
+        let path = path.trim_end_matches('/');
+        self.territory.iter().any(|t| {
+            let t = t.replace('\\', "/").to_lowercase();
+            let t = t.trim_end_matches('/');
+            (!strictly && glob(t, path)) || glob(&format!("{t}/*"), path)
+        })
+    }
+
+    /// Whether every file a delete command names stays inside the person's own folders: a
+    /// plain relative path (no `..`, variable, `~` or `.git`) inside the folder it runs in
+    /// (`here`, already known to be theirs), or an absolute path strictly inside the
+    /// territory. Other commands of the class (`git ...`) delete inside their repository.
+    fn deletes_inside(&self, seg: &[String], here: Option<&str>) -> bool {
+        let Some(prog) = seg.first() else {
+            return true;
+        };
+        let cmd_flags = matches!(prog.as_str(), "rmdir" | "rd" | "del" | "erase");
+        if !cmd_flags && !matches!(prog.as_str(), "rm" | "remove-item" | "ri") {
+            return true;
+        }
+        if here.is_none() {
+            return false;
+        }
+        seg[1..]
             .iter()
-            .any(|e| e.class == class && glob(&e.repo.replace('\\', "/").to_lowercase(), &folder))
+            .filter(|w| !w.starts_with('-') && !(cmd_flags && w.starts_with('/') && w.len() == 2))
+            .all(|t| {
+                let t = t.replace('\\', "/");
+                if t.contains(['$', '%', '~', '`'])
+                    || t.split('/')
+                        .any(|part| part == ".." || part.eq_ignore_ascii_case(".git"))
+                {
+                    return false;
+                }
+                let b = t.as_bytes();
+                if !(t.starts_with('/') || (b.len() >= 2 && b[1] == b':')) {
+                    return true;
+                }
+                // Git Bash's `/c/Users/x` is `C:/Users/x`.
+                let t = match b {
+                    [b'/', d, b'/', ..] if d.is_ascii_alphabetic() => {
+                        format!("{}:{}", *d as char, &t[2..])
+                    }
+                    _ => t,
+                };
+                self.in_territory(&t, true)
+            })
     }
 
     /// Whether every part of `cmd` is something allowed after the budget ran out. A wrap-up
@@ -4062,5 +4293,290 @@ mod tests {
         assert!(glob("--force*", "--force-with-lease"));
         assert!(glob("a*b*c", "aXXbYYc"));
         assert!(!glob("a*b*c", "aXXbYY"));
+    }
+}
+
+#[cfg(test)]
+mod territory_tests {
+    //! The territory policy (`policy/territory.json`): each line holds inside Philip's own
+    //! folders, the common work of the week of 17-23 Nov passes there, and nothing changes
+    //! elsewhere.
+    use super::*;
+
+    const OWN: &str = "C:/Users/phili/Desktop/Projects/ergon";
+    const CLIENT: &str = "C:/Users/phili/Desktop/Projects/Kalyth";
+
+    fn territory() -> Policy {
+        Policy::from_json(TERRITORY)
+            .expect("the territory policy parses")
+            .with_floor(&Policy::builtin())
+    }
+
+    /// Decide `cmd` as run from `cwd`, on branch `branch`; a `cd` or `git -C` folder counts as
+    /// its own repository.
+    fn decide_in(p: &Policy, cwd: &str, branch: &str, cmd: &str) -> Verdict {
+        let repo = |hint: Option<&str>| Some(hint.unwrap_or(cwd).to_owned());
+        let branch_of = |_: Option<&str>| Some(branch.to_owned());
+        p.decide_with_env(
+            Action::Command(cmd),
+            &branch_of,
+            &repo,
+            Inherited::default(),
+        )
+    }
+
+    fn at(cwd: &str, cmd: &str) -> Decision {
+        decide_in(&territory(), cwd, "feature", cmd).decision
+    }
+
+    #[test]
+    fn a_territory_without_lines_is_refused() {
+        let text = r#"{"efforts":{},"routes":{},"rules":[],"territory":["C:/x"]}"#;
+        assert!(Policy::from_json(text).is_err());
+    }
+
+    #[test]
+    fn every_line_still_asks_inside_the_territory() {
+        let p = territory();
+        for (cmd, class) in [
+            // (a) production deploys
+            ("vercel --prod", "deploy"),
+            ("vercel ./app", "deploy"),
+            ("wrangler deploy", "deploy"),
+            ("wrangler pages deploy dist --branch production", "deploy"),
+            ("git push origin production", "deploy"),
+            (
+                "gh pr create --base production --title x --body y",
+                "deploy",
+            ),
+            ("gh release create v1.0.0", "deploy"),
+            ("npm publish", "deploy"),
+            // (b) deletes that git or a trash folder cannot undo
+            ("git push --force origin main", "destroy"),
+            ("git push -f origin main", "destroy"),
+            ("git push origin main -f", "destroy"),
+            ("git push origin +main", "destroy"),
+            ("git push origin HEAD:main --force-with-lease", "destroy"),
+            ("git push origin --delete main", "destroy"),
+            ("git push origin :main", "destroy"),
+            ("git push --mirror", "destroy"),
+            ("git push --force origin production", "destroy"),
+            ("gh api -X DELETE repos/Philipjj609/x", "destroy"),
+            ("rm -rf C:/Users/phili/Documents/old", "delete"),
+            ("rm -rf C:/Users/phili/Desktop/Projects/organon", "delete"),
+            ("rm -rf .git", "delete"),
+            ("rm -rf ../elsewhere", "delete"),
+            ("rm -rf $HOME/x", "delete"),
+            // (c) secrets
+            ("cat .env", "secrets"),
+            ("Get-Content C:/Users/phili/.ssh/id_ed25519", "secrets"),
+            ("printenv", "secrets"),
+            ("gh auth token", "secrets"),
+            ("gh secret set TOKEN --body x", "secrets"),
+            // (d) payments and paid services
+            ("stripe payment_intents create --amount 500", "paid"),
+            ("vercel domains buy example.com", "paid"),
+            // (e) organon's policy, its hook, the lines
+            ("cp p.json C:/Users/phili/.organon/policy.json", "policy"),
+            ("cargo install --path crates/organon-cli", "policy"),
+            // (f) sending outside
+            ("curl -X POST https://example.com/api -d x=1", "send"),
+            ("echo hi | mail a@b.c", "send"),
+        ] {
+            let v = decide_in(&p, OWN, "feature", cmd);
+            assert_eq!(v.decision, Decision::Ask, "{cmd}");
+            let classes: Vec<String> = p
+                .matching(
+                    Action::Command(cmd),
+                    &|_| Some("feature".into()),
+                    &|h| Some(h.unwrap_or(OWN).to_owned()),
+                    &no_origin,
+                    Inherited::default(),
+                )
+                .into_iter()
+                .filter_map(|(r, _)| r.class.clone())
+                .collect();
+            assert!(classes.iter().any(|c| c == class), "{cmd}: {classes:?}");
+        }
+        // A bare force push while on main is a rewrite of main.
+        assert_eq!(
+            decide_in(&p, OWN, "main", "git push -f").decision,
+            Decision::Ask
+        );
+        // Deleting a repository stays denied.
+        assert_eq!(
+            at(OWN, "gh repo delete Philipjj609/x --yes"),
+            Decision::Deny
+        );
+    }
+
+    #[test]
+    fn secrets_and_the_policy_are_guarded_for_tools_too() {
+        let p = territory();
+        for path in [
+            "C:/Users/phili/Desktop/Projects/ergon/.env",
+            "C:\\Users\\phili\\.ssh\\id_ed25519",
+        ] {
+            assert_eq!(
+                p.decide(Action::Read { path }).decision,
+                Decision::Ask,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            p.decide(Action::Read {
+                path: "C:/x/README.md"
+            })
+            .decision,
+            Decision::Allow
+        );
+        for path in [
+            "C:/Users/phili/.organon/policy.json",
+            "C:/Users/phili/.claude/settings.json",
+            "C:/Users/phili/.ergon/bin/organon-bg.mjs",
+            "C:/x/.env",
+        ] {
+            assert_eq!(
+                p.decide(Action::Write { path }).decision,
+                Decision::Ask,
+                "{path}"
+            );
+        }
+        for tool in [
+            "mcp__claude_ai_Gmail__send_message",
+            "mcp__claude_ai_Supabase__apply_migration",
+            "mcp__claude_ai_Vercel__buy_domain",
+        ] {
+            assert_eq!(
+                p.decide(Action::Tool(tool)).decision,
+                Decision::Ask,
+                "{tool}"
+            );
+        }
+    }
+
+    /// Real commands from the friction ledger (`jobs/J32/notes/06-friction-ledger.md`, rows
+    /// 2, 4, 7, 8, 10, 11 and 25) and the daily flow of the main agent and its workers.
+    #[test]
+    fn the_common_work_of_the_week_passes_inside_the_territory() {
+        for cmd in [
+            "gh pr merge 47 --squash --delete-branch",
+            "cd C:/Users/phili/Desktop/Projects/ergon && gh pr merge 47 --squash --match-head-commit 1a2b3c",
+            "cd C:/Users/phili/Desktop/Projects/organon && git fetch origin && git reset --hard origin/main",
+            "git push origin main",
+            "git push -u origin jobs/j32-territory",
+            "git push --force-with-lease origin jobs/j32-territory",
+            "git push origin --delete jobs/old",
+            "git branch -D jobs/old",
+            "git merge --ff-only origin/main",
+            "rm -f shots/*",
+            "rm -rf target",
+            "rm -rf C:/Users/phili/.ergon/scratch/j32",
+            "rm -rf C:/Users/phili/Desktop/Projects/ergon-wt/j20-design/node_modules",
+            "Remove-Item -Recurse -Force C:/Users/phili/Desktop/Projects/ergon/tmp-shots",
+            "git worktree remove --force C:/Users/phili/Desktop/Projects/ergon-wt/j20-design",
+            "git clean -fdx",
+            "claude --bg -p brief --permission-mode bypassPermissions",
+            "gh pr create --draft --title x --body y",
+            "cargo test",
+        ] {
+            assert_eq!(at(OWN, cmd), Decision::Allow, "{cmd}");
+        }
+        assert_eq!(
+            at("C:/Users/phili/.ergon/scratch/x", "rm -rf build"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn outside_the_territory_nothing_changes() {
+        let def = Policy::builtin();
+        for cmd in [
+            "git push origin main",
+            "gh pr merge 5 --squash",
+            "rm -rf build",
+            "git reset --hard origin/main",
+            "git push --force origin feature",
+        ] {
+            assert_eq!(at(CLIENT, cmd), Decision::Ask, "{cmd}");
+            assert_eq!(
+                decide_in(&def, CLIENT, "feature", cmd).decision,
+                Decision::Ask,
+                "{cmd}"
+            );
+        }
+        // A merge in the territory that names another repository, or uses --admin, is not
+        // lifted.
+        assert_ne!(
+            at(OWN, "gh pr merge 5 --repo someone/client"),
+            Decision::Allow
+        );
+        assert_ne!(
+            at(
+                OWN,
+                "cd C:/Users/phili/Desktop/Projects/ergon && git status && gh pr merge 5 --admin"
+            ),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn an_agreed_exception_lifts_only_its_own_target() {
+        let mut p = territory();
+        p.agreed.push(Agreed {
+            class: "send".into(),
+            command: Some("curl -X POST http://localhost:*".into()),
+            tool: None,
+            reason: "test".into(),
+        });
+        let d = |cmd: &str| decide_in(&p, OWN, "feature", cmd).decision;
+        assert_eq!(d("curl -X POST http://localhost:4347/api"), Decision::Allow);
+        assert_eq!(d("curl -X POST https://example.com/api"), Decision::Ask);
+        // An exception to one line never lifts another.
+        assert_eq!(
+            d("curl -X POST http://localhost:4347 && vercel --prod"),
+            Decision::Ask
+        );
+    }
+
+    #[test]
+    fn a_line_is_not_lifted_by_an_exception_either() {
+        let mut p = territory();
+        p.exceptions.push(Exception {
+            class: "deploy".into(),
+            repo: OWN.into(),
+            reason: "test".into(),
+        });
+        assert_eq!(
+            decide_in(&p, OWN, "feature", "vercel deploy").decision,
+            Decision::Ask
+        );
+    }
+
+    #[test]
+    fn rewrites_branch_reads_force_delete_and_refspecs() {
+        let w = |s: &str| s.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        let b = vec!["main".to_owned()];
+        for yes in [
+            "git push -f origin main",
+            "git push -uf origin main",
+            "git push origin +main",
+            "git push origin +HEAD:refs/heads/main",
+            "git push origin :main",
+            "git push -d origin main",
+            "git push --all --force origin",
+            "git push --prune origin",
+        ] {
+            assert!(rewrites_branch(&w(yes), &b), "{yes}");
+        }
+        for no in [
+            "git push origin main",
+            "git push -f origin feature",
+            "git push origin +feature",
+            "git push --follow-tags origin main",
+            "git push -u origin main",
+        ] {
+            assert!(!rewrites_branch(&w(no), &b), "{no}");
+        }
     }
 }

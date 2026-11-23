@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use organon_core::audit::audit;
 use organon_core::budget::{standing, Budget, Effort, Level, Minutes, Standing, Usd};
 use organon_core::meter::SessionSpend;
-use organon_core::policy::{segments, Action, Decision};
+use organon_core::policy::{segments, Action, Decision, Verdict};
 use organon_core::route::Tier;
 use organon_core::task::{Event, Task};
 use organon_core::time::rfc3339;
@@ -96,6 +96,10 @@ enum Cmd {
         /// The memory folder (e.g. a mneme memory).
         #[arg(long)]
         memory: Option<PathBuf>,
+        /// Write the territory policy instead of the default: in the person's own folders only
+        /// their lines ask (see policy/territory.json).
+        #[arg(long)]
+        territory: bool,
     },
 }
 
@@ -175,7 +179,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Check { write, command } => check(&home, write.as_deref(), &command.join(" ")),
         Cmd::Hook => unreachable!("handled above"),
         Cmd::Audit { proposal, messages } => audit_cmd(&home, proposal.as_deref(), &messages),
-        Cmd::Init { memory } => init(&home, memory.as_deref()),
+        Cmd::Init { memory, territory } => init(&home, memory.as_deref(), territory),
     }
 }
 
@@ -581,7 +585,7 @@ fn check(home: &Home, write: Option<&str>, command: &str) -> Result<ExitCode> {
         None => bail!("give a command after -- or --write <path>"),
     };
     let branch_of = |hint: Option<&str>| git::branch_in(&git::folder("", hint));
-    let repo_of = |hint: Option<&str>| git::repo_root(&git::folder("", hint));
+    let repo_of = |hint: Option<&str>| git::root_or_folder(&git::folder("", hint));
     let origin_of = |root: &str| git::origin_url(root);
     let v = policy.decide_with_origin(
         action,
@@ -602,7 +606,7 @@ fn check(home: &Home, write: Option<&str>, command: &str) -> Result<ExitCode> {
     }))
 }
 
-fn init(home: &Home, memory: Option<&Path>) -> Result<ExitCode> {
+fn init(home: &Home, memory: Option<&Path>, territory: bool) -> Result<ExitCode> {
     if let Some(m) = memory {
         if !m.is_dir() {
             bail!("no folder {}", m.display());
@@ -618,7 +622,12 @@ fn init(home: &Home, memory: Option<&Path>) -> Result<ExitCode> {
         println!("policy exists: {}", path.display());
     } else {
         fs::create_dir_all(&home.root)?;
-        fs::write(&path, organon_core::policy::DEFAULT)?;
+        let text = if territory {
+            organon_core::policy::TERRITORY
+        } else {
+            organon_core::policy::DEFAULT
+        };
+        fs::write(&path, text)?;
         println!("wrote {}", path.display());
     }
     println!(
@@ -647,6 +656,8 @@ struct HookEvent {
     tool: String,
     command: Option<String>,
     path: Option<String>,
+    /// A file a tool reads into the context (`Read`, `Grep`).
+    read: Option<String>,
     transcript: String,
     session_id: String,
     cwd: String,
@@ -654,10 +665,11 @@ struct HookEvent {
 
 impl HookEvent {
     fn action(&self) -> Action<'_> {
-        match (&self.command, &self.path) {
-            (Some(c), _) => Action::Command(c),
-            (None, Some(p)) => Action::Write { path: p },
-            (None, None) => Action::Tool(&self.tool),
+        match (&self.command, &self.path, &self.read) {
+            (Some(c), _, _) => Action::Command(c),
+            (None, Some(p), _) => Action::Write { path: p },
+            (None, None, Some(p)) => Action::Read { path: p },
+            (None, None, None) => Action::Tool(&self.tool),
         }
     }
 
@@ -683,11 +695,17 @@ impl HookEvent {
             "NotebookEdit" => (None, Some(field("notebook_path"))),
             _ => (None, None),
         };
+        let read = match tool.as_str() {
+            "Read" => Some(field("file_path")),
+            "Grep" => Some(field("path")).filter(|p| !p.is_empty()),
+            _ => None,
+        };
         Self {
             name: s("hook_event_name"),
             tool,
             command,
             path,
+            read,
             transcript: s("transcript_path"),
             session_id: s("session_id"),
             cwd: s("cwd"),
@@ -700,10 +718,16 @@ impl HookEvent {
         let tool = string_field(raw, "tool_name").unwrap_or_default();
         let command = string_field(raw, "command");
         let path = string_field(raw, "file_path").or_else(|| string_field(raw, "notebook_path"));
+        let (path, read) = if tool == "Read" {
+            (None, path)
+        } else {
+            (path, None)
+        };
         Self {
             name: string_field(raw, "hook_event_name").unwrap_or_default(),
             command: command.filter(|_| matches!(tool.as_str(), "Bash" | "PowerShell" | "")),
             path,
+            read,
             tool,
             transcript: String::new(),
             session_id: String::new(),
@@ -846,6 +870,16 @@ fn fail_safe(home: &Home, ev: &HookEvent, err: &anyhow::Error) -> Option<Value> 
     if why.is_empty() {
         why = "unknown error".into();
     }
+    log_refusal(
+        home,
+        &policy,
+        ev,
+        &Verdict {
+            decision: Decision::Deny,
+            reason: Some(format!("organon could not check this action ({why})")),
+            class: rule.class.clone(),
+        },
+    );
     Some(json!({ "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
@@ -856,6 +890,55 @@ fn fail_safe(home: &Home, ev: &HookEvent, err: &anyhow::Error) -> Option<Value> 
             home.root.join("hook-errors.log").display()
         ),
     }}))
+}
+
+/// Append an ask or deny to the policy's refusal log, so friction becomes data. A failure is
+/// logged to `hook-errors.log` and never changes the answer. A command in the `secrets` class
+/// is logged by its first two words only: what it names may be a secret.
+fn log_refusal(home: &Home, policy: &organon_core::policy::Policy, ev: &HookEvent, v: &Verdict) {
+    let Some(log) = policy.refusal_log.as_deref() else {
+        return;
+    };
+    let path = match log.strip_prefix("~/") {
+        Some(rest) => match home::user_home() {
+            Some(h) => h.join(rest),
+            None => return,
+        },
+        None => PathBuf::from(log),
+    };
+    let secret = v.class.as_deref() == Some("secrets");
+    let action = match ev.action() {
+        Action::Command(c) if secret => {
+            let mut w: Vec<&str> = c.split_whitespace().take(2).collect();
+            w.push("…");
+            w.join(" ")
+        }
+        Action::Command(c) => c.chars().take(300).collect(),
+        Action::Write { path } => format!("write {path}"),
+        Action::Read { path } => format!("read {path}"),
+        Action::Tool(t) => t.to_owned(),
+    };
+    let line = json!({
+        "time": rfc3339(now()),
+        "decision": v.decision,
+        "class": v.class,
+        "rule": v.reason,
+        "tool": ev.tool,
+        "action": action,
+        "cwd": ev.cwd,
+        "session": ev.session_id,
+    });
+    let written = path
+        .parent()
+        .map_or(Ok(()), fs::create_dir_all)
+        .map_err(anyhow::Error::from)
+        .and_then(|()| append_line(&path, &line.to_string()));
+    if let Err(e) = written {
+        let _ = append_line(
+            &home.root.join("hook-errors.log"),
+            &format!("{} refusal log {}: {e:#}", rfc3339(now()), path.display()),
+        );
+    }
 }
 
 /// The hook's normal path: the answer to print, if any.
@@ -876,7 +959,7 @@ fn hook(home: &Home, ev: &HookEvent) -> Result<Option<String>> {
     let action = ev.action();
     let (policy, _) = home.policy()?;
     let branch_of = |hint: Option<&str>| git::branch_in(&git::folder(&ev.cwd, hint));
-    let repo_of = |hint: Option<&str>| git::repo_root(&git::folder(&ev.cwd, hint));
+    let repo_of = |hint: Option<&str>| git::root_or_folder(&git::folder(&ev.cwd, hint));
     let origin_of = |root: &str| git::origin_url(root);
     let mut verdict = policy.decide_with_origin(
         action,
@@ -921,6 +1004,7 @@ fn hook(home: &Home, ev: &HookEvent) -> Result<Option<String>> {
                     action: match action {
                         Action::Command(c) => c.chars().take(200).collect(),
                         Action::Write { path } => format!("write {path}"),
+                        Action::Read { path } => format!("read {path}"),
                         Action::Tool(t) => t.to_owned(),
                     },
                 },
@@ -952,6 +1036,9 @@ fn hook(home: &Home, ev: &HookEvent) -> Result<Option<String>> {
         }
     }
 
+    if verdict.decision != Decision::Allow {
+        log_refusal(home, &policy, ev, &verdict);
+    }
     let out = match verdict.decision {
         Decision::Allow => context.map(|c| {
             json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "additionalContext": c } })
