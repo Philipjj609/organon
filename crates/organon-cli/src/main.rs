@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use organon_core::audit::audit;
 use organon_core::budget::{standing, Budget, Effort, Level, Minutes, Standing, Usd};
 use organon_core::meter::SessionSpend;
-use organon_core::policy::{segments, Action, Decision, Verdict};
+use organon_core::policy::{glob, segments, Action, Decision, Verdict};
 use organon_core::route::Tier;
 use organon_core::task::{Event, Task};
 use organon_core::time::rfc3339;
@@ -658,6 +658,8 @@ struct HookEvent {
     path: Option<String>,
     /// A file a tool reads into the context (`Read`, `Grep`).
     read: Option<String>,
+    /// The files a `Grep` searches by name (its `glob`), in `read` or the agent's folder.
+    read_glob: Option<String>,
     transcript: String,
     session_id: String,
     cwd: String,
@@ -700,12 +702,14 @@ impl HookEvent {
             "Grep" => Some(field("path")).filter(|p| !p.is_empty()),
             _ => None,
         };
+        let read_glob = Some(field("glob")).filter(|g| tool == "Grep" && !g.is_empty());
         Self {
             name: s("hook_event_name"),
             tool,
             command,
             path,
             read,
+            read_glob,
             transcript: s("transcript_path"),
             session_id: s("session_id"),
             cwd: s("cwd"),
@@ -728,6 +732,7 @@ impl HookEvent {
             command: command.filter(|_| matches!(tool.as_str(), "Bash" | "PowerShell" | "")),
             path,
             read,
+            read_glob: None,
             tool,
             transcript: String::new(),
             session_id: String::new(),
@@ -892,9 +897,94 @@ fn fail_safe(home: &Home, ev: &HookEvent, err: &anyhow::Error) -> Option<Value> 
     }}))
 }
 
+/// Names of files that hold secrets, which a `Grep` glob is tried on.
+const SECRET_NAMES: &[&str] = &[
+    ".env",
+    ".env.local",
+    ".env.development",
+    ".env.production",
+    ".env.staging",
+    ".env.test",
+    ".envrc",
+    ".dev.vars",
+    ".git-credentials",
+    ".npmrc",
+    ".netrc",
+    "credentials",
+    "hosts.yml",
+    "id_rsa",
+    "id_ed25519",
+    ".credentials.json",
+];
+
+/// The size at which the refusal log is moved to `<name>.1` (replacing an older one) and
+/// started again.
+const REFUSAL_LOG_CAP: u64 = 1024 * 1024;
+
+/// Whether a command may carry a value that must not be written down: a pipe or a here-string
+/// (`echo <value> | vercel env add`), an assignment (`TOKEN=<value> gh ...`), or a word that
+/// names a token, key, secret or password.
+fn carries_values(cmd: &str) -> bool {
+    let lower = cmd.to_lowercase();
+    cmd.contains('|')
+        || cmd.contains("<<")
+        || ["token", "key", "secret", "passw", "auth", "bearer"]
+            .iter()
+            .any(|w| lower.contains(w))
+        || cmd.split_whitespace().any(|w| {
+            let w = w.trim_start_matches(['"', '\'']);
+            let w = w.strip_prefix("$env:").unwrap_or(w);
+            w.split_once('=').is_some_and(|(k, _)| {
+                !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+        })
+}
+
+/// A command reduced to its programs and their subcommands (`vercel env … | gh secret …`):
+/// no argument, flag, assignment or piped value.
+fn program_words(cmd: &str) -> String {
+    let segs = if cmd.len() > organon_core::policy::MAX_COMMAND_BYTES {
+        Vec::new()
+    } else {
+        segments(cmd)
+    };
+    let printers = [
+        "echo",
+        "printf",
+        "print",
+        "write-output",
+        "write-host",
+        "cat",
+        "type",
+    ];
+    let parts: Vec<String> = segs
+        .iter()
+        .map(|seg| {
+            let mut w = seg[0].clone();
+            if let Some(sub) = seg.get(1).filter(|s| {
+                !printers.contains(&seg[0].as_str())
+                    && s.len() <= 24
+                    && !s.starts_with('-')
+                    && s.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+            }) {
+                w.push(' ');
+                w.push_str(sub);
+            }
+            w.push_str(" …");
+            w
+        })
+        .collect();
+    if parts.is_empty() {
+        "…".into()
+    } else {
+        parts.join(" | ")
+    }
+}
+
 /// Append an ask or deny to the policy's refusal log, so friction becomes data. A failure is
-/// logged to `hook-errors.log` and never changes the answer. A command in the `secrets` class
-/// is logged by its first two words only: what it names may be a secret.
+/// logged to `hook-errors.log` and never changes the answer. A command in the `secrets`,
+/// `send` or `paid` class, or one that may carry a value ([`carries_values`]), is logged by
+/// its programs only ([`program_words`]). Past [`REFUSAL_LOG_CAP`] the log starts again.
 fn log_refusal(home: &Home, policy: &organon_core::policy::Policy, ev: &HookEvent, v: &Verdict) {
     let Some(log) = policy.refusal_log.as_deref() else {
         return;
@@ -906,13 +996,9 @@ fn log_refusal(home: &Home, policy: &organon_core::policy::Policy, ev: &HookEven
         },
         None => PathBuf::from(log),
     };
-    let secret = v.class.as_deref() == Some("secrets");
+    let cut = matches!(v.class.as_deref(), Some("secrets" | "send" | "paid"));
     let action = match ev.action() {
-        Action::Command(c) if secret => {
-            let mut w: Vec<&str> = c.split_whitespace().take(2).collect();
-            w.push("…");
-            w.join(" ")
-        }
+        Action::Command(c) if cut || carries_values(c) => program_words(c),
         Action::Command(c) => c.chars().take(300).collect(),
         Action::Write { path } => format!("write {path}"),
         Action::Read { path } => format!("read {path}"),
@@ -928,6 +1014,16 @@ fn log_refusal(home: &Home, policy: &organon_core::policy::Policy, ev: &HookEven
         "cwd": ev.cwd,
         "session": ev.session_id,
     });
+    if fs::metadata(&path).is_ok_and(|m| m.len() >= REFUSAL_LOG_CAP) {
+        let mut old = path.clone().into_os_string();
+        old.push(".1");
+        if let Err(e) = fs::rename(&path, &old) {
+            let _ = append_line(
+                &home.root.join("hook-errors.log"),
+                &format!("{} refusal log {}: {e:#}", rfc3339(now()), path.display()),
+            );
+        }
+    }
     let written = path
         .parent()
         .map_or(Ok(()), fs::create_dir_all)
@@ -968,6 +1064,22 @@ fn hook(home: &Home, ev: &HookEvent) -> Result<Option<String>> {
         &origin_of,
         git::inherited(Some(&ev.session_id), &policy.merge_env_names),
     );
+    // A `Grep` reads the files its glob names too: `glob=".env*"` reads secrets. The glob is
+    // tried on the names of the secret files the policy knows of.
+    if let Some(g) = ev.read_glob.as_deref() {
+        let base = ev.read.as_deref().unwrap_or(".");
+        let base = base.trim_end_matches(['/', '\\']);
+        let g = g.replace('\\', "/").to_lowercase();
+        let name = g.rsplit('/').next().unwrap_or(&g);
+        for file in SECRET_NAMES.iter().filter(|f| glob(name, f)) {
+            let v = policy.decide(Action::Read {
+                path: &format!("{base}/{file}"),
+            });
+            if v.decision > verdict.decision {
+                verdict = v;
+            }
+        }
+    }
     let mut context: Option<String> = None;
     let active = home.active_task_in(&ev.transcript);
 

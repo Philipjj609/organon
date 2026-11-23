@@ -1102,3 +1102,53 @@ fn a_territory_lifts_all_but_its_lines_and_logs_every_refusal() {
     assert_eq!(lines[2]["tool"], "Read");
     assert_eq!(lines[3]["class"], "push-main");
 }
+
+#[test]
+fn the_refusal_log_writes_no_value_and_a_grep_glob_is_seen() {
+    let e = env("territory-log");
+    fs::create_dir_all(&e.home).unwrap();
+    let root = e.home.parent().unwrap().to_owned();
+    let own = root.join("own");
+    fs::create_dir_all(own.join(".git")).unwrap();
+    fs::write(own.join(".git").join("HEAD"), "ref: refs/heads/feature\n").unwrap();
+    let log = root.join("refusals.jsonl");
+    let slash = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    fs::write(
+        e.home.join("policy.json"),
+        serde_json::json!({
+            "efforts": {}, "routes": {},
+            "rules": [
+                {"read": "*/.env|*/.env.*", "decision": "ask", "class": "secrets", "reason": "secret"},
+                {"command": "curl", "sends": true, "decision": "ask", "class": "send", "reason": "send"},
+                {"command": "rm -*r*", "decision": "ask", "class": "delete", "reason": "delete"},
+            ],
+            "territory": [slash(&own)],
+            "lines": ["deploy", "destroy", "secrets", "paid", "policy", "send"],
+            "refusal_log": slash(&log),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let run = |tool: &str, input: &str| {
+        e.hook_raw(&event("s1", &e.transcript, &slash(&own), tool, input), &[])
+    };
+    for cmd in [
+        "curl -s https://example.com -H \"Authorization: Bearer LEAK1\" -d x=1",
+        "echo LEAK2 | vercel env add TOKEN production",
+        "TOKEN=LEAK3 gh secret set X --body \"$TOKEN\"",
+        "rm -rf C:/elsewhere/LEAK4 | tee out",
+    ] {
+        let _ = run("Bash", &command(cmd));
+    }
+    // A glob that names `.env` files reads them; one that does not, does not.
+    assert!(is_ask(&run(
+        "Grep",
+        r#"{"pattern":"API_KEY","glob":".env*"}"#
+    )));
+    assert_eq!(run("Grep", r#"{"pattern":"TODO","glob":"*.rs"}"#), "");
+    let text = fs::read_to_string(&log).unwrap();
+    for leak in ["LEAK1", "LEAK2", "LEAK3", "LEAK4"] {
+        assert!(!text.contains(leak), "{leak}: {text}");
+    }
+    assert!(text.contains("curl …"), "{text}");
+}
